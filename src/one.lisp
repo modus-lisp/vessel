@@ -33,8 +33,15 @@
 
 (defvar *nostr-gateway-system* "glass-webrtc/nostr")
 (defvar *etc* (kiln-env "KILN_ETC" "/etc/kiln"))
-(defvar *ops-file*
-  (format nil "~a/kiln/boot/ops.lisp" *root*))
+(defvar *here*
+  (make-pathname :name nil :type nil :version nil
+                 :defaults (or *load-truename* (format nil "~a/vessel/src/" *root*)))
+  "vessel's src/, where this file is: its siblings (session, sshd, klog, ops) load from
+   beside it, so a workspace checkout loads its own and the image its pinned one.")
+
+(defun %sibling (name) (namestring (merge-pathnames name *here*)))
+
+(defvar *ops-file* (%sibling "ops.lisp"))
 
 (defun kiln-flag-default (name default)
   "KILN-FLAG, but for a setting whose default is ON.  Absent means DEFAULT; a value
@@ -208,7 +215,7 @@
     ;; THE SESSION'S OWN IDENTITY.  Not the host's, and there is nothing to fall back
     ;; to: no NOSTR_SEC, no /etc/kiln/nostr-sec.  A fallback is how one host key ends up
     ;; signing for four desktops again on the machine nobody re-read the config on.
-    (let ((sec (let ((f (format nil "~a/boot/session.lisp" (kiln-env "KILN_HOME" "/kiln"))))
+    (let ((sec (let ((f (%sibling "session.lisp")))
                  (when (probe-file f)
                    (handler-case
                        (progn
@@ -248,7 +255,7 @@
          ;; cannot sign, cannot be found, and cannot mint a login code, so there is
          ;; nothing useful to start in a degraded mode.
          (format *error-output* "~&@@ nostr: this session has no identity, and one could not be~%~
-                                   @@   minted (boot/session.lisp, ~a/sessions).  Not starting:~%~
+                                   @@   minted (src/session.lisp, ~a/sessions).  Not starting:~%~
                                    @@   a gateway with no key cannot sign, cannot be found, and~%~
                                    @@   cannot mint a login code.~%" *etc*)
          nil)
@@ -333,7 +340,7 @@
 ;;; to put it in.  KILN_SSHD_EMBEDDED stops sshd.lisp auto-starting (and, more to
 ;;; the point, stops its "refusing to start" path from calling QUIT on the whole
 ;;; image over a missing key file).
-(let ((sshd (format nil "~a/boot/sshd.lisp" (kiln-env "KILN_HOME" "/kiln"))))
+(let ((sshd (%sibling "sshd.lisp")))
   ;; Opt-in, because "start an SSH server" should never be a side effect of
   ;; starting a desktop.  The container turns it on (it is the only way in);
   ;; `kiln local' leaves it off unless asked, since there you already have a
@@ -354,8 +361,8 @@
 
 ;;; The event log, when the config says so.  Opt-in (KILN_LOG_DM), because it sends what it
 ;;; is given to the baked npub over public relays, and that is the box owner's call, not a
-;;; side effect of starting a desktop.  See boot/klog.lisp for what it does and does not keep.
-(let ((klog (format nil "~a/boot/klog.lisp" (kiln-env "KILN_HOME" "/kiln"))))
+;;; side effect of starting a desktop.  See src/klog.lisp for what it does and does not keep.
+(let ((klog (%sibling "klog.lisp")))
   (when (and (kiln-flag "KILN_LOG_DM") (probe-file klog))
     (handler-case
         (progn (load klog)
@@ -364,7 +371,7 @@
       (error (e) (format *error-output* "~&@@ klog failed to start: ~a~%" e)))))
 
 ;;; Housekeeping (the periodic full GC that keeps gen-6 garbage from accumulating) is
-;;; registered in the CORE, by boot/build.lisp, as an init hook — so the container, `kiln
+;;; registered in the CORE, by kiln's boot/build.lisp, as an init hook — so the container, `kiln
 ;;; local', `repl' and `modus' all get it from the one place instead of this file getting
 ;;; it alone.  See the comment there for the measurements.
 (load *desktop-file*)

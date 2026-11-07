@@ -1,7 +1,7 @@
 ;;;; android.lisp — the Android app's entry point: glass on the phone's own screen.
-;;;; The app itself is boot/app.lisp; this is Android's way to the screen.
+;;;; The app itself is src/app.lisp; this is Android's way to the screen.
 ;;;;
-;;;; Loaded into the world `kiln android' snapshots (boot/ios-world.lisp with
+;;;; Loaded into the world `kiln android' snapshots (kiln's boot/ios-world.lisp with
 ;;;; KILN_APP=android).  The app's modus.args say
 ;;;;   --core @kiln.core --eval (kiln-android-main)
 ;;;; On Android the image is not alone in its process: it is the CHILD of the
@@ -66,5 +66,5 @@
        (if (member n '(1001 1004 1010 1012)) (%kiln-ui-reply) 0))))
 
 (defun kiln-android-main (&key autoplay)
-  "The Android app (boot/app.lisp).  The window is full-screen: no status bar above it."
+  "The Android app (src/app.lisp).  The window is full-screen: no status bar above it."
   (kiln-app-main :autoplay autoplay :top 0))

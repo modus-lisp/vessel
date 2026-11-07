@@ -1,4 +1,4 @@
-;;;; klog-test.lisp — offline checks for boot/klog.lisp.
+;;;; klog-test.lisp — offline checks for src/klog.lisp.
 ;;;;
 ;;;;   sbcl --non-interactive --load test/klog-test.lisp   (quicklisp at ~/quicklisp)
 ;;;; --script swallows the output (and the exit flush), so it is not used here.
@@ -22,7 +22,7 @@
      (format t "~:[FAIL~;PASS~] ~a~%" ok ,label)
      (unless ok (incf *fails*))))
 
-(load (merge-pathnames "../boot/klog.lisp" *load-truename*))
+(load (merge-pathnames "../src/klog.lisp" *load-truename*))
 
 ;;; 1. the wrap chain
 (let* ((recipient (cl-nostr.keys:generate-keypair))

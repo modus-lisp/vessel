@@ -31,7 +31,7 @@
     (asdf:load-system :seal/http)
     (asdf:load-system :com.inuoe.jzon)))
 
-(load (merge-pathnames "config.lisp" (or *load-truename* #p"/kiln/boot/")))
+(load (merge-pathnames "config.lisp" (or *load-truename* #p"/opt/modus-lisp/vessel/src/")))
 
 (setf kiln-config:*config-path* (format nil "~a/config" *etc*))
 

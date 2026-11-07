@@ -96,7 +96,7 @@
                @@   is no identity to start, so kiln stops here rather than serving a~%~
                @@   desktop that nobody could be told about or allowed into.~%~
                @@~%~
-               @@   The core predates cl-nostr joining boot/build.lisp.  Rebuild it:~%~
+               @@   The core predates cl-nostr joining kiln's boot/build.lisp.  Rebuild it:~%~
                @@       kiln local --rebuild~%")
     (finish-output *error-output*)
     (sb-ext:exit :code 1)))

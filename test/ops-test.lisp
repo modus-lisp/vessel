@@ -1,4 +1,4 @@
-;;;; ops-test.lisp — boot/ops.lisp, on a bare SBCL with nothing else loaded.
+;;;; ops-test.lisp — src/ops.lisp, on a bare SBCL with nothing else loaded.
 ;;;;
 ;;;; ops.lisp exists so that an AI inside a running image can ask five plain
 ;;;; questions without rebuilding them from sb-thread internals each session.
@@ -16,12 +16,12 @@
 (require :sb-posix)
 
 (defparameter *here*
-  (merge-pathnames "../boot/ops.lisp"
+  (merge-pathnames "../src/ops.lisp"
                    (make-pathname :name nil :type nil :defaults *load-truename*)))
 
 (handler-case (load *here*)
   (error (e)
-    (format *error-output* "~&ops-test: boot/ops.lisp failed to load: ~a~%" e)
+    (format *error-output* "~&ops-test: src/ops.lisp failed to load: ~a~%" e)
     (sb-ext:exit :code 1)))
 
 (defpackage :kiln-ops-test (:use :cl) (:import-from :kiln-ops #:split-spaces))

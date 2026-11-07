@@ -1,4 +1,4 @@
-;;;; klog-live.lisp — end to end: boot/klog.lisp -> a real relay -> decrypted by the recipient.
+;;;; klog-live.lisp — end to end: src/klog.lisp -> a real relay -> decrypted by the recipient.
 ;;;;
 ;;;;   sbcl --non-interactive --load test/klog-live.lisp [ws://host:port]
 ;;;;
@@ -19,7 +19,7 @@
      (format t "~:[FAIL~;PASS~] ~a~%" ok ,label)
      (unless ok (incf *fails*))))
 
-(load (merge-pathnames "../boot/klog.lisp" *load-truename*))
+(load (merge-pathnames "../src/klog.lisp" *load-truename*))
 
 (defvar *relay* (or (second sb-ext:*posix-argv*) "ws://127.0.0.1:7780"))
 (defvar *tag* (format nil "live-~d" (random 1000000)))

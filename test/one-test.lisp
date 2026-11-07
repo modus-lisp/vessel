@@ -1,4 +1,4 @@
-;;;; one-test.lisp — the decisions boot/one.lisp makes before anything starts.
+;;;; one-test.lisp — the decisions src/one.lisp makes before anything starts.
 ;;;;
 ;;;; These are small functions guarding expensive failures.  A flag misread means a
 ;;;; service that was asked for does not start (or one that was not, does).  A payload
@@ -6,14 +6,14 @@
 ;;;; cannot run the client — and NOTHING on the box looks wrong, which is what makes
 ;;;; the check worth having and worth testing.
 ;;;;
-;;;; The definitions are read out of boot/one.lisp itself.  Loading that file is not an
+;;;; The definitions are read out of src/one.lisp itself.  Loading that file is not an
 ;;;; option (it starts a desktop), and copying the functions here would leave a test
 ;;;; that passes forever against code nobody runs.
 ;;;;
 ;;;;   sbcl --script t/one-test.lisp
 
 (require :sb-posix)
-;; not to use it: boot/one.lisp mentions ASDF:FIND-SYSTEM and friends, and the reader
+;; not to use it: src/one.lisp mentions ASDF:FIND-SYSTEM and friends, and the reader
 ;; refuses a symbol whose package does not exist, so reading the file needs ASDF loaded
 (require :asdf)
 
@@ -21,7 +21,7 @@
   '(kiln-env kiln-flag kiln-flag-default kiln-file-line kiln-file-has-relative-import-p))
 
 (defparameter *here*
-  (merge-pathnames "../boot/one.lisp"
+  (merge-pathnames "../src/one.lisp"
                    (make-pathname :name nil :type nil :defaults *load-truename*)))
 
 (let ((found '()))

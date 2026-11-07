@@ -1,9 +1,9 @@
 ;;;; app.lisp — the phone app kiln builds: a glass desk on the phone's own screen.
 ;;;;
-;;;; Shared by `kiln ios' (boot/ios.lisp) and `kiln android' (boot/android.lisp),
+;;;; Shared by `kiln ios' (src/ios.lisp) and `kiln android' (src/android.lisp),
 ;;;; which each define %KILN-SYS -- the platform's way to the screen, touch,
 ;;;; keyboard and speaker -- and an entry point that calls KILN-APP-MAIN.  Loaded
-;;;; into the world the build snapshots (boot/ios-world.lisp), so it is native code
+;;;; into the world the build snapshots (kiln's boot/ios-world.lisp), so it is native code
 ;;;; by the time the phone runs it.  The calls, by number (iOS: modus's
 ;;;; host/ios/modus-ui.m; Android: modus's host/android/modus-launcher.c):
 ;;;;   1001 size/scale  1002 fill  1003 present  1004 touch/key  1005 blit

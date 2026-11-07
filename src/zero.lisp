@@ -1,7 +1,7 @@
 ;;;; zero.lisp — kiln's phone app on a Raspberry Pi Zero 2 W running bare-metal modus:
 ;;;; the desk on the Zero's HDMI screen, its USB keyboard and mouse as input.
 ;;;;
-;;;; The platform layer for app.lisp, as boot/ios.lisp and boot/android.lisp are, over modus's
+;;;; The platform layer for app.lisp, as src/ios.lisp and src/android.lisp are, over modus's
 ;;;; board drivers instead of a host shim: net/hdmi-console.lisp (a 640-wide framebuffer the
 ;;;; firmware scales to the display, mapped non-cacheable, read with HCON-GET) and
 ;;;; net/usb-hid-split.lisp (HID-SPLIT-POLL, HID-RING-POP, MOUSE-X/-Y/-BUTTONS).  Those are
