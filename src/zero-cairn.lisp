@@ -148,7 +148,20 @@
                            (cairn::make-wt-stat :type (if (second e) :dir :file)
                                                 :mode (if (second e) #o040755 #o100644)
                                                 :size (third e)))))
-       :walk         (lambda (reldir) (%fat-walk-files v (full reldir) "" t))))))
+       :walk         (lambda (reldir) (%fat-walk-files v (full reldir) "" t))
+       ;; streaming: checkout writes a blob a piece at a time as it comes off the pack.  Without
+       ;; these cairn collects the whole file first, and a 24 MB file (weft's PNGs, dist's
+       ;; archives) exhausted the board's heap
+       :open-output  (lambda (rel exec)
+                       (declare (ignore exec))
+                       (%fat-parent-dirs v (full rel))
+                       (fs-fat:fat32-open-output v (full rel)))
+       :write-output (lambda (h buf start end)
+                       (fs-fat:fat32-write-output h buf :start start :end end)
+                       t)
+       :close-output (lambda (h abort)
+                       (fs-fat:fat32-close-output h :abort abort)
+                       t)))))
 
 (defun store-repository (dir)
   "The git repository at store directory DIR, open on the store."
