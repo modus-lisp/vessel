@@ -6,6 +6,7 @@
 ;;;;
 ;;;;   (kiln-zero-card:clone-to-store "https://github.com/modus-lisp/kiln" "/src/kiln")
 ;;;;   (kiln-zero-card:sync-repos '("kiln" "cram"))   ; clone each that is missing, log a line
+;;;;   (kiln-zero-card:sync-repos-in-background (list "kiln"))  ; the same, the desk still drawing
 ;;;;   kiln-zero-card:*sync-log*                      ; what SYNC-REPOS did, newest first
 ;;;;
 ;;;; THE PACK STREAMS TO THE CARD.  A fetched pack is written to the store as it arrives
@@ -22,7 +23,7 @@
 
 (in-package #:kiln-zero-card)
 
-(export '(clone-to-store store-repository sync-repos *sync-log*))
+(export '(clone-to-store store-repository sync-repos sync-repos-in-background sync-running-p *sync-log*))
 
 (defun %fat-join (root rel)
   "ROOT and REL as one store path, without a trailing slash."
@@ -191,6 +192,37 @@
                        (format nil "failed ~a: ~a" name (princ-to-string e)))))))
         (push line *sync-log*)
         (push line lines)))))
+
+;;; IN THE BACKGROUND, so the desk keeps drawing.  An SSH command is a job on the main thread,
+;;; and the desk runs jobs between frames, each to its end: a clone of minutes is a desk frozen
+;;; for minutes.  A thread on CORE 0 instead (unpinned threads start there) runs when the desk
+;;; is idle between frames, in 10 ms slices.  Core 0, because its threads share region 0 with
+;;; main: a sync stores into the mounted store, the sector cache, *SYNC-LOG* and the package
+;;; tables, which a thread on cores 1..3 may not yet do (net/bare-threads.lisp).
+
+(defvar *sync-thread* nil "The thread SYNC-REPOS-IN-BACKGROUND started, or NIL.")
+
+(defun sync-running-p ()
+  (and *sync-thread* (sb-thread:thread-alive-p *sync-thread*) t))
+
+(defun sync-repos-in-background (names &rest keys &key root org)
+  "SYNC-REPOS on a core-0 thread, returning at once; watch *SYNC-LOG* (newest first).  It
+   ends with a \"sync done\" line, or \"sync stopped\" if something outside one repo's clone
+   failed.  Refuses while a sync is running.  KEYS as SYNC-REPOS's."
+  (declare (ignore root org))
+  (when (sync-running-p) (error "store: a sync is already running"))
+  (let ((names (copy-list names)) (keys (copy-list keys)))
+    (push (format nil "sync started: ~d repos" (length names)) *sync-log*)
+    (setf *sync-thread*
+          (sb-thread:make-thread
+           (lambda ()
+             (handler-case
+                 (let ((lines (apply #'sync-repos names keys)))
+                   (push (format nil "sync done: ~d repos" (length lines)) *sync-log*))
+               (error (e)
+                 (push (format nil "sync stopped: ~a" (princ-to-string e)) *sync-log*))))
+           :name "sync"))
+    :started))
 
 (defun %store-remove-tree (dir)
   "Delete DIR and everything below it from the store."
