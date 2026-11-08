@@ -14,7 +14,9 @@
 ;;;; An image without the ring (anything but the Pi CL image) has no Console.
 
 (defun %kiln-ring-fn (name)
-  (let ((s (find-symbol name "MODUS-INT")))
+  ;; INTERN, not FIND-SYMBOL: a saved core keeps the function but may have dropped the NAME
+  ;; from MODUS-INT (measured on the board: SERIAL-RING-BYTES was defined, its symbol gone)
+  (let ((s (and (find-package "MODUS-INT") (intern name "MODUS-INT"))))
     (and s (fboundp s) (symbol-function s))))
 
 (defun kiln-console-available-p ()

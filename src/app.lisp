@@ -337,6 +337,7 @@
 ;; The Terminal's typeface: Liberation Mono when the image carries it (kiln zero's core build
 ;; loads it beside the desk's two faces), else the desk's own.
 (defvar *kiln-mono-font* nil)
+(defvar *kiln-desk* nil "The running desk, so an app can be registered on it from a REPL.")
 
 (defun %kiln-terminal-app (fb)
   "A Lisp listener: see %KILN-TERMINAL-EVAL."
@@ -486,6 +487,7 @@
          (lib (and media (warp-media:make-library :root (concatenate 'string dir "media/")
                                                   :mixer mixer)))
          (desk (glass.desk:make-desk (glass:make-framebuffer dw dh))))
+    (setf *kiln-desk* desk)
     (format t "~&kiln: ~Dx~D screen, desk ~Dx~D at ~Dx, media from ~A~%" sw sh dw dh k dir)
     (%kiln-sys 1002 0 (+ sw (* sh 65536)) #x1E2530)
     ;; TOUCH-SIZED CHROME: a 34-point title bar to drag by, 44-point menu rows (iOS's
