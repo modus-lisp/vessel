@@ -512,6 +512,10 @@
                                       (symbol-function '%kiln-vt-terminal-app)
                                       #'%kiln-terminal-app)
                                   :width (min dw 600) :height 320)
+    ;; the board's serial console, dmesg style, with a line to type into (zero-console.lisp)
+    (when (and (fboundp 'kiln-console-available-p) (funcall 'kiln-console-available-p))
+      (glass.desk:desk-register-app desk "Console" (symbol-function '%kiln-console-app)
+                                    :width (min dw 600) :height 320))
     ;; THE KEYBOARD follows the focus: the desk raises the phone's keyboard (pseudo-syscall 1006)
     ;; when a window that takes text is opened or tapped into, and puts it away when you tap
     ;; elsewhere; what is typed arrives as key events below

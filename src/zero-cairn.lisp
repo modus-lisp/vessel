@@ -25,6 +25,16 @@
 
 (export '(clone-to-store store-repository sync-repos sync-repos-in-background sync-running-p *sync-log*))
 
+;;; PROGRESS goes to the serial console (and so to the ring, (dmesg) and the desk's Console):
+;;; a line as a repo starts, one per MB of pack received, and one per step after it.  On a host
+;;; (SBCL, the tests) to *ERROR-OUTPUT*.
+(defun %say (fmt &rest args)
+  (let ((line (apply #'format nil fmt args))
+        (ws (let ((p (find-package "MODUS-INT"))) (and p (find-symbol "WRITE-STRING-SERIAL" p)))))
+    (if (and ws (fboundp ws))
+        (progn (funcall ws line) (funcall ws (string #\Newline)))
+        (format *error-output* "~&~a~%" line))))
+
 (defun %fat-join (root rel)
   "ROOT and REL as one store path, without a trailing slash."
   (string-right-trim "/" (if (or (string= rel "") (string= rel "/"))
@@ -69,8 +79,13 @@
 
 (defun make-store-git-backend (root)
   "A cairn FS-BACKEND keeping the git directory ROOT (e.g. \"/src/kiln/.git\") on the store."
-  (let ((v (%store)))
-    (flet ((full (rel) (%fat-join root rel)))
+  (let ((v (%store)) (written 0) (next-mb 1))
+    (flet ((full (rel) (%fat-join root rel))
+           (count-bytes (n)
+             (incf written n)
+             (when (>= written (* next-mb 1048576))
+               (%say "  ~d MB received" next-mb)
+               (setf next-mb (1+ (floor written 1048576))))))
       (cairn::make-fs-backend
        :read-bytes   (lambda (rel) (fs-fat:fat32-read-file v (full rel)))
        :read-string  (lambda (rel) (%bytes-string (fs-fat:fat32-read-file v (full rel))))
@@ -86,12 +101,27 @@
        ;; at a time, never in memory whole
        :write-stream (lambda (rel next)
                        (%fat-parent-dirs v (full rel))
-                       (fs-fat:fat32-write-file-stream v (full rel) next))
+                       (setf written 0 next-mb 1)
+                       (prog1 (fs-fat:fat32-write-file-stream
+                               v (full rel)
+                               (lambda ()
+                                 (multiple-value-bind (more end) (funcall next)
+                                   (when more (count-bytes (or end (length more))))
+                                   (values more end))))
+                         (when (> written 65536) (%say "  ~d bytes received; indexing" written))))
        :open-output  (lambda (rel)
                        (%fat-parent-dirs v (full rel))
+                       (setf written 0 next-mb 1)
                        (fs-fat:fat32-open-output v (full rel)))
-       :write-output (lambda (h buf start end) (fs-fat:fat32-write-output h buf :start start :end end) t)
-       :close-output (lambda (h abort) (fs-fat:fat32-close-output h :abort abort) t)
+       :write-output (lambda (h buf start end)
+                       (fs-fat:fat32-write-output h buf :start start :end end)
+                       (count-bytes (- end start))
+                       t)
+       :close-output (lambda (h abort)
+                       (fs-fat:fat32-close-output h :abort abort)
+                       (when (and (not abort) (> written 65536))
+                         (%say "  ~d bytes received; indexing" written))
+                       t)
        :open-input   (lambda (rel) (fs-fat:fat32-open-input v (full rel)))
        :read-into    (lambda (h off buf start end) (fs-fat:fat32-read-into h off buf :start start :end end))
        :input-size   (lambda (h) (fs-fat:fat32-input-size h))
@@ -156,16 +186,20 @@
   (let ((t0 (get-internal-real-time))
         (v (%store))
         (base (cairn::smart-http-base url)))
+    (%say "clone ~a -> ~a" url dir)
     (multiple-value-bind (refs caps head-target) (cairn::discover-refs base)
       (declare (ignore caps))
+      (%say "  ~d refs; fetching" (length refs))
       (let ((repo (%store-start-clone url dir refs head-target)) (files 0))
         (multiple-value-bind (name count octets)
             (cairn:fetch-pack-into repo base (cairn::refs->wants refs))
           (declare (ignore name))
           (fs-fat:fat32-sync v)
+          (%say "  ~d objects indexed" count)
           (when checkout
             (setq files (cairn:checkout repo))
-            (fs-fat:fat32-sync v))
+            (fs-fat:fat32-sync v)
+            (%say "  ~d files checked out" files))
           (list :objects count :octets octets :files files
                 :seconds (round (- (get-internal-real-time) t0) internal-time-units-per-second)))))))
 
@@ -191,6 +225,7 @@
                        (ignore-errors (%store-remove-tree dir))
                        (format nil "failed ~a: ~a" name (princ-to-string e)))))))
         (push line *sync-log*)
+        (%say "sync: ~a" line)
         (push line lines)))))
 
 ;;; IN THE BACKGROUND, so the desk keeps drawing.  An SSH command is a job on the main thread,
