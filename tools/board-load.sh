@@ -9,6 +9,7 @@
 # its hash is fetched again), and installed with MODUS-INT::INSTALL-TARBALL-FROM-BYTES -- the
 # same route `kiln zero' uses for the desk.  Systems are installed in the order given.
 #
+# Pieces are staged in /tmp on the gateway (modus-pi's root filesystem is full).
 # Env: ZERO_HOST (10.0.0.199), ZERO_GATEWAY (modus@modus-pi, the machine wired to the board),
 #      ZERO_GATEWAY_IP (10.0.0.1, its address as the board sees it), ZERO_PORT (8765).
 set -euo pipefail
@@ -19,7 +20,7 @@ zeval() { ssh "${SSHO[@]}" -J "$GW" "modus@$ZH" "$1"; }   # one form; prints "= 
 [ $# -gt 0 ] || { sed -n '2,15p' "$0"; exit 2; }
 work=$(mktemp -d)
 # the HTTP server is killed by the PID it was started with, never by a name pattern
-trap 'rm -rf "$work"; ssh "${SSHO[@]}" "$GW" "[ -f ~/board-load/pid ] && kill \$(cat ~/board-load/pid); rm -rf ~/board-load" >/dev/null 2>&1 || true' EXIT
+trap 'rm -rf "$work"; ssh "${SSHO[@]}" "$GW" "[ -f /tmp/board-load/pid ] && kill \$(cat /tmp/board-load/pid); rm -rf /tmp/board-load" >/dev/null 2>&1 || true' EXIT
 
 # the fetch helpers, defined once per board session (cheap to redefine)
 zeval '(progn (setq *jit-hot-only* nil)
@@ -28,7 +29,7 @@ zeval '(progn (setq *jit-hot-only* nil)
  (defun kz-fetch (base m) (let* ((total (let ((s 0)) (dolist (e m s) (setq s (+ s (cadr e)))))) (v (make-array total :element-type (quote (unsigned-byte 8)))) (off 0)) (dolist (e m v) (let ((p (kz-piece (concatenate (quote string) base (car e)) (cadr e) (caddr e)))) (when (null p) (return nil)) (replace v p :start1 off) (setq off (+ off (cadr e)))))))
  :helpers)' >/dev/null
 
-ssh "${SSHO[@]}" "$GW" "rm -rf ~/board-load; mkdir -p ~/board-load; cd ~/board-load && { nohup python3 -m http.server $PORT --bind $GIP >http.log 2>&1 & echo \$! > pid; }"
+ssh "${SSHO[@]}" "$GW" "rm -rf /tmp/board-load; mkdir -p /tmp/board-load; cd /tmp/board-load && { nohup python3 -m http.server $PORT --bind $GIP >http.log 2>&1 & echo \$! > pid; }"
 for spec in "$@"; do
   dir=${spec%%:*} sys=""; [[ $spec == *:* ]] && sys=${spec#*:}
   dir=$(cd "$dir" && pwd); name=$(basename "$dir")
@@ -47,7 +48,7 @@ for i in range(0, len(data), 16384):
     entries.append('("%s/%s" %d %d)' % (name, fn, len(chunk), h))
 open(os.path.join(work, name + ".lisp"), "w").write("(" + " ".join(entries) + ")")
 PY
-  scp -q "${SSHO[@]}" -r "$work/$name" "$GW:board-load/"
+  scp -q "${SSHO[@]}" -r "$work/$name" "$GW:/tmp/board-load/"
   fi
   n=$(wc -c < "$work/$name.tar")
   echo "board-load: $name ($n bytes) ..." >&2
