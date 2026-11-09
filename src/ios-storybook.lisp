@@ -58,19 +58,48 @@
 
 (defun %story-text ()
   (let* ((field (kiln-swift:ui-text-field "type here" 24 200 350 36))
-         (mirror (kiln-swift:ui-label "" 24 250 350 30)))
+         (mirror (kiln-swift:ui-label "" 24 250 350 30))
+         (done (kiln-swift:ui-button "done" 24 300 120 40)))
     (kiln-swift:on-event :text field
                          (lambda (value h)
                            (declare (ignore value))
                            (kiln-swift:ui-set-text mirror (kiln-swift:ui-text-value h))))
-    (list field mirror)))
+    ;; the keyboard covers the bottom of the screen; "done" gives it up
+    (kiln-swift:on-tap done (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-resign field)))
+    (list field mirror done)))
+
+(defun %story-stack ()
+  (let* ((stack (kiln-swift:ui-stack t 8 24 200 350 180))
+         (top (kiln-swift:ui-label "first" 0 0 300 24))
+         (middle (kiln-swift:ui-label "second" 0 0 300 24))
+         (bottom (kiln-swift:ui-label "third" 0 0 300 24)))
+    (dolist (child (list top middle bottom))
+      (kiln-swift:ui-add stack child))
+    (list stack top middle bottom)))
+
+(defun %story-scroll ()
+  "Thirty items in a scroll view: the last is below the fold until the view is dragged."
+  (let* ((scroll (kiln-swift:ui-scroll 24 200 350 560))
+         (items (loop for i from 1 to 30
+                      collect (kiln-swift:ui-label (format nil "item ~D" i) 0 0 300 24))))
+    (dolist (item items)
+      (kiln-swift:ui-add scroll item))
+    (cons scroll items)))
+
+(defun %story-image ()
+  (let ((picture (kiln-swift:ui-image "star.fill" 24 200 120 120))
+        (name (kiln-swift:ui-label "star.fill" 24 330 350 30)))
+    (list picture name)))
 
 (defparameter *stories*
   (list (cons "label" #'%story-label)
         (cons "button" #'%story-button)
         (cons "switch" #'%story-switch)
         (cons "slider" #'%story-slider)
-        (cons "text" #'%story-text)))
+        (cons "text" #'%story-text)
+        (cons "stack" #'%story-stack)
+        (cons "scroll" #'%story-scroll)
+        (cons "image" #'%story-image)))
 
 ;;; ---- the storybook ------------------------------------------------------------------------------
 
@@ -85,15 +114,16 @@
   "Open the storybook (closing any open one first)."
   (close-storybook)
   (let ((background (kiln-swift:ui-panel 0 0 0 0 *background*))
-        (title (kiln-swift:ui-label "storybook" 24 60 250 30))
-        (x 24))
+        (title (kiln-swift:ui-label "storybook" 24 60 250 30)))
     (setf *shelf* (list background title))
-    (dolist (story *stories*)
-      (let* ((name (car story))
-             (button (kiln-swift:ui-button name x 120 68 36)))
-        (push button *shelf*)
-        (kiln-swift:on-tap button (lambda (value h) (declare (ignore value h)) (%show name)))
-        (incf x 76)))
+    ;; five to a row; the stories start below the second row
+    (loop for story in *stories*
+          for i from 0
+          do (let* ((name (car story))
+                    (button (kiln-swift:ui-button name (+ 24 (* 76 (mod i 5))) (+ 120 (* 44 (floor i 5)))
+                                                  68 36)))
+               (push button *shelf*)
+               (kiln-swift:on-tap button (lambda (value h) (declare (ignore value h)) (%show name)))))
     ;; top right: the keyboard covers the bottom of the screen while a text field has focus
     (let ((closer (kiln-swift:ui-button "close" 290 60 90 36)))
       (push closer *shelf*)

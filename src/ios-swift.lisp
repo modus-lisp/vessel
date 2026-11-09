@@ -14,7 +14,8 @@
 (defpackage #:kiln-swift
   (:use #:cl)
   (:export #:swift-call #:ui-label #:ui-button #:ui-switch #:ui-slider #:ui-text-field #:ui-panel
-           #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap
+           #:ui-stack #:ui-scroll #:ui-image #:ui-add
+           #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
 
 (in-package #:kiln-swift)
@@ -71,6 +72,23 @@
 (defun ui-panel (x y w h rgb)
   (swift-call "ui_panel_new" x y w h rgb))
 
+(defun ui-stack (vertical-p spacing x y w h)
+  "A stack: its children laid out in a column (VERTICAL-P) or a row, SPACING points apart."
+  (swift-call "ui_stack_new" (if vertical-p 0 1) spacing x y w h))
+
+(defun ui-scroll (x y w h)
+  "A scroll view: the children added to it stack vertically and scroll."
+  (swift-call "ui_scroll_new" x y w h))
+
+(defun ui-image (name x y w h)
+  "An SF Symbol by NAME (\"star.fill\"), in white."
+  (let ((b (%octets name)))
+    (swift-call "ui_image_new" (%addr b) (length b) x y w h)))
+
+(defun ui-add (parent child)
+  "Put CHILD into PARENT: a stack's arranged children, a scroll view's content, or a view's subviews."
+  (swift-call "ui_add" parent child))
+
 (defun ui-set-text (handle text)
   (let ((b (%octets text)))
     (swift-call "ui_set_text" handle (%addr b) (length b))))
@@ -96,6 +114,10 @@
 
 (defun ui-remove (handle)
   (swift-call "ui_remove" handle))
+
+(defun ui-resign (handle)
+  "The view HANDLE gives up the keyboard (a text field's)."
+  (swift-call "ui_resign" handle))
 
 (defun ui-tap (handle)
   "Tap the button HANDLE, as a touch would: its event comes back through SWIFT-PUMP."
