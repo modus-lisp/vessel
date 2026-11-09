@@ -224,7 +224,7 @@
               (lambda (mask x y)
                 (when (logbitp 0 mask) (place (row-at-y y) x)))
               (lambda () (when dirty (setf dirty nil) (redraw) t))
-              nil nil
+              nil nil nil
               t))))                       ; it takes typing: focusing it brings up the keyboard
 
 ;;; THE TERMINAL: a Lisp listener in a window.  Enter evaluates what was typed once its
@@ -444,6 +444,7 @@
               (lambda () (when remote (take-remote)) (when dirty (setf dirty nil) (redraw) t))
               nil
               (lambda () (when remote (ignore-errors (funcall (%kiln-c "DISCONNECT") (first remote)))))
+              nil
               t))))                       ; it takes typing
 
 (defun %kiln-blit-region (big k x0 y0 x y w h)
@@ -484,8 +485,9 @@
          (speaker (zerop (%kiln-sys 1010 +kiln-rate+ 0 0)))
          (mixer (and speaker (glass:make-mixer :rate +kiln-rate+)))
          (sink (and mixer (glass:mixer-subscribe mixer :name "speaker" :rate +kiln-rate+)))
-         (lib (and media (warp-media:make-library :root (concatenate 'string dir "media/")
-                                                  :mixer mixer)))
+         ;; warp is looked up when media is on: the iOS world may not carry it
+         (lib (and media (funcall (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")
+                                  :root (concatenate 'string dir "media/") :mixer mixer)))
          (desk (glass.desk:make-desk (glass:make-framebuffer dw dh))))
     (setf *kiln-desk* desk)
     (format t "~&kiln: ~Dx~D screen, desk ~Dx~D at ~Dx, media from ~A~%" sw sh dw dh k dir)
@@ -502,7 +504,7 @@
       (glass.desk:desk-register-app desk "Media"
                                     (lambda (fb)
                                       (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
-                                          (warp-media-glass:make-media-window fb lib)
+                                          (funcall (find-symbol "MAKE-MEDIA-WINDOW" "WARP-MEDIA-GLASS") fb lib)
                                         (values on-key on-pointer dirty-p copy-p close-fn nil)))
                                     :width dw :height 440))
     (glass.desk:desk-register-app desk "Clock" #'%kiln-clock-app :width 260 :height 110)
@@ -529,11 +531,13 @@
       (let ((path (concatenate 'string dir "media/" autoplay)))
         (if (probe-file path)
             (progn (format t "~&kiln: autoplay ~A~%" autoplay)
-                   (warp-media:play-path (warp-media:library-player lib) path))
+                   (funcall (find-symbol "PLAY-PATH" "WARP-MEDIA")
+                            (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib) path))
             (format t "~&kiln: autoplay ~A: no such file~%" autoplay))))
     (when media
       (format t "~&kiln: ~D track~:P~%"
-              (length (warp-media:folder-tracks (concatenate 'string dir "media/")))))
+              (length (funcall (find-symbol "FOLDER-TRACKS" "WARP-MEDIA")
+                               (concatenate 'string dir "media/")))))
     ;; A tap or a repaint that signals is logged and dropped: one bad gesture
     ;; must not take the app down (an error out of here ends the process).
     (loop

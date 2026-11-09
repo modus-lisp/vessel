@@ -19,5 +19,6 @@
   (modus-int::%gc-safe-block-6 n a b c d))
 
 (defun kiln-ios-main (&key autoplay)
-  "The iPhone app (src/app.lisp), below the status bar."
-  (kiln-app-main :autoplay autoplay :top 60))
+  "The iPhone app (src/app.lisp), below the status bar.  No media for now: the desk,
+   Clock and Terminal first (warp is not in this world)."
+  (kiln-app-main :autoplay autoplay :top 60 :media nil))
