@@ -1,0 +1,135 @@
+;;;; ios-swift.lisp -- Lisp calls Swift.  A Swift function is named in host/ios/modus-swift.m's table
+;;;; (by the Swift side, in host/ios/swift/), and SWIFT-CALL calls it by that name with words: integers,
+;;;; and the addresses of byte arrays that hold UTF-8 text.  The native components are made in Swift and
+;;;; driven from here; the events they send (a tap, a switch, a slider, typing) come back through
+;;;; SWIFT-PUMP, which the app runs each frame.  Nothing is generated: each call is written out.
+;;;;
+;;;;   (ui-label "text" x y w h)              (ui-button "title" x y w h)
+;;;;   (ui-switch on x y)                     (ui-slider value x y w h)
+;;;;   (ui-text-field "placeholder" x y w h)  (ui-panel x y w h rgb)   ; w 0: the whole screen
+;;;;   (ui-set-text h "text")  (ui-set-value h v)  (ui-text-value h)  (ui-set-frame h x y w h)
+;;;;   (ui-remove h)  (ui-tap h)
+;;;;   (on-event kind h (lambda (value h) ...))   ; kind :tap :switch :slider :text
+
+(defpackage #:kiln-swift
+  (:use #:cl)
+  (:export #:swift-call #:ui-label #:ui-button #:ui-switch #:ui-slider #:ui-text-field #:ui-panel
+           #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap
+           #:on-event #:on-tap #:swift-pump))
+
+(in-package #:kiln-swift)
+
+(defparameter *frame-bytes* 256)
+(defparameter *name-at* 128)
+
+(defun %addr (array)
+  (+ (modus-int::%gc-word-of array (modus-int::%conv-addr #x100050A0)) 7))
+
+(defun %octets (text)
+  (coerce (seal:utf8-encode text) '(simple-array (unsigned-byte 8) (*))))
+
+(defun %put-word (f off w)
+  (dotimes (i 8) (setf (aref f (+ off i)) (ldb (byte 8 (* 8 i)) w))))
+
+(defun %get-word (f off)
+  (let ((w 0))
+    (dotimes (i 8 w)
+      (setf w (+ w (ash (aref f (+ off i)) (* 8 i)))))))
+
+(defun swift-call (name &rest args)
+  "Call the Swift function NAME with ARGS (at most six words); the word it returns."
+  (when (> (length args) 6) (error "swift-call: at most six arguments, not ~D" (length args)))
+  (let ((f (make-array *frame-bytes* :element-type '(unsigned-byte 8) :initial-element 0)))
+    (loop for c across name for i from *name-at*
+          do (setf (aref f i) (logand (char-code c) #xff)))
+    (%put-word f 0 (length args))
+    (loop for a in args for i from 0 do (%put-word f (+ 8 (* 8 i)) (or a 0)))
+    (let ((rc (cl-user::%kiln-sys 1060 (%addr f) 0 0)))
+      (when (< rc 0) (error "swift-call: no Swift function named ~A" name))
+      (%get-word f 64))))
+
+;;; The components.  A handle is the Swift side's name for a view.
+
+(defun ui-label (text x y w h)
+  (let ((b (%octets text)))
+    (swift-call "ui_label_new" (%addr b) (length b) x y w h)))
+
+(defun ui-button (title x y w h)
+  (let ((b (%octets title)))
+    (swift-call "ui_button_new" (%addr b) (length b) x y w h)))
+
+(defun ui-switch (on x y)
+  (swift-call "ui_switch_new" (if on 1 0) x y))
+
+(defun ui-slider (value x y w h)
+  (swift-call "ui_slider_new" value x y w h))
+
+(defun ui-text-field (placeholder x y w h)
+  (let ((b (%octets placeholder)))
+    (swift-call "ui_text_field_new" (%addr b) (length b) x y w h)))
+
+(defun ui-panel (x y w h rgb)
+  (swift-call "ui_panel_new" x y w h rgb))
+
+(defun ui-set-text (handle text)
+  (let ((b (%octets text)))
+    (swift-call "ui_set_text" handle (%addr b) (length b))))
+
+(defun ui-set-value (handle value)
+  "A switch's state (T or NIL), or a slider's value."
+  (swift-call "ui_set_value" handle (if (eq value t) 1 (if (null value) 0 value))))
+
+(defun ui-text-value (handle)
+  "The text of a text field (or label), as a string."
+  (let* ((cap 1024)
+         (buf (make-array cap :element-type '(unsigned-byte 8) :initial-element 0))
+         (n (swift-call "ui_text_value" handle (%addr buf) cap)))
+    (cond ((zerop n) "")
+          ((> n cap)
+           (let ((big (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
+             (swift-call "ui_text_value" handle (%addr big) n)
+             (seal:utf8-decode big :end n)))
+          (t (seal:utf8-decode buf :end n)))))
+
+(defun ui-set-frame (handle x y w h)
+  (swift-call "ui_set_frame" handle x y w h))
+
+(defun ui-remove (handle)
+  (swift-call "ui_remove" handle))
+
+(defun ui-tap (handle)
+  "Tap the button HANDLE, as a touch would: its event comes back through SWIFT-PUMP."
+  (swift-call "ui_send_tap" handle))
+
+;;; The events.  Each is (kind handle value), with kind 1 tap, 2 switch, 3 slider, 4 text.
+
+(defparameter *event-kinds* '((1 . :tap) (2 . :switch) (3 . :slider) (4 . :text)))
+
+(defun %next-event ()
+  "The oldest event from the native side: (values kind handle value), or NIL when there is none."
+  (let* ((buf (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0))
+         (got (swift-call "ui_events_next" (%addr buf))))
+    (when (= got 1)
+      (values (%get-word buf 0) (%get-word buf 8) (%get-word buf 16)))))
+
+(defvar *handlers* (make-hash-table :test 'equal))
+
+(defun on-event (kind handle fn)
+  "Run FN with (value handle) when HANDLE sends an event of KIND (:tap, :switch, :slider or :text)."
+  (setf (gethash (list kind handle) *handlers*) fn)
+  (pushnew 'swift-pump cl-user::*kiln-frame-hooks*))
+
+(defun on-tap (handle fn)
+  (on-event :tap handle fn))
+
+(defun swift-pump ()
+  "Each frame: the native events, delivered (a few at a time, so a frame is never long)."
+  (loop repeat 16
+        do (multiple-value-bind (kind handle value) (%next-event)
+             (unless kind (return))
+             (let* ((name (cdr (assoc kind *event-kinds*)))
+                    (fn (and name (gethash (list name handle) *handlers*))))
+               (when fn
+                 (handler-case (funcall fn value handle)
+                   (serious-condition (e)
+                     (format t "~&event handler ~A ~A: ~A~%" name handle e))))))))
