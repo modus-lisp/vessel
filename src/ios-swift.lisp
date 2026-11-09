@@ -14,7 +14,7 @@
 (defpackage #:kiln-swift
   (:use #:cl)
   (:export #:swift-call #:ui-label #:ui-button #:ui-switch #:ui-slider #:ui-text-field #:ui-panel
-           #:ui-stack #:ui-scroll #:ui-image #:ui-add
+           #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-rows
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
 
@@ -115,6 +115,16 @@
 (defun ui-remove (handle)
   (swift-call "ui_remove" handle))
 
+(defun ui-list (x y w h)
+  "A list of rows: set them with UI-LIST-SET-ROWS.  The table makes its cells as they scroll into view;
+   a tap on a row is a :select event with the row's index."
+  (swift-call "ui_list_new" x y w h))
+
+(defun ui-list-set-rows (handle rows)
+  "ROWS, a list of strings, are the list's rows in order."
+  (let ((b (%octets (format nil "~{~A~^~%~}" rows))))
+    (swift-call "ui_list_set_rows" handle (%addr b) (length b))))
+
 (defun ui-resign (handle)
   "The view HANDLE gives up the keyboard (a text field's)."
   (swift-call "ui_resign" handle))
@@ -125,7 +135,7 @@
 
 ;;; The events.  Each is (kind handle value), with kind 1 tap, 2 switch, 3 slider, 4 text.
 
-(defparameter *event-kinds* '((1 . :tap) (2 . :switch) (3 . :slider) (4 . :text)))
+(defparameter *event-kinds* '((1 . :tap) (2 . :switch) (3 . :slider) (4 . :text) (5 . :select)))
 
 (defun %next-event ()
   "The oldest event from the native side: (values kind handle value), or NIL when there is none."

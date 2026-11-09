@@ -91,6 +91,17 @@
         (name (kiln-swift:ui-label "star.fill" 24 330 350 30)))
     (list picture name)))
 
+(defun %story-list ()
+  "Twenty rows: only the visible ones are made, and a tap on one shows which it was."
+  (let* ((table (kiln-swift:ui-list 24 200 350 560))
+         (selected (kiln-swift:ui-label "selected: nothing" 24 780 350 30)))
+    (kiln-swift:ui-list-set-rows table (loop for i from 1 to 20 collect (format nil "row ~D" i)))
+    (kiln-swift:on-event :select table
+                         (lambda (row h)
+                           (declare (ignore h))
+                           (kiln-swift:ui-set-text selected (format nil "selected: row ~D" (1+ row)))))
+    (list table selected)))
+
 (defparameter *stories*
   (list (cons "label" #'%story-label)
         (cons "button" #'%story-button)
@@ -99,7 +110,8 @@
         (cons "text" #'%story-text)
         (cons "stack" #'%story-stack)
         (cons "scroll" #'%story-scroll)
-        (cons "image" #'%story-image)))
+        (cons "image" #'%story-image)
+        (cons "list" #'%story-list)))
 
 ;;; ---- the storybook ------------------------------------------------------------------------------
 
