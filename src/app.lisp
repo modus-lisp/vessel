@@ -321,7 +321,7 @@
 
 (defun %kiln-ssh-session (host user port)
   (%kiln-c "CONNECT")                   ; no conch: say so, before anything else complains
-  (let ((zs (find-package "KILN-ZERO-SSH")))
+  (let ((zs (or (find-package "KILN-IOS-SSH") (find-package "KILN-ZERO-SSH"))))
     (unless zs (error "no kiln-zero-ssh in this desk"))
     (funcall (find-symbol "SSH-INSTALL" zs))
     (let* ((conn (funcall (%kiln-c "CONNECT") host :port port :user user
@@ -442,10 +442,31 @@
       (values (lambda (down ks) (when down (key ks)))
               nil
               (lambda () (when remote (take-remote)) (when dirty (setf dirty nil) (redraw) t))
-              nil
+              (lambda () (format nil "~{~a~%~}" (append lines (list input))))
               (lambda () (when remote (ignore-errors (funcall (%kiln-c "DISCONNECT") (first remote)))))
               nil
               t))))                       ; it takes typing
+
+;; THE FRAME QUEUE: steps that run one per frame, after the frame before them has been shown.  A
+;; step that changes the screen (a button's highlight, a key typed into the Terminal) is drawn
+;; before the next step runs, so an action that blocks -- an ssh -- starts only once its own
+;; press is on the screen.  The loop runs one step per iteration, after desk-tick presents.
+(defvar *kiln-frame-queue* nil "Thunks to run, one per frame, after that frame is presented.")
+(defvar *kiln-present-changes* nil
+  "Shows what has changed on the desk now (set by kiln-app-main: it knows the screen's scaling).")
+
+(defvar *kiln-frame-hooks* nil
+  "Functions run once per frame, after the desk's: a platform's bridge polls its events here
+   (ios-swift.lisp's SWIFT-PUMP).  A hook that signals is reported and dropped, not run again.")
+
+(defun %kiln-run-frame-hooks ()
+  (dolist (f *kiln-frame-hooks*)
+    (handler-case (funcall f)
+      (serious-condition (e) (format t "~&frame hook ~A: ~A~%" f e)))))
+
+(defun %kiln-run-queued-frame ()
+  (let ((next (pop *kiln-frame-queue*)))
+    (when next (funcall next))))
 
 (defun %kiln-blit-region (big k x0 y0 x y w h)
   "Show desk rectangle (X,Y,W,H), already magnified by K into BIG, at screen offset (X0,Y0):
@@ -490,6 +511,9 @@
                                   :root (concatenate 'string dir "media/") :mixer mixer)))
          (desk (glass.desk:make-desk (glass:make-framebuffer dw dh))))
     (setf *kiln-desk* desk)
+    ;; a window's copy box puts its text on the host's clipboard (the iPhone's pasteboard)
+    (when (fboundp '%kiln-copy-text)
+      (setf glass.desk:*desk-copy* (symbol-function '%kiln-copy-text)))
     (format t "~&kiln: ~Dx~D screen, desk ~Dx~D at ~Dx, media from ~A~%" sw sh dw dh k dir)
     (%kiln-sys 1002 0 (+ sw (* sh 65536)) #x1E2530)
     ;; TOUCH-SIZED CHROME: a 34-point title bar to drag by, 44-point menu rows (iOS's
@@ -520,6 +544,10 @@
     (when (and (fboundp 'kiln-console-available-p) (funcall 'kiln-console-available-p))
       (glass.desk:desk-register-app desk "Console" (symbol-function '%kiln-console-app)
                                     :width (min dw 600) :height 320))
+    ;; THE ACTIONS window (actions.lisp, when it is loaded): a grid of buttons, each typing a form into a Terminal
+    (when (fboundp '%kiln-actions-app)
+      (glass.desk:desk-register-app desk "Actions" (symbol-function '%kiln-actions-app)
+                                    :width (min dw 300) :height 220))
     ;; THE KEYBOARD follows the focus: the desk raises the phone's keyboard (pseudo-syscall 1006)
     ;; when a window that takes text is opened or tapped into, and puts it away when you tap
     ;; elsewhere; what is typed arrives as key events below
@@ -538,6 +566,22 @@
       (format t "~&kiln: ~D track~:P~%"
               (length (funcall (find-symbol "FOLDER-TRACKS" "WARP-MEDIA")
                                (concatenate 'string dir "media/")))))
+    ;; THE UI SYNC: what has changed is shown now.  A Return is handled only after this, so a line
+    ;; is drawn before it is evaluated (a form may block for a long time), and pasted text, which
+    ;; arrives as keys, shows before its newline runs.
+    (setf *kiln-present-changes*
+          (lambda ()
+            (multiple-value-bind (changed x y w h) (glass.desk:desk-tick desk)
+              (when changed
+                (if (eq (glass:fb-format (glass.desk:desk-fb desk)) :xrgb)
+                    (progn
+                      (if (= k 1)
+                          (%kiln-blit-region (glass.desk:desk-fb desk) 1 x0 y0 x y w h)
+                          (progn
+                            (glass:fb-blit-scaled-region big (glass.desk:desk-fb desk) k x y w h)
+                            (%kiln-blit-region big k x0 y0 x y w h)))
+                      (%kiln-sys 1003 0 0 0))
+                    (%kiln-sys 1007 (glass.desk:desk-fb desk) 0 0))))))
     ;; A tap or a repaint that signals is logged and dropped: one bad gesture
     ;; must not take the app down (an error out of here ends the process).
     (loop
@@ -563,6 +607,8 @@
                       ;; A Y'CbCr desk (glass :I420) is shown as it is: the platform scans
                       ;; the planes out (pseudo-syscall 1007, the Zero's HVS)
                       (%kiln-sys 1007 (glass.desk:desk-fb desk) 0 0))))
+              (%kiln-run-queued-frame)
+              (%kiln-run-frame-hooks)
               ;; a frame is 16 ms; sleep only what is left of it, not 16 ms on top of the work --
               ;; or spend it on the platform's own work (the Zero's sockets, when they share
               ;; this thread) if it has a way to wait that does that
@@ -580,7 +626,9 @@
                     (if (and (or (= ks #x7e) (= ks #x2f))
                              (not (and focus (glass.desk::win-text-p focus))))
                         (glass.desk:desk-open desk "Terminal")
-                        (progn (glass.desk:desk-key desk t ks)
+                        (progn (when (and (= ks #xff0d) *kiln-present-changes*)
+                                 (funcall *kiln-present-changes*))   ; the line is drawn before it runs
+                               (glass.desk:desk-key desk t ks)
                                (glass.desk:desk-key desk nil ks))))
                   (glass.desk:desk-pointer desk (if (or (= type 3) (= type 5)) 0 1)
                                            (floor (- x x0) k) (floor (- y y0) k))))))

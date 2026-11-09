@@ -18,6 +18,16 @@
   (declare (ignore e))
   (modus-int::%gc-safe-block-6 n a b c d))
 
+(defun %kiln-copy-text (text)
+  "Put TEXT on the iPhone's pasteboard: pseudo-syscall 1007 reads the bytes in place and makes
+   the UTF-8 string from them.  Characters past ASCII come out as ?, which is what a copy of a
+   Terminal's text needs and no more."
+  (let* ((v (map '(simple-array (unsigned-byte 8) (*))
+                 (lambda (c) (if (< (char-code c) 128) (char-code c) 63)) text))
+         (addr (+ (modus-int::%gc-word-of v (modus-int::%conv-addr #x100050A0)) 7)))
+    (%kiln-sys 1007 addr (length v) 0)
+    t))
+
 (defun kiln-ios-main (&key autoplay)
   "The iPhone app (src/app.lisp), below the status bar.  No media for now: the desk,
    Clock and Terminal first (warp is not in this world)."
