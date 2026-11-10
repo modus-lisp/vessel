@@ -632,6 +632,13 @@
         (cons "pagevc" '%story-pagevc)
         (cons "file" '%story-file)))
 
+;; the seventh page: row editing, an edit menu, a popover, a split view
+(defparameter *stories-7*
+  (list (cons "editing" '%story-editing)
+        (cons "editmenu" '%story-editmenu)
+        (cons "popover" '%story-popover)
+        (cons "split" '%story-split)))
+
 (defun %story-sections ()
   "A list in two sections, 'today' and 'later'; the readout names the row picked, by its number."
   (let* ((readout (kiln-swift:ui-label "selected: none" 24 200 350 30))
@@ -671,6 +678,76 @@
 (defun %story-file ()
   "A circle drawn, saved as a PNG file, and shown from that file."
   (list (kiln-swift:ui-file-image :oval #x2ecc71 120 24 240)))
+
+(defun %story-editing ()
+  "A list whose rows can be deleted in editing mode; the readout names the row deleted, by its number."
+  (let* ((readout (kiln-swift:ui-label "deleted: none" 24 200 350 30))
+         (edit (kiln-swift:ui-button "edit rows" 24 240 140 40))
+         (table (kiln-swift:ui-list 24 290 350 450))
+         (editing nil))
+    (kiln-swift:ui-list-set-data table (loop for i from 1 to 4 collect (list :title (format nil "item ~D" i))))
+    (kiln-swift:on-event :delete table
+                         (lambda (index h)
+                           (declare (ignore h))
+                           (kiln-swift:ui-set-text readout (format nil "deleted: ~D" (1+ index)))))
+    (kiln-swift:on-tap edit
+                       (lambda (value h)
+                         (declare (ignore value h))
+                         (setf editing (not editing))
+                         (kiln-swift:ui-list-editing table editing)))
+    (list table readout edit)))
+
+(defun %story-editmenu ()
+  "A label with an edit menu: a long press opens it, and the readout names the choice."
+  (let* ((choices '("copy" "paste"))
+         (target (kiln-swift:ui-label "long press for edit menu" 24 200 350 60))
+         (readout (kiln-swift:ui-label "edit: none" 24 280 350 30)))
+    (kiln-swift:ui-edit-menu target choices)
+    (kiln-swift:on-event :edit target
+                         (lambda (index h)
+                           (declare (ignore h))
+                           (kiln-swift:ui-set-text readout (format nil "edit: ~A" (nth index choices)))))
+    (list target readout)))
+
+(defun %story-popover ()
+  "A button that shows its content as a popover (a sheet on a phone); 'done' in it closes it."
+  (let* ((readout (kiln-swift:ui-label "popover: closed" 24 260 350 30))
+         (source (kiln-swift:ui-button "show popover" 24 200 160 40)))
+    (kiln-swift:on-tap source
+                       (lambda (value h)
+                         (declare (ignore value h))
+                         (let* ((content (kiln-swift:ui-modal))
+                                (done (kiln-swift:ui-button "done popover" 24 120 160 40)))
+                           (kiln-swift:ui-add content (kiln-swift:ui-label "in the popover" 24 60 300 30))
+                           (kiln-swift:ui-add content done)
+                           (kiln-swift:on-tap done
+                                              (lambda (value2 h2)
+                                                (declare (ignore value2 h2))
+                                                (kiln-swift:ui-modal-dismiss content)
+                                                (kiln-swift:ui-set-text readout "popover: closed")))
+                           (kiln-swift:ui-popover content source))))
+    (list source readout)))
+
+(defun %story-split ()
+  "A split view of a primary and a secondary column, shown as a sheet.  On a phone the secondary shows first, and
+   Back shows the primary, whose 'done split' closes the sheet."
+  (let ((open (kiln-swift:ui-button "show split" 24 200 160 40)))
+    (kiln-swift:on-tap open
+                       (lambda (value h)
+                         (declare (ignore value h))
+                         (let* ((primary (kiln-swift:ui-modal))
+                                (secondary (kiln-swift:ui-modal))
+                                (done (kiln-swift:ui-button "done split" 24 120 160 40))
+                                (split nil))
+                           (kiln-swift:ui-add primary (kiln-swift:ui-label "primary view" 24 60 300 30))
+                           (kiln-swift:ui-add primary done)
+                           (kiln-swift:ui-add secondary (kiln-swift:ui-label "secondary view" 24 60 300 30))
+                           (kiln-swift:on-tap done
+                                              (lambda (value2 h2)
+                                                (declare (ignore value2 h2))
+                                                (kiln-swift:ui-modal-dismiss split)))
+                           (setf split (kiln-swift:ui-split primary secondary)))))
+    (list open)))
 
 (defparameter *stories*
   (list (cons "label" #'%story-label)
@@ -730,7 +807,7 @@
         (cons "tabctl" #'%story-tabctl)
         (cons "navctl" #'%story-navctl)))
 
-(defparameter *pages* (list *stories* *stories-2* *stories-3* *stories-4* *stories-5* *stories-6*))
+(defparameter *pages* (list *stories* *stories-2* *stories-3* *stories-4* *stories-5* *stories-6* *stories-7*))
 
 ;;; ---- the storybook ------------------------------------------------------------------------------
 

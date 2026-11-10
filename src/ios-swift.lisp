@@ -28,6 +28,7 @@
            #:ui-tab-controller #:ui-tab-content #:ui-nav-controller #:ui-nav-root #:ui-nav-push-view
            #:ui-attributed-label #:ui-dynamic-label #:ui-safe-area-top #:ui-parallax #:ui-zoom-scroll #:ui-zoom-content
            #:ui-drawn-image #:ui-file-image #:ui-page-controller #:ui-page-content
+           #:ui-list-editing #:ui-edit-menu #:ui-popover #:ui-split
            #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-data
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
@@ -342,6 +343,25 @@
 (defun ui-page-content (pager index)
   "The view of page INDEX of the page view controller PAGER, to add to with UI-ADD."
   (swift-call "ui_page_content" pager index))
+
+(defun ui-list-editing (list-handle on)
+  "The rows of the list LIST-HANDLE show their delete controls when ON.  Deleting one is a :delete event with the
+   row's index."
+  (swift-call "ui_list_editing" list-handle (if on 1 0)))
+
+(defun ui-edit-menu (handle choices)
+  "A long press on the view HANDLE opens an edit menu of the strings in CHOICES.  Choosing one is an :edit event
+   with HANDLE and the choice's index."
+  (let ((b (%term-octets choices)))
+    (swift-call "ui_edit_menu_on" handle (%addr b) (length b))))
+
+(defun ui-popover (modal source)
+  "Show MODAL (from UI-MODAL) as a popover from the view SOURCE.  On a phone it is a sheet."
+  (swift-call "ui_popover_present" modal source))
+
+(defun ui-split (primary secondary)
+  "A split view of two contents (from UI-MODAL), shown as a sheet.  On a phone it shows the primary."
+  (swift-call "ui_split_present" primary secondary))
 
 (defun ui-panel (x y w h rgb)
   (swift-call "ui_panel_new" x y w h rgb))
