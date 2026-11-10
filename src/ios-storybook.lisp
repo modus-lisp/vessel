@@ -53,7 +53,8 @@
     (kiln-swift:on-event :slider slider
                          (lambda (value h)
                            (declare (ignore h))
-                           (kiln-swift:ui-set-text readout (format nil "value ~D" value))))
+                           ;; the slider sends a double, as a term
+                           (kiln-swift:ui-set-text readout (format nil "value ~D" (round value)))))
     (list readout slider)))
 
 (defun %story-text ()
@@ -65,7 +66,7 @@
                            (declare (ignore value))
                            (kiln-swift:ui-set-text mirror (kiln-swift:ui-text-value h))))
     ;; the keyboard covers the bottom of the screen; "done" gives it up
-    (kiln-swift:on-tap done (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-resign field)))
+    (kiln-swift:on-tap done (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-resign)))
     (list field mirror done)))
 
 (defun %story-stack ()
@@ -95,7 +96,10 @@
   "Twenty rows: only the visible ones are made, and a tap on one shows which it was."
   (let* ((table (kiln-swift:ui-list 24 200 350 560))
          (selected (kiln-swift:ui-label "selected: nothing" 24 780 350 30)))
-    (kiln-swift:ui-list-set-rows table (loop for i from 1 to 20 collect (format nil "row ~D" i)))
+    (kiln-swift:ui-list-set-data table
+                                 (loop for i from 1 to 20
+                                       collect (list :id i :title (format nil "row ~D" i)
+                                                     :subtitle "a record, sent as a term")))
     (kiln-swift:on-event :select table
                          (lambda (row h)
                            (declare (ignore h))
