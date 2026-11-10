@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# slot-install.sh — put a kernel and core in the Zero's slot A, from a running board, over SSH.
+# slot-install.sh — put a kernel and core in the Zero's TRYBOOT slot, from a running board, over SSH.
 #
 #   tools/slot-install.sh KERNEL.img DESK.core
 #
-# The card has two slots (see the card's config.txt / tryboot.txt):
-#   B, the DEFAULT: config.txt  -> kernel8-b.img, cmdline-b.txt, core 2:/boot/desk-b.core
-#   A, tryboot only: tryboot.txt -> kernel8-a.img, cmdline-a.txt, core 2:/boot/desk-a.core
-# This replaces slot A's kernel (boot partition) and core (the store, partition 2), and
-# touches nothing of slot B's -- so whatever happens, a plain reset still boots B.  Boot A
-# once with (modus-int::reboot :tryboot t) on the board.
+# The card has two slots, A and B, each a kernel8-X.img, a cmdline-X.txt and a core at
+# 2:/boot/desk-X.core.  config.txt names the DEFAULT slot; tryboot.txt names the other, which
+# the firmware boots only on a tryboot.  This installs into the slot tryboot.txt names (read off
+# the card) and refuses if config.txt names it too, so whatever happens a plain reset still
+# boots the default.  Boot the new one once with (modus-int::reboot :tryboot t); when it works,
+# tools/slot-flip.sh makes it the default.
+#
+# The kernel reads its core from the card (CORE=2:/boot/desk-X.core in cmdline-X.txt: modus's
+# lib/core-from-card.lisp), so tryboot.txt must not name an initramfs: the firmware would load
+# the default slot's desk.core into RAM, and the new kernel would refuse it ("written by a
+# different modus binary").  This drops such a line.
 #
 # Each file is cut into 64 KB pieces with an FNV-1a hash each and served over HTTP from the
 # machine wired to the board; the board fetches each piece (again, if its hash is wrong)
@@ -28,6 +33,16 @@ SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ER
 zeval() { ssh "${SSHO[@]}" -J "$GW" "modus@$ZH" "$1"; }
 [ $# -eq 2 ] || { sed -n '2,24p' "$0"; exit 2; }
 kernel=$(realpath "$1") core=$(realpath "$2")
+# which slot: the letter in tryboot.txt's kernel=kernel8-X.img, never the one config.txt boots
+slot_of() {
+  zeval "(let* ((s (map (quote string) (function code-char) (fs-fat:fat32-read-file (kiln-zero-card::%volume) \"/$1\"))) (i (search \"kernel=kernel8-\" s))) (if i (string-downcase (string (char s (+ i 15)))) \"none\"))" \
+    | tr -dc 'a-z'
+}
+slot=$(slot_of tryboot.txt) dflt=$(slot_of config.txt)
+case $slot in a|b) ;; *) echo "slot-install: tryboot.txt names no kernel8-X.img slot ($slot)" >&2; exit 1 ;; esac
+[ "$slot" != "$dflt" ] || { echo "slot-install: tryboot.txt and config.txt both boot slot $slot; refusing to write the default" >&2; exit 1; }
+SLOT=$(echo "$slot" | tr a-z A-Z)
+echo "slot-install: default is slot $(echo "$dflt" | tr a-z A-Z); installing into slot $SLOT" >&2
 work=$(mktemp -d)
 trap 'rm -rf "$work"; ssh "${SSHO[@]}" "$GW" "[ -f /tmp/slot-install/pid ] && kill \$(cat /tmp/slot-install/pid); rm -rf /tmp/slot-install" >/dev/null 2>&1 || true' EXIT
 
@@ -77,15 +92,35 @@ run() {  # run LABEL FORM -- one write; poll the log if the eval's session drops
   zeval '(prin1-to-string (car kz-slot-log))'
 }
 U="http://$GIP:$PORT/"
-# the core first: the store has room for old and new, and a failure leaves slot A's old core
+# the core first: the store has room for old and new, and a failure leaves the slot's old core
 # (SLOT_SKIP_CORE=1: the core is already in -- only the kernel)
 [ -n "${SLOT_SKIP_CORE:-}" ] || {
-run "core -> 2:/boot/desk-a.core ($(stat -c %s "$core") bytes)" \
-  "(kz-slot-write (kiln-zero-card::%store) \"/boot/desk-a.core\" \"$U\" \"core\")"
-zeval '(if (getf (cdr (car kz-slot-log)) :error) :failed :core-ok)' | grep -q CORE-OK || { echo "slot-install: the core did not go in; slot A's kernel is left alone" >&2; exit 1; }
+run "core -> 2:/boot/desk-$slot.core ($(stat -c %s "$core") bytes)" \
+  "(kz-slot-write (kiln-zero-card::%store) \"/boot/desk-$slot.core\" \"$U\" \"core\")"
+zeval '(if (getf (cdr (car kz-slot-log)) :error) :failed :core-ok)' | grep -q CORE-OK || { echo "slot-install: the core did not go in; slot $SLOT's kernel is left alone" >&2; exit 1; }
 }
-# the boot partition has no room for two kernels: slot A's old one goes first
-zeval '(let ((v (kiln-zero-card::%volume))) (when (fs-fat:fat32-lookup v "/kernel8-a.img") (fs-fat:fat32-delete v "/kernel8-a.img")) (fs-fat:fat32-sync v) :deleted)'
-run "kernel -> 1:/kernel8-a.img ($(stat -c %s "$kernel") bytes)" \
-  "(kz-slot-write (kiln-zero-card::%volume) \"/kernel8-a.img\" \"$U\" \"kernel\")"
+# the boot partition has no room for a third kernel: the slot's old one goes first
+zeval "(let ((v (kiln-zero-card::%volume))) (when (fs-fat:fat32-lookup v \"/kernel8-$slot.img\") (fs-fat:fat32-delete v \"/kernel8-$slot.img\")) (fs-fat:fat32-sync v) :deleted)"
+run "kernel -> 1:/kernel8-$slot.img ($(stat -c %s "$kernel") bytes)" \
+  "(kz-slot-write (kiln-zero-card::%volume) \"/kernel8-$slot.img\" \"$U\" \"kernel\")"
 zeval '(let ((bad (remove-if (lambda (r) (equal (getf (cdr r) :want) (getf (cdr r) :have))) (subseq kz-slot-log 0 (min 2 (length kz-slot-log)))))) (if bad (list :MISMATCH bad) :verified))'
+# the new kernel reads its core from CORE=: tryboot.txt must not hand it the default slot's
+# desk.core as an initramfs, and cmdline-X.txt must name the core just written.  (The board's
+# REPL takes one form per line: the form is written out readably here and joined.)
+fix=$(sed "s/@SLOT@/$slot/g" <<'FORM' | tr '\n' ' '
+(let* ((v (kiln-zero-card::%volume))
+       (tb (map 'string #'code-char (fs-fat:fat32-read-file v "/tryboot.txt")))
+       (i (search "initramfs " tb))
+       (cl (map 'string #'code-char (fs-fat:fat32-read-file v "/cmdline-@SLOT@.txt"))))
+  (when i
+    (let ((ls (or (position #\Newline tb :end i :from-end t) -1))
+          (le (or (position #\Newline tb :start i) (1- (length tb)))))
+      (fs-fat:fat32-write-file v "/tryboot.txt"
+        (map '(vector (unsigned-byte 8)) #'char-code
+             (concatenate 'string (subseq tb 0 (1+ ls)) (subseq tb (1+ le)))))
+      (fs-fat:fat32-sync v)))
+  (list :initramfs-dropped (and i t)
+        :cmdline-core (if (search "CORE=2:/boot/desk-@SLOT@.core" cl) :ok :missing)))
+FORM
+)
+ssh "${SSHO[@]}" -J "$GW" "modus@$ZH" "$fix"
