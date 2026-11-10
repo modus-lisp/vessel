@@ -130,16 +130,23 @@
   (and *host-public* (format nil "SHA256:~a" (%base64 (%sha256 (%ssh-blob *host-public*)) :pad nil))))
 
 ;;; ---- identity --------------------------------------------------------------------------------
+(defun %fixed (octets)
+  "OCTETS copied into fixed memory, the heap copy wiped: natrium signs only with a key the
+   collector never moves (gossamer), and refuses one on the moving heap."
+  (prog1 (funcall (%fn "FIXED-COPY" "GOSSAMER") octets)
+    (fill octets 0)))
+
 (defun %identity ()
-  "This board's nostr secret and its SSH host key's seed: from NSEC, or fresh."
+  "This board's nostr secret (in fixed memory) and its SSH host key's seed: from NSEC, or fresh."
   (let ((nsec (%bootarg "NSEC")))
     (if nsec
         (let ((sk (funcall (%fn "NSEC-DECODE" "CL-NOSTR.BECH32") nsec)))
           (setf sk (coerce sk '(vector (unsigned-byte 8))))
           (unless (= (length sk) 32) (error "NSEC is not a 32-byte key"))
           ;; the host key is DERIVED, not the nostr key itself: one secret, two curves, kept apart
-          (values sk (%sha256 (%cat sk (%bytes "modus ssh host key"))) :nsec))
-        (values (%random 32) (%random 32) :fresh))))
+          (let ((seed (%sha256 (%cat sk (%bytes "modus ssh host key")))))
+            (values (%fixed sk) seed :nsec)))
+        (values (%fixed (%random 32)) (%random 32) :fresh))))
 
 (defun npub ()
   (and *nostr-secret*
