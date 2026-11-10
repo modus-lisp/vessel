@@ -17,6 +17,17 @@
 (defpackage #:kiln-swift
   (:use #:cl)
   (:export #:swift-call #:ui-label #:ui-button #:ui-switch #:ui-slider #:ui-text-field #:ui-panel
+           #:ui-text-view #:ui-segmented #:ui-progress #:ui-spinner
+           #:ui-stepper #:ui-page-control #:ui-date-picker #:ui-on-long-press
+           #:ui-alert #:ui-alert-action #:ui-alert-present #:ui-tab-bar #:ui-on-refresh #:ui-send-refresh
+           #:ui-search-bar #:ui-toolbar #:ui-picker #:ui-blur #:ui-on-pan
+           #:ui-grid #:ui-menu-button #:ui-color-well
+           #:ui-nav-bar #:ui-nav-push #:ui-nav-pop #:ui-context-menu #:ui-animate-to #:ui-shape #:ui-on-swipe
+           #:ui-share #:ui-set-accessibility #:ui-haptic #:ui-fade-to #:ui-modal #:ui-modal-present #:ui-modal-dismiss
+           #:ui-paging #:ui-list-actions #:ui-announce
+           #:ui-tab-controller #:ui-tab-content #:ui-nav-controller #:ui-nav-root #:ui-nav-push-view
+           #:ui-attributed-label #:ui-dynamic-label #:ui-safe-area-top #:ui-parallax #:ui-zoom-scroll #:ui-zoom-content
+           #:ui-drawn-image #:ui-file-image #:ui-page-controller #:ui-page-content
            #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-data
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
@@ -78,6 +89,259 @@
 (defun ui-text-field (placeholder x y w h)
   (let ((b (%octets placeholder)))
     (swift-call "ui_text_field_new" (%addr b) (length b) x y w h)))
+
+(defun ui-text-view (text x y w h)
+  "A multi-line text view with TEXT.  Its changes are :text events (read it with UI-TEXT-VALUE)."
+  (let ((b (%octets text)))
+    (swift-call "ui_text_view_new" (%addr b) (length b) x y w h)))
+
+(defun ui-segmented (titles x y w h)
+  "A segmented control: one segment per string in TITLES.  Choosing one is a :select event with its index."
+  (let ((b (%term-octets titles)))
+    (swift-call "ui_segmented_new" (%addr b) (length b) x y w h)))
+
+(defun ui-progress (percent x y w h)
+  "A progress bar at PERCENT (0 to 100); UI-SET-VALUE moves it."
+  (swift-call "ui_progress_new" percent x y w h))
+
+(defun ui-spinner (x y w h)
+  "An activity indicator, spinning.  UI-SET-VALUE with NIL stops it, and with T starts it again."
+  (swift-call "ui_spinner_new" x y w h))
+
+(defun ui-stepper (value x y)
+  "A stepper from 0 to 100, at VALUE.  Each change is a :step event with its value."
+  (swift-call "ui_stepper_new" value x y))
+
+(defun ui-page-control (pages current x y)
+  "A page control: PAGES dots with the CURRENT one lit (UI-SET-VALUE moves it).  A tap on a dot is a :page
+   event with its index."
+  (swift-call "ui_page_new" pages current x y))
+
+(defun ui-date-picker (seconds x y)
+  "A date picker showing the date SECONDS (since 1970).  A change is a :date event with the new seconds."
+  (swift-call "ui_date_new" seconds x y))
+
+(defun ui-on-long-press (handle ms)
+  "A long press on the view HANDLE, held at least MS milliseconds, is a :longpress event with HANDLE."
+  (swift-call "ui_long_press_on" handle ms))
+
+(defun ui-alert (title message &key sheet)
+  "An alert with TITLE and MESSAGE, not shown yet: add its buttons with UI-ALERT-ACTION, then show it with
+   UI-ALERT-PRESENT.  SHEET makes it an action sheet (its buttons from the bottom of the screen).  A button is
+   an :alert event with the alert's handle and the button's index."
+  (let ((tb (%octets title))
+        (mb (%octets message)))
+    (swift-call "ui_alert_new" (%addr tb) (length tb) (%addr mb) (length mb) (if sheet 1 0))))
+
+(defun ui-search-bar (placeholder x y w h)
+  "A search bar with PLACEHOLDER.  Each change of its text is a :text event (read it with UI-TEXT-VALUE)."
+  (let ((b (%octets placeholder)))
+    (swift-call "ui_search_bar_new" (%addr b) (length b) x y w h)))
+
+(defun ui-toolbar (titles x y w h)
+  "A toolbar with a button per string in TITLES, spaced evenly.  Tapping one is a :select event with its index."
+  (let ((b (%term-octets titles)))
+    (swift-call "ui_toolbar_new" (%addr b) (length b) x y w h)))
+
+(defun ui-alert-action (alert title)
+  "A button of ALERT, titled TITLE, in the order added."
+  (let ((b (%octets title)))
+    (swift-call "ui_alert_action" alert (%addr b) (length b))))
+
+(defun ui-alert-present (alert)
+  "Show ALERT over the app's screen."
+  (swift-call "ui_alert_present" alert))
+
+(defun ui-tab-bar (titles x y w h)
+  "A tab bar, an item per string in TITLES.  Choosing one is a :select event with its index."
+  (let ((b (%term-octets titles)))
+    (swift-call "ui_tab_bar_new" (%addr b) (length b) x y w h)))
+
+(defun ui-on-refresh (list-handle)
+  "Pulling the list LIST-HANDLE down is a :refresh event with its handle.  UI-SET-VALUE with 0 stops its spinner."
+  (swift-call "ui_refresh_on" list-handle))
+
+(defun ui-send-refresh (list-handle)
+  "A pull on the list LIST-HANDLE, sent as its refresh control sends it: the :refresh event then comes back.
+   For tests, like UI-TAP."
+  (swift-call "ui_send_refresh" list-handle))
+
+(defun ui-picker (titles x y w h)
+  "A wheel of rows, one per string in TITLES.  Choosing a row is a :select event with its index; UI-SET-VALUE
+   selects a row from code."
+  (let ((b (%term-octets titles)))
+    (swift-call "ui_picker_new" (%addr b) (length b) x y w h)))
+
+(defun ui-blur (x y w h)
+  "A blur of what is behind it.  Its children (UI-ADD) go on top of the blur."
+  (swift-call "ui_blur_new" x y w h))
+
+(defun ui-on-pan (handle)
+  "A pan on the view HANDLE: when it ends, a :pan event with the horizontal distance dragged."
+  (swift-call "ui_pan_on" handle))
+
+(defun ui-grid (titles x y w h)
+  "A grid of tiles, one per string in TITLES.  Tapping one is a :select event with its index."
+  (let ((b (%term-octets titles)))
+    (swift-call "ui_grid_new" (%addr b) (length b) x y w h)))
+
+(defun ui-menu-button (choices x y w h)
+  "A button, 'options', whose menu offers the strings in CHOICES.  Choosing one is a :menu event with its index."
+  (let ((b (%term-octets choices)))
+    (swift-call "ui_menu_button_new" (%addr b) (length b) x y w h)))
+
+(defun ui-color-well (rgb x y w h)
+  "A colour well showing RGB (0xRRGGBB).  A new colour is a :color event with it as RGB; UI-SET-VALUE sets it."
+  (swift-call "ui_color_well_new" rgb x y w h))
+
+(defun ui-nav-bar (x y w h)
+  "A navigation bar, with no items.  UI-NAV-PUSH pushes one; the back button it then shows is a :pop event."
+  (swift-call "ui_nav_bar_new" x y w h))
+
+(defun ui-nav-push (bar title &optional right)
+  "Push an item titled TITLE onto BAR.  RIGHT, if given, is its right button: tapping it is a :navtap event with
+   BAR's handle."
+  (let ((tb (%octets title))
+        (rb (%octets (or right ""))))
+    (swift-call "ui_nav_push" bar (%addr tb) (length tb) (%addr rb) (length rb))))
+
+(defun ui-nav-pop (bar)
+  "Pop the top item of BAR."
+  (swift-call "ui_nav_pop" bar))
+
+(defun ui-context-menu (handle choices)
+  "A context menu on the view HANDLE, of the strings in CHOICES: a long press opens it, and a choice is a :context
+   event with HANDLE and the choice's index."
+  (let ((b (%term-octets choices)))
+    (swift-call "ui_context_menu_on" handle (%addr b) (length b))))
+
+(defun ui-animate-to (handle x y w h ms)
+  "The view HANDLE's frame moves to X Y W H over MS milliseconds."
+  (swift-call "ui_animate_to" handle x y w h ms))
+
+(defun ui-shape (kind x y w h rgb)
+  "A filled shape in the frame: KIND :oval or :rounded, in RGB (0xRRGGBB)."
+  (swift-call "ui_shape_new" (if (eq kind :oval) 0 1) x y w h rgb))
+
+(defun ui-on-swipe (handle direction)
+  "A swipe on the view HANDLE in DIRECTION (:left, :right, :up or :down) is a :swipe event with HANDLE and the
+   direction's number: 0 left, 1 right, 2 up, 3 down."
+  (swift-call "ui_swipe_on" handle (ecase direction (:left 0) (:right 1) (:up 2) (:down 3))))
+
+(defun ui-share (text)
+  "The share sheet, with TEXT as its item.  Returns its handle: its completion is a :share event with the handle and
+   1 (an activity was completed) or 0."
+  (let ((b (%octets text)))
+    (swift-call "ui_share_present" (%addr b) (length b))))
+
+(defun ui-set-accessibility (handle text)
+  "The accessibility label of the view HANDLE: what VoiceOver reads, and what the accessibility tree lists."
+  (let ((b (%octets text)))
+    (swift-call "ui_set_accessibility" handle (%addr b) (length b))))
+
+(defun ui-haptic (strength)
+  "An impact feedback: STRENGTH :light, :medium or :heavy."
+  (swift-call "ui_haptic" (ecase strength (:light 0) (:medium 1) (:heavy 2))))
+
+(defun ui-fade-to (handle percent ms)
+  "The view HANDLE's alpha moves to PERCENT (0 to 100) over MS milliseconds.  Its end is a :fade event with HANDLE."
+  (swift-call "ui_fade_to" handle percent ms))
+
+(defun ui-modal ()
+  "A sheet's content, not yet shown: add to it with UI-ADD, then show it with UI-MODAL-PRESENT."
+  (swift-call "ui_modal_new"))
+
+(defun ui-modal-present (modal &key large)
+  "Show MODAL as a sheet, at medium height, or at large with LARGE.  Dragging it down is a :dismiss event."
+  (swift-call "ui_modal_present" modal (if large 1 0)))
+
+(defun ui-modal-dismiss (modal)
+  "Dismiss MODAL from code (no :dismiss event)."
+  (swift-call "ui_modal_dismiss" modal))
+
+(defun ui-paging (pages x y w h)
+  "A scroll view of PAGES pages, each W wide, that snap to a page.  Each page's content is added with UI-ADD, at
+   its own x.  A page that comes to rest is a :page event with its index."
+  (swift-call "ui_paging_new" pages x y w h))
+
+(defun ui-list-actions (list-handle titles)
+  "Swipe actions for the rows of the list LIST-HANDLE: a button per string in TITLES.  Tapping one is a :rowaction
+   event with the list's handle and the button's index."
+  (let ((b (%term-octets titles)))
+    (swift-call "ui_list_actions" list-handle (%addr b) (length b))))
+
+(defun ui-announce (text)
+  "VoiceOver announces TEXT (nothing changes on the screen)."
+  (let ((b (%octets text)))
+    (swift-call "ui_announce" (%addr b) (length b))))
+
+(defun ui-tab-controller (titles)
+  "A tab bar controller with a tab per string in TITLES.  Its tabs' views come from UI-TAB-CONTENT; show it with
+   UI-MODAL-PRESENT.  A tab picked is a :select event with its index."
+  (let ((b (%term-octets titles)))
+    (swift-call "ui_tab_controller_new" (%addr b) (length b))))
+
+(defun ui-tab-content (tabs index)
+  "The view of tab INDEX of TABS, to add to with UI-ADD."
+  (swift-call "ui_tab_content" tabs index))
+
+(defun ui-nav-controller ()
+  "A navigation controller, its root view from UI-NAV-ROOT.  Show it with UI-MODAL-PRESENT; UI-NAV-PUSH-VIEW pushes
+   a view (its back button reads 'back')."
+  (swift-call "ui_nav_controller_new"))
+
+(defun ui-nav-root (nav)
+  "The view of the root of the navigation controller NAV."
+  (swift-call "ui_nav_root" nav))
+
+(defun ui-nav-push-view (nav title)
+  "Push a view titled TITLE onto NAV; its handle is returned, to add to with UI-ADD."
+  (let ((b (%octets title)))
+    (swift-call "ui_nav_push_view" nav (%addr b) (length b))))
+
+(defun ui-attributed-label (text x y w h)
+  "A label of attributed text: TEXT, underlined and tinted."
+  (let ((b (%octets text)))
+    (swift-call "ui_attributed_label_new" (%addr b) (length b) x y w h)))
+
+(defun ui-dynamic-label (text x y w h)
+  "A label in a text style that follows the user's text size (Dynamic Type)."
+  (let ((b (%octets text)))
+    (swift-call "ui_dynamic_label_new" (%addr b) (length b) x y w h)))
+
+(defun ui-safe-area-top ()
+  "The top safe-area inset of the screen, in points."
+  (swift-call "ui_safe_area_top"))
+
+(defun ui-parallax (handle amount)
+  "A parallax motion effect on the view HANDLE: it moves with the device's tilt, by AMOUNT points."
+  (swift-call "ui_parallax_on" handle amount))
+
+(defun ui-zoom-scroll (x y w h)
+  "A scroll view whose content zooms from 1x to 4x.  Its content view is UI-ZOOM-CONTENT; a zoom that ends is a
+   :zoom event with the scale in percent."
+  (swift-call "ui_zoom_scroll_new" x y w h))
+
+(defun ui-zoom-content (scroll)
+  "The content view of the zoom scroll view SCROLL, to add to with UI-ADD."
+  (swift-call "ui_zoom_content" scroll))
+
+(defun ui-drawn-image (kind rgb size x y)
+  "An image drawn here, an oval (KIND :oval) or a rounded square, in RGB, SIZE points square at X Y."
+  (swift-call "ui_drawn_image_new" (if (eq kind :oval) 0 1) rgb size x y))
+
+(defun ui-file-image (kind rgb size x y)
+  "A shape (KIND :oval or :rounded, in RGB) drawn, saved as a PNG file, and shown from that file."
+  (swift-call "ui_file_image_new" (if (eq kind :oval) 0 1) rgb size x y))
+
+(defun ui-page-controller (count)
+  "A page view controller of COUNT pages.  Its pages' views come from UI-PAGE-CONTENT; show it with UI-MODAL-PRESENT.
+   A page that comes to rest is a :page event with its index."
+  (swift-call "ui_page_controller_new" count))
+
+(defun ui-page-content (pager index)
+  "The view of page INDEX of the page view controller PAGER, to add to with UI-ADD."
+  (swift-call "ui_page_content" pager index))
 
 (defun ui-panel (x y w h rgb)
   (swift-call "ui_panel_new" x y w h rgb))
