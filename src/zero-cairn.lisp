@@ -219,17 +219,50 @@
 (defvar *sync-log* '()
   "One line per repo SYNC-REPOS looked at, newest first.")
 
+(defun update-in-store (dir)
+  "Bring the repository at store directory DIR up to its remote: fetch (the new objects only,
+   the pack streamed to the card), then FAST-FORWARD the current branch and check it out --
+   which writes only the files that changed.  Never merges: a branch that has diverged from
+   its upstream is left as it is.  Returns (:result R :head SHA :seconds S), R one of
+   :fast-forward :up-to-date :diverged :no-upstream :detached."
+  (let* ((t0 (get-internal-real-time))
+         (repo (store-repository dir))
+         (result
+           (progn
+             (let ((*standard-output* (make-broadcast-stream))) (cairn:fetch repo))
+             (multiple-value-bind (kind ref) (cairn::head-ref repo)
+               (if (not (eq kind :symbolic))
+                   :detached
+                   (let ((ours (cairn:head-commit repo))
+                         (theirs (cairn::resolve-ref
+                                  repo (format nil "refs/remotes/origin/~a" (subseq ref (length "refs/heads/"))))))
+                     (cond ((null theirs) :no-upstream)
+                           ((string= ours theirs) :up-to-date)
+                           ((cairn::ancestor-p repo ours theirs)
+                            (cairn::update-ref repo ref theirs)
+                            (cairn:checkout repo theirs)
+                            (fs-fat:fat32-sync (%store))
+                            :fast-forward)
+                           (t :diverged))))))))
+    (list :result result :head (cairn:head-commit repo)
+          :seconds (round (- (get-internal-real-time) t0) internal-time-units-per-second))))
+
 (defun sync-repos (names &key (root "/src") (org "https://github.com/modus-lisp/"))
-  "kiln sync on the card, for the repos NAMES: clone each one missing from ROOT, and leave a
-   present one alone (fetching into one is not here yet).  A repo that fails is logged and
-   the rest still run; a half-made clone is removed so the next run tries it again.  Returns
-   the lines added to *SYNC-LOG*, in order."
+  "kiln sync on the card, for the repos NAMES: clone each one missing from ROOT, and bring a
+   present one up to date (UPDATE-IN-STORE: fetch, then fast-forward).  A repo that fails is
+   logged and the rest still run; a half-made CLONE is removed so the next run tries it again
+   (a failed update leaves the repository as it was: its old refs and files are still good).
+   Returns the lines added to *SYNC-LOG*, in order."
   (let ((lines '()))
     (dolist (name names (nreverse lines))
       (let* ((dir (concatenate 'string root "/" name))
              (line
                (if (fs-fat:fat32-lookup (%store) dir)
-                   (format nil "present ~a" name)
+                   (handler-case
+                       (let ((r (update-in-store dir)))
+                         (format nil "~(~a~) ~a: ~a, ~ds" (getf r :result) name
+                                 (subseq (getf r :head) 0 8) (getf r :seconds)))
+                     (error (e) (format nil "update failed ~a: ~a" name (princ-to-string e))))
                    (handler-case
                        (let ((r (clone-to-store (concatenate 'string org name) dir)))
                          (format nil "cloned ~a: ~d objects, ~d bytes, ~d files, ~ds" name
