@@ -30,6 +30,8 @@
            #:ui-drawn-image #:ui-file-image #:ui-page-controller #:ui-page-content
            #:ui-list-editing #:ui-edit-menu #:ui-popover #:ui-split #:ui-gravity-drop
            #:ui-keyboard-avoid #:ui-keyboard-post #:ui-document-picker #:ui-collection #:ui-image-picker
+           #:ui-on-tap-gesture #:ui-on-edge-pan #:ui-calendar #:ui-unavailable #:ui-color-picker #:ui-font-picker
+           #:ui-input-keys
            #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-data
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
@@ -363,6 +365,36 @@
 (defun ui-split (primary secondary)
   "A split view of two contents (from UI-MODAL), shown as a sheet.  On a phone it shows the primary."
   (swift-call "ui_split_present" primary secondary))
+
+(defun ui-on-tap-gesture (handle)
+  "A tap on the view HANDLE (any view, by a tap gesture recognizer) is a :tap event, as a button's is."
+  (swift-call "ui_tap_on" handle))
+
+(defun ui-on-edge-pan (handle)
+  "A pan in from the screen's left edge over the view HANDLE is an :edge event."
+  (swift-call "ui_edge_pan_on" handle))
+
+(defun ui-calendar (seconds x y w h)
+  "A calendar showing the month of the date SECONDS (since 1970); a day picked is a :date event with its seconds."
+  (swift-call "ui_calendar_new" seconds x y w h))
+
+(defun ui-unavailable (text x y w h)
+  "A content-unavailable view: an image and TEXT, as an empty screen shows."
+  (let ((b (%octets text)))
+    (swift-call "ui_unavailable_new" (%addr b) (length b) x y w h)))
+
+(defun ui-color-picker ()
+  "The system colour picker, over the app.  Returns its handle: a colour picked is a :color event with it as RGB."
+  (swift-call "ui_color_picker_show"))
+
+(defun ui-font-picker ()
+  "The system font picker, over the app.  Returns its handle: a font picked is a :font event."
+  (swift-call "ui_font_picker_show"))
+
+(defun ui-input-keys (field keys)
+  "The text field FIELD's keyboard is an input view of a key per string in KEYS; a key types its string."
+  (let ((b (%term-octets keys)))
+    (swift-call "ui_input_keys_on" field (%addr b) (length b))))
 
 (defun ui-image-picker ()
   "The system's photo picker over the app.  Its Cancel closes it."

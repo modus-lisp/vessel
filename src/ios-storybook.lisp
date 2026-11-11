@@ -644,6 +644,88 @@
         (cons "collection" '%story-collection)
         (cons "photos" '%story-photos)))
 
+;; the eighth page: a tap gesture, an edge pan, a calendar, an empty state, the colour and font pickers, input keys
+(defparameter *stories-8*
+  (list (cons "tapview" '%story-tapview)
+        (cons "edge" '%story-edge)
+        (cons "calendar" '%story-calendar)
+        (cons "empty" '%story-empty)
+        (cons "colors" '%story-colors)
+        (cons "fonts" '%story-fonts)
+        (cons "keys" '%story-keys)))
+
+(defun %story-tapview ()
+  "A label that a tap gesture makes tappable; the readout counts the taps."
+  (let* ((count 0)
+         (target (kiln-swift:ui-label "tap this label" 24 200 350 40))
+         (readout (kiln-swift:ui-label "label taps: 0" 24 260 350 30)))
+    (kiln-swift:ui-on-tap-gesture target)
+    (kiln-swift:on-tap target (lambda (value h)
+                                (declare (ignore value h))
+                                (kiln-swift:ui-set-text readout (format nil "label taps: ~D" (incf count)))))
+    (list target readout)))
+
+(defun %story-edge ()
+  "A panel across the screen: a pan in from its left edge is the readout's 'edge: yes'."
+  (let* ((panel (kiln-swift:ui-panel 0 200 402 400 #x22262e))
+         (readout (kiln-swift:ui-label "edge: no" 24 620 350 30)))
+    (kiln-swift:ui-on-edge-pan panel)
+    (kiln-swift:on-event :edge panel (lambda (value h)
+                                       (declare (ignore value h))
+                                       (kiln-swift:ui-set-text readout "edge: yes")))
+    (list panel readout)))
+
+(defun %story-calendar ()
+  "A calendar of November 2026; a day picked is the readout's day."
+  (let* ((readout (kiln-swift:ui-label "day: none" 24 200 350 30))
+         (calendar (kiln-swift:ui-calendar 1794700800 24 240 350 400)))
+    (kiln-swift:on-event :date calendar
+                         (lambda (seconds h)
+                           (declare (ignore h))
+                           (multiple-value-bind (s m hr day)
+                               (decode-universal-time (+ (round seconds) 2208988800) 0)
+                             (declare (ignore s m hr))
+                             (kiln-swift:ui-set-text readout (format nil "day: ~D" day)))))
+    (list readout calendar)))
+
+(defun %story-empty ()
+  (list (kiln-swift:ui-unavailable "No mail" 24 200 350 300)))
+
+(defun %story-colors ()
+  "A button that shows the system colour picker; the readout says when a colour was picked."
+  (let ((open (kiln-swift:ui-button "pick color" 24 200 160 40))
+        (readout (kiln-swift:ui-label "color: none" 24 260 350 30)))
+    (kiln-swift:on-tap open (lambda (value h)
+                              (declare (ignore value h))
+                              (kiln-swift:on-event :color (kiln-swift:ui-color-picker)
+                                                   (lambda (rgb h2)
+                                                     (declare (ignore rgb h2))
+                                                     (kiln-swift:ui-set-text readout "color: picked")))))
+    (list open readout)))
+
+(defun %story-fonts ()
+  "A button that shows the system font picker; the readout says when a font was picked."
+  (let ((open (kiln-swift:ui-button "pick font" 24 200 160 40))
+        (readout (kiln-swift:ui-label "font: none" 24 260 350 30)))
+    (kiln-swift:on-tap open (lambda (value h)
+                              (declare (ignore value h))
+                              (kiln-swift:on-event :font (kiln-swift:ui-font-picker)
+                                                   (lambda (value2 h2)
+                                                     (declare (ignore value2 h2))
+                                                     (kiln-swift:ui-set-text readout "font: picked")))))
+    (list open readout)))
+
+(defun %story-keys ()
+  "A text field whose keyboard is an input view of three keys; the readout mirrors the field."
+  (let* ((field (kiln-swift:ui-text-field "keys here" 24 200 350 36))
+         (mirror (kiln-swift:ui-label "typed: nothing" 24 250 350 30)))
+    (kiln-swift:ui-input-keys field '("1" "2" "3"))
+    (kiln-swift:on-event :text field
+                         (lambda (value h)
+                           (declare (ignore value))
+                           (kiln-swift:ui-set-text mirror (format nil "typed: ~A" (kiln-swift:ui-text-value h)))))
+    (list field mirror)))
+
 (defun %story-sections ()
   "A list in two sections, 'today' and 'later'; the readout names the row picked, by its number."
   (let* ((readout (kiln-swift:ui-label "selected: none" 24 200 350 30))
@@ -859,7 +941,7 @@
         (cons "tabctl" #'%story-tabctl)
         (cons "navctl" #'%story-navctl)))
 
-(defparameter *pages* (list *stories* *stories-2* *stories-3* *stories-4* *stories-5* *stories-6* *stories-7*))
+(defparameter *pages* (list *stories* *stories-2* *stories-3* *stories-4* *stories-5* *stories-6* *stories-7* *stories-8*))
 
 ;;; ---- the storybook ------------------------------------------------------------------------------
 
@@ -869,6 +951,9 @@
 
 (defun %show (name)
   "Show the story NAME in place of the one on show."
+  ;; a story starts with the keyboard down: a sheet that closes hands the first responder back to the desk, which
+  ;; takes keys, and its keyboard would cover the bottom of the story
+  (kiln-swift:ui-resign)
   (%forget *story*)
   (setf *story* nil)
   (setf *story-name* name)
@@ -897,6 +982,8 @@
 (defun storybook ()
   "Open the storybook (closing any open one first)."
   (close-storybook)
+  ;; the storybook covers the desk, whose Terminal (the Actions grid opens one) keeps the keyboard up
+  (kiln-swift:ui-resign)
   (let ((background (kiln-swift:ui-panel 0 0 0 0 *background*))
         (title (kiln-swift:ui-label "storybook" 24 60 250 30)))
     (setf *shelf* (list background title))
