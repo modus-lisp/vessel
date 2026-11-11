@@ -29,7 +29,7 @@
            #:ui-attributed-label #:ui-dynamic-label #:ui-safe-area-top #:ui-parallax #:ui-zoom-scroll #:ui-zoom-content
            #:ui-drawn-image #:ui-file-image #:ui-page-controller #:ui-page-content
            #:ui-list-editing #:ui-edit-menu #:ui-popover #:ui-split #:ui-gravity-drop
-           #:ui-keyboard-avoid #:ui-keyboard-post #:ui-document-picker #:ui-collection
+           #:ui-keyboard-avoid #:ui-keyboard-post #:ui-document-picker #:ui-collection #:ui-image-picker
            #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-data
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
@@ -363,6 +363,10 @@
 (defun ui-split (primary secondary)
   "A split view of two contents (from UI-MODAL), shown as a sheet.  On a phone it shows the primary."
   (swift-call "ui_split_present" primary secondary))
+
+(defun ui-image-picker ()
+  "The system's photo picker over the app.  Its Cancel closes it."
+  (swift-call "ui_image_picker_show"))
 
 (defun ui-collection (rows x y w h)
   "A collection view of sections, in compositional layout: ROWS as UI-LIST-SET-DATA (each a plist with :TITLE and

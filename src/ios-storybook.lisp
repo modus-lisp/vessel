@@ -641,7 +641,8 @@
         (cons "dynamics" '%story-dynamics)
         (cons "keyboard" '%story-keyboard)
         (cons "files" '%story-files)
-        (cons "collection" '%story-collection)))
+        (cons "collection" '%story-collection)
+        (cons "photos" '%story-photos)))
 
 (defun %story-sections ()
   "A list in two sections, 'today' and 'later'; the readout names the row picked, by its number."
@@ -793,6 +794,12 @@
                            (declare (ignore h))
                            (kiln-swift:ui-set-text readout (format nil "tile: ~D" (1+ index)))))
     (list view readout)))
+
+(defun %story-photos ()
+  "A button that opens the system's photo picker; its Cancel closes it."
+  (let ((open (kiln-swift:ui-button "pick photo" 24 200 160 40)))
+    (kiln-swift:on-tap open (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-image-picker)))
+    (list open)))
 
 (defparameter *stories*
   (list (cons "label" #'%story-label)
