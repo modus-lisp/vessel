@@ -31,7 +31,7 @@
            #:ui-list-editing #:ui-edit-menu #:ui-popover #:ui-split #:ui-gravity-drop
            #:ui-keyboard-avoid #:ui-keyboard-post #:ui-document-picker #:ui-collection #:ui-image-picker
            #:ui-on-tap-gesture #:ui-on-edge-pan #:ui-calendar #:ui-unavailable #:ui-color-picker #:ui-font-picker
-           #:ui-input-keys #:ui-gauge #:ui-crown #:ui-screen-height
+           #:ui-input-keys #:ui-gauge #:ui-crown #:ui-screen-height #:ui-screen-width
            #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-data
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
@@ -320,6 +320,10 @@
 (defun ui-screen-height ()
   "The height of the app's screen, in points."
   (swift-call "ui_screen_height"))
+
+(defun ui-screen-width ()
+  "The width of the app's screen, in points."
+  (swift-call "ui_screen_width"))
 
 (defun ui-parallax (handle amount)
   "A parallax motion effect on the view HANDLE: it moves with the device's tilt, by AMOUNT points."
