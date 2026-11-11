@@ -548,6 +548,11 @@
     (when (fboundp '%kiln-actions-app)
       (glass.desk:desk-register-app desk "Actions" (symbol-function '%kiln-actions-app)
                                     :width (min dw 300) :height 220))
+    ;; THE STORYBOOK of the native components (ios-storybook.lisp), where the image has it: not a window -- its
+    ;; views are the platform's own, over the desk -- so a menu action
+    (when (find-package "KILN-STORYBOOK")
+      (glass.desk:desk-register-action desk "Storybook"
+                                       (lambda () (funcall (find-symbol "STORYBOOK" "KILN-STORYBOOK")))))
     ;; THE KEYBOARD follows the focus: the desk raises the phone's keyboard (pseudo-syscall 1006)
     ;; when a window that takes text is opened or tapped into, and puts it away when you tap
     ;; elsewhere; what is typed arrives as key events below
