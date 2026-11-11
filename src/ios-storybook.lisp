@@ -644,7 +644,8 @@
         (cons "collection" '%story-collection)
         (cons "photos" '%story-photos)))
 
-;; the eighth page: a tap gesture, an edge pan, a calendar, an empty state, the colour and font pickers, input keys
+;; the eighth page: a tap gesture, an edge pan, a calendar, an empty state, the colour and font pickers, input keys,
+;; and the GPU
 (defparameter *stories-8*
   (list (cons "tapview" '%story-tapview)
         (cons "edge" '%story-edge)
@@ -652,7 +653,53 @@
         (cons "empty" '%story-empty)
         (cons "colors" '%story-colors)
         (cons "fonts" '%story-fonts)
-        (cons "keys" '%story-keys)))
+        (cons "keys" '%story-keys)
+        (cons "gpu" '%story-gpu)))
+
+(defparameter *spin-shader*
+  "#include <metal_stdlib>
+using namespace metal;
+struct V { float4 position [[position]]; float4 colour; };
+// each vertex is x, y, r, g, b; buffer 1 holds the time, in seconds
+vertex V spin_vertex(uint i [[vertex_id]], constant float *v [[buffer(0)]], constant float &t [[buffer(1)]]) {
+  float x = v[i * 5], y = v[i * 5 + 1], c = cos(t), s = sin(t);
+  V out;
+  out.position = float4(x * c - y * s, x * s + y * c, 0, 1);
+  out.colour = float4(v[i * 5 + 2], v[i * 5 + 3], v[i * 5 + 4], 1);
+  return out;
+}
+fragment float4 spin_fragment(V in [[stage_in]]) { return in.colour; }
+"
+  "The GPU story's shader, in Metal Shading Language: a triangle turned by the time, its colours blended.")
+
+(defun %story-gpu ()
+  "A triangle the GPU draws and turns, every frame: a pipeline built once, a uniform written each frame, a render
+   pass recorded and submitted (gpu.lisp).  The readout says when it has drawn ten frames."
+  (let* ((view (kiln-gpu:gpu-view 24 200 350 350))
+         (readout (kiln-swift:ui-label "gpu: starting" 24 570 350 30))
+         (shader (kiln-gpu:gpu-shader *spin-shader*))
+         (pipeline (and shader (kiln-gpu:gpu-pipeline shader "spin_vertex" "spin_fragment")))
+         (vertices (kiln-gpu:gpu-buffer (kiln-gpu:floats  0.0  0.8   1.0 0.3 0.3
+                                                          -0.7 -0.5   0.3 1.0 0.3
+                                                           0.7 -0.5   0.3 0.4 1.0)))
+         (time (kiln-gpu:gpu-buffer 4))
+         (frames 0)
+         (hook nil))
+    (unless pipeline (kiln-swift:ui-set-text readout "gpu: no pipeline (see the log)"))
+    (setf hook
+          (lambda ()
+            ;; a frame: the time into its buffer, then one pass -- or, the view gone, this hook goes too
+            (kiln-gpu:gpu-write time (kiln-gpu:floats (/ frames 60.0)))
+            (if (and pipeline
+                     (kiln-gpu:with-gpu-pass (pass view :clear #x101820)
+                       (kiln-gpu:gpu-use pass pipeline)
+                       (kiln-gpu:gpu-bind pass vertices 0)
+                       (kiln-gpu:gpu-bind pass time 1)
+                       (kiln-gpu:gpu-draw pass 3)))
+                (when (= (incf frames) 10) (kiln-swift:ui-set-text readout "gpu: drawing"))
+                (setf cl-user::*kiln-frame-hooks* (remove hook cl-user::*kiln-frame-hooks*)))))
+    (when pipeline (push hook cl-user::*kiln-frame-hooks*))
+    (list view readout)))
 
 (defun %story-tapview ()
   "A label that a tap gesture makes tappable; the readout counts the taps."
