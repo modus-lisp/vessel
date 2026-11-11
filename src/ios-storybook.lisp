@@ -640,7 +640,8 @@
         (cons "split" '%story-split)
         (cons "dynamics" '%story-dynamics)
         (cons "keyboard" '%story-keyboard)
-        (cons "files" '%story-files)))
+        (cons "files" '%story-files)
+        (cons "collection" '%story-collection)))
 
 (defun %story-sections ()
   "A list in two sections, 'today' and 'later'; the readout names the row picked, by its number."
@@ -777,6 +778,21 @@
   (let ((open (kiln-swift:ui-button "open files" 24 200 160 40)))
     (kiln-swift:on-tap open (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-document-picker)))
     (list open)))
+
+(defun %story-collection ()
+  "A collection view of two sections, 'alpha' and 'beta', in three columns; the readout names the tile tapped, by its
+   number among all the tiles."
+  (let* ((readout (kiln-swift:ui-label "tile: none" 24 200 350 30))
+         (view (kiln-swift:ui-collection
+                (loop for i from 1 to 6
+                      collect (list :title (format nil "~A~D" (if (<= i 3) "a" "b") (if (<= i 3) i (- i 3)))
+                                    :section (if (<= i 3) "alpha" "beta")))
+                24 240 350 500)))
+    (kiln-swift:on-event :select view
+                         (lambda (index h)
+                           (declare (ignore h))
+                           (kiln-swift:ui-set-text readout (format nil "tile: ~D" (1+ index)))))
+    (list view readout)))
 
 (defparameter *stories*
   (list (cons "label" #'%story-label)
