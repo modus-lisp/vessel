@@ -548,6 +548,13 @@
     (when (fboundp '%kiln-actions-app)
       (glass.desk:desk-register-app desk "Actions" (symbol-function '%kiln-actions-app)
                                     :width (min dw 300) :height 220))
+;; SPEAK AND LISTEN (glass/voice-apps), where the image has them: the desk's voice and ear by hand, over
+    ;; whatever voice and ear glass has -- the session's chord and stave, or the phone's own (speech.lisp)
+    (let ((speak (find-symbol "SPEAK-APP" "GLASS.DESK")) (listen (find-symbol "LISTEN-APP" "GLASS.DESK")))
+      (when (and speak (fboundp speak))
+        (glass.desk:desk-register-app desk "Speak" (symbol-function speak) :width (min dw 400) :height 300))
+      (when (and listen (fboundp listen))
+        (glass.desk:desk-register-app desk "Listen" (symbol-function listen) :width (min dw 400) :height 320)))
     ;; THE STORYBOOK of the native components (ios-storybook.lisp), where the image has it: not a window -- its
     ;; views are the platform's own, over the desk -- so a menu action
     (when (find-package "KILN-STORYBOOK")

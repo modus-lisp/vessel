@@ -654,7 +654,35 @@
         (cons "colors" '%story-colors)
         (cons "fonts" '%story-fonts)
         (cons "keys" '%story-keys)
-        (cons "gpu" '%story-gpu)))
+        (cons "gpu" '%story-gpu)
+        (cons "speech" '%story-speech)))
+
+(defun %story-speech ()
+  "The phone's own voice and ear, end to end and without a microphone: say a sentence into a file
+   (AVSpeechSynthesizer), transcribe the file (SFSpeechRecognizer), and show what was heard, normalized.
+   \"speak aloud\" says the sentence through the speaker too."
+  (let* ((sentence "the quick brown fox jumps over the lazy dog")
+         (said (kiln-swift:ui-label "said: nothing yet" 24 170 350 30))
+         (readout (kiln-swift:ui-label "heard: nothing yet" 24 200 350 60))
+         (trip (kiln-swift:ui-button "round trip" 24 270 160 40))
+         (aloud (kiln-swift:ui-button "speak aloud" 200 270 150 40)))
+    (kiln-swift:on-tap trip
+                       (lambda (value h)
+                         (declare (ignore value h))
+                         (kiln-swift:ui-set-text readout "heard: ...")
+                         (kiln-speech:round-trip
+                          sentence
+                          (lambda (heard)
+                            (kiln-swift:ui-set-text readout
+                                                    (if (eq heard :failed)
+                                                        "heard: no recognizer here"
+                                                        (format nil "heard: ~A" (kiln-speech:normalize heard)))))
+                          :said (lambda (ok) (kiln-swift:ui-set-text said (if ok "said: to a file" "said: failed"))))))
+    (kiln-swift:on-tap aloud
+                       (lambda (value h)
+                         (declare (ignore value h))
+                         (glass.desk:voice-say glass.desk:*voice* sentence)))
+    (list said readout trip aloud)))
 
 (defparameter *spin-shader*
   "#include <metal_stdlib>

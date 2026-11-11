@@ -34,6 +34,9 @@
   ;; KILN_STORYBOOK=1 (simctl launch passes it as SIMCTL_CHILD_KILN_STORYBOOK) opens the storybook at start: the UI
   ;; suite's way in on any device, with no desk taps whose places depend on the screen
   ;; looked up when it runs: this file is loaded before the storybook's
+  ;; the platform's voice and ear behind glass's Speak and Listen (speech.lisp)
+  (when (find-package "KILN-SPEECH")
+    (funcall (find-symbol "INSTALL-PLATFORM-SPEECH" "KILN-SPEECH")))
   (when (modus-int::%cli-getenv "KILN_STORYBOOK")
     (funcall (find-symbol "STORYBOOK" "KILN-STORYBOOK")))
   (kiln-app-main :autoplay autoplay :top 60 :media t))
