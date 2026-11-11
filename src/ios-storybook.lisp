@@ -638,7 +638,9 @@
         (cons "editmenu" '%story-editmenu)
         (cons "popover" '%story-popover)
         (cons "split" '%story-split)
-        (cons "dynamics" '%story-dynamics)))
+        (cons "dynamics" '%story-dynamics)
+        (cons "keyboard" '%story-keyboard)
+        (cons "files" '%story-files)))
 
 (defun %story-sections ()
   "A list in two sections, 'today' and 'later'; the readout names the row picked, by its number."
@@ -758,6 +760,23 @@
                               (declare (ignore value h))
                               (kiln-swift:ui-gravity-drop ball)))
     (list ball drop)))
+
+(defun %story-keyboard ()
+  "A field at the bottom that lifts when the keyboard comes up (posted by the buttons, as UIKit posts it) and
+   returns when it goes down."
+  (let* ((field (kiln-swift:ui-label "bottom field" 24 640 350 40))
+         (raise (kiln-swift:ui-button "raise keyboard" 24 200 160 40))
+         (lower (kiln-swift:ui-button "lower keyboard" 24 250 160 40)))
+    (kiln-swift:ui-keyboard-avoid field)
+    (kiln-swift:on-tap raise (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-keyboard-post 300)))
+    (kiln-swift:on-tap lower (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-keyboard-post 0)))
+    (list field raise lower)))
+
+(defun %story-files ()
+  "A button that opens the system's document picker; its Cancel closes it."
+  (let ((open (kiln-swift:ui-button "open files" 24 200 160 40)))
+    (kiln-swift:on-tap open (lambda (value h) (declare (ignore value h)) (kiln-swift:ui-document-picker)))
+    (list open)))
 
 (defparameter *stories*
   (list (cons "label" #'%story-label)

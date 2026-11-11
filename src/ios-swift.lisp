@@ -29,6 +29,7 @@
            #:ui-attributed-label #:ui-dynamic-label #:ui-safe-area-top #:ui-parallax #:ui-zoom-scroll #:ui-zoom-content
            #:ui-drawn-image #:ui-file-image #:ui-page-controller #:ui-page-content
            #:ui-list-editing #:ui-edit-menu #:ui-popover #:ui-split #:ui-gravity-drop
+           #:ui-keyboard-avoid #:ui-keyboard-post #:ui-document-picker
            #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-data
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
@@ -362,6 +363,18 @@
 (defun ui-split (primary secondary)
   "A split view of two contents (from UI-MODAL), shown as a sheet.  On a phone it shows the primary."
   (swift-call "ui_split_present" primary secondary))
+
+(defun ui-keyboard-avoid (handle)
+  "The view HANDLE moves up out of the keyboard's way when the keyboard comes up, and returns when it goes down."
+  (swift-call "ui_keyboard_avoid_on" handle))
+
+(defun ui-keyboard-post (height)
+  "Post the keyboard notifications for a keyboard HEIGHT points tall (0: it goes down).  For tests."
+  (swift-call "ui_keyboard_post" height))
+
+(defun ui-document-picker ()
+  "The system's document picker, for opening a text file, shown over the app.  Its Cancel closes it."
+  (swift-call "ui_document_picker_show"))
 
 (defun ui-gravity-drop (handle)
   "The view HANDLE falls under gravity, until it comes to rest on the bottom of its superview (UIDynamicAnimator)."
