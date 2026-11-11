@@ -157,8 +157,48 @@
   (em-wait-irpt 2 "write done")
   t)
 
+;; READ_MULTIPLE_BLOCK (CMD18) with the controller's own CMD12 at the end -- the encoding
+;; modus's lib/core-from-card.lisp reads the core with.  One command per run instead of one
+;; per sector: the card's access latency is paid per COMMAND, and a sync applying a delta to a
+;; 1 MB base read that base back 512 bytes at a time (half its time, profiled on the Zero).
+(defun emmc-read-blocks (lba count buf start)
+  "COUNT (1-65535) sectors from LBA into BUF[START, START + 512 COUNT) with one CMD18."
+  (em-set #x04 (logior (ash count 16) 512))
+  (em-cmd #x123A0036 lba "CMD18")
+  (dotimes (b count)
+    (em-wait-irpt (ash 1 5) "read ready")
+    (let ((base (+ start (* 512 b))))
+      (dotimes (n 128)
+        (let ((w (em-reg #x20)) (p (+ base (* 4 n))))
+          (setf (aref buf p) (logand w 255)
+                (aref buf (+ p 1)) (logand (ash w -8) 255)
+                (aref buf (+ p 2)) (logand (ash w -16) 255)
+                (aref buf (+ p 3)) (logand (ash w -24) 255))))))
+  (em-wait-irpt 2 "read done")
+  buf)
+
+(defun em-reset-data ()
+  "Reset the data line (SRST_DATA) and clear INTERRUPT: what a failed multi-block read may
+   have left busy."
+  (em-set #x2C (logior (em-reg #x2C) (ash 1 26)))
+  (em-wait #x2C (ash 1 26) 0 200000)
+  (em-set #x30 #xFFFFFFFF))
+
 (defun emmc-read-sectors (lba count buf start)
-  (dotimes (i count buf) (emmc-read-block (+ lba i) buf (+ start (* 512 i)))))
+  "COUNT sectors from LBA into BUF[START, ...): runs of up to 128 per CMD18, and a run whose
+   CMD18 fails read again a sector at a time (as core-from-card does), so a card that will
+   not do multi-block still reads."
+  (if (= count 1)
+      (emmc-read-block lba buf start)
+      (let ((done 0))
+        (loop while (< done count) do
+          (let ((k (min 128 (- count done))) (at (+ start (* 512 done))))
+            (handler-case (emmc-read-blocks (+ lba done) k buf at)
+              (error ()
+                (em-reset-data)
+                (dotimes (i k) (emmc-read-block (+ lba done i) buf (+ at (* 512 i))))))
+            (setq done (+ done k))))
+        buf)))
 
 (defun emmc-write-sectors (lba count buf start)
   (dotimes (i count t) (emmc-write-block (+ lba i) buf (+ start (* 512 i)))))

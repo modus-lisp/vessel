@@ -27,44 +27,76 @@
 (defvar *part-lba* 0 "The partition's first sector on the card.")
 (defvar *cache* (make-hash-table) "Sector number -> 512 bytes, as last read or written.")
 
+;;; ONE CARD, ONE TRANSFER AT A TIME.  A block read or write is a run of controller commands
+;;; (emmc.lisp), and threads on a core are switched every 10 ms: a sync reading a pack on its
+;;; thread while an SSH command looked a file up on main interleaved the two and the read died
+;;; ("emmc: read done timed out").  Every runtime path to the card -- %SECTOR, %WRITE-AT, the
+;;; card's bring-up, the MBR write -- holds *CARD-LOCK*, and the sector cache with it.  This
+;;; makes the DRIVER safe; two threads WRITING one fs-fat volume still race in fs-fat's own
+;;; state (its free-cluster hint, a directory being rewritten).
+(defvar *card-lock* (sb-thread:make-mutex :name "card"))
+
+(defvar *kernel-syms* (make-hash-table :test 'equal) "Kernel function name -> its symbol.")
+
 (defun %kernel (name)
-  ;; INTERN, not FIND-SYMBOL: a kernel function nobody has typed has no symbol yet
-  (symbol-function (intern name "MODUS-INT")))
+  ;; INTERN, not FIND-SYMBOL: a kernel function nobody has typed has no symbol yet.  Once per
+  ;; NAME: INTERN on every sector read was 7% of a sync's time.  The SYMBOL is kept, not its
+  ;; function, so a kernel function redefined later is still the one called.
+  (or (gethash name *kernel-syms*)
+      (setf (gethash name *kernel-syms*) (intern name "MODUS-INT"))))
 
 (defun %u8 (n) (make-array n :element-type '(unsigned-byte 8)))
 
 (defun %le32 (b o)
   (logior (aref b o) (ash (aref b (+ o 1)) 8) (ash (aref b (+ o 2)) 16) (ash (aref b (+ o 3)) 24)))
 
-(defun %sector (lba)
-  "Card sector LBA (absolute), 512 bytes, through the cache."
+(defun %sector-1 (lba)
+  "%SECTOR for a caller already holding *CARD-LOCK*."
   (or (gethash lba *cache*)
       (let ((b (%u8 512)))
         (funcall (%kernel "EMMC-READ-SECTORS") lba 1 b 0)
         (when (> (hash-table-count *cache*) 512) (clrhash *cache*))
         (setf (gethash lba *cache*) b))))
 
+(defun %sector (lba)
+  "Card sector LBA (absolute), 512 bytes, through the cache."
+  (sb-thread:with-mutex (*card-lock*) (%sector-1 lba)))
+
+(defun %read-run (lba last)
+  "Read the uncached sectors from LBA up to LAST (at most 128, stopping at the first one already
+   cached) with one card command, and cache them.  Holds *CARD-LOCK*'s caller."
+  (let* ((k (loop for l from lba to (min last (+ lba 127))
+                  while (not (gethash l *cache*)) count t))
+         (blk (%u8 (* 512 k))))
+    (funcall (%kernel "EMMC-READ-SECTORS") lba k blk 0)
+    (when (> (+ (hash-table-count *cache*) k) 512) (clrhash *cache*))
+    (dotimes (i k) (setf (gethash (+ lba i) *cache*) (subseq blk (* 512 i) (* 512 (1+ i)))))))
+
 (defun %read-at (base off n)
-  "N bytes at byte OFF of the partition starting at sector BASE."
-  (let ((out (%u8 n)) (pos 0))
-    (loop while (< pos n) do
-      (let* ((at (+ off pos)) (lba (+ base (floor at 512))) (o (mod at 512))
-             (take (min (- 512 o) (- n pos))))
-        (replace out (%sector lba) :start1 pos :start2 o :end2 (+ o take))
-        (incf pos take)))
+  "N bytes at byte OFF of the partition starting at sector BASE.  The sectors it lacks are read
+   a run per command (%READ-RUN), not one command per sector."
+  (let ((out (%u8 n)) (pos 0) (last (+ base (floor (+ off (max n 1) -1) 512))))
+    (sb-thread:with-mutex (*card-lock*)
+      (loop while (< pos n) do
+        (let* ((at (+ off pos)) (lba (+ base (floor at 512))) (o (mod at 512))
+               (take (min (- 512 o) (- n pos))))
+          (unless (gethash lba *cache*) (%read-run lba last))
+          (replace out (gethash lba *cache*) :start1 pos :start2 o :end2 (+ o take))
+          (incf pos take))))
     out))
 
 (defun %write-at (base off src)
   "SRC at byte OFF of the partition starting at sector BASE: within one sector (fs-fat's
    promise), the rest of the sector read and written back with it -- unless SRC is the whole
    sector (a format writes thousands), which needs no read."
-  (let* ((lba (+ base (floor off 512)))
-         (b (if (and (= (length src) 512) (zerop (mod off 512)))
-                (let ((v (%u8 512))) (replace v src) v)
-                (let ((v (copy-seq (%sector lba)))) (replace v src :start1 (mod off 512)) v))))
-    (funcall (%kernel "EMMC-WRITE-SECTORS") lba 1 b 0)
-    (when (> (hash-table-count *cache*) 512) (clrhash *cache*))
-    (setf (gethash lba *cache*) b)))
+  (sb-thread:with-mutex (*card-lock*)
+    (let* ((lba (+ base (floor off 512)))
+           (b (if (and (= (length src) 512) (zerop (mod off 512)))
+                  (let ((v (%u8 512))) (replace v src) v)
+                  (let ((v (copy-seq (%sector-1 lba)))) (replace v src :start1 (mod off 512)) v))))
+      (funcall (%kernel "EMMC-WRITE-SECTORS") lba 1 b 0)
+      (when (> (hash-table-count *cache*) 512) (clrhash *cache*))
+      (setf (gethash lba *cache*) b))))
 
 (defun %read (off n) (%read-at *part-lba* off n))
 (defun %write (off src) (%write-at *part-lba* off src))
@@ -80,8 +112,9 @@
    the MBR's first partition opened as FAT32."
   (or *volume*
       (progn
-        (funcall (%kernel "EMMC-INIT"))
-        (clrhash *cache*)
+        (sb-thread:with-mutex (*card-lock*)
+          (funcall (%kernel "EMMC-INIT"))
+          (clrhash *cache*))
         (setq *part-lba* 0)
         (let ((mbr (%sector 0)))
           (unless (and (= (aref mbr 510) #x55) (= (aref mbr 511) #xAA))
@@ -216,8 +249,9 @@
         (setf (aref mbr (+ e 4)) #x0C)                        ; FAT32, LBA
         (setf (aref mbr (+ e 5)) #xFE (aref mbr (+ e 6)) #xFF (aref mbr (+ e 7)) #xFF)
         (le32 (+ e 8) start) (le32 (+ e 12) count))
-      (funcall (%kernel "EMMC-WRITE-SECTORS") 0 1 mbr 0)
-      (setf (gethash 0 *cache*) mbr))
+      (sb-thread:with-mutex (*card-lock*)
+        (funcall (%kernel "EMMC-WRITE-SECTORS") 0 1 mbr 0)
+        (setf (gethash 0 *cache*) mbr)))
     (setq *store-lba* start
           *store* (fs-fat:fat32-format (%store-device start count) :label label
                                        :hidden-sectors start :volume-id (random #xFFFFFFFF)))
