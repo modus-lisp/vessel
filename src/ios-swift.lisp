@@ -31,7 +31,7 @@
            #:ui-list-editing #:ui-edit-menu #:ui-popover #:ui-split #:ui-gravity-drop
            #:ui-keyboard-avoid #:ui-keyboard-post #:ui-document-picker #:ui-collection #:ui-image-picker
            #:ui-on-tap-gesture #:ui-on-edge-pan #:ui-calendar #:ui-unavailable #:ui-color-picker #:ui-font-picker
-           #:ui-input-keys
+           #:ui-input-keys #:ui-gauge #:ui-crown #:ui-screen-height
            #:ui-stack #:ui-scroll #:ui-image #:ui-add #:ui-list #:ui-list-set-data
            #:ui-set-text #:ui-set-value #:ui-text-value #:ui-set-frame #:ui-remove #:ui-tap #:ui-resign
            #:on-event #:on-tap #:swift-pump))
@@ -317,6 +317,10 @@
   "The top safe-area inset of the screen, in points."
   (swift-call "ui_safe_area_top"))
 
+(defun ui-screen-height ()
+  "The height of the app's screen, in points."
+  (swift-call "ui_screen_height"))
+
 (defun ui-parallax (handle amount)
   "A parallax motion effect on the view HANDLE: it moves with the device's tilt, by AMOUNT points."
   (swift-call "ui_parallax_on" handle amount))
@@ -422,6 +426,18 @@
 (defun ui-gravity-drop (handle)
   "The view HANDLE falls under gravity, until it comes to rest on the bottom of its superview (UIDynamicAnimator)."
   (swift-call "ui_gravity_drop" handle))
+
+(defun ui-gauge (value label x y w h)
+  "The watch's gauge: a ring at VALUE (0 to 100), named LABEL.  UI-SET-VALUE moves it.  (watchOS only.)"
+  (let ((gauge (swift-call "ui_gauge_new" value x y w h)))
+    (ui-set-text gauge label)
+    gauge))
+
+(defun ui-crown (label x y w h)
+  "The watch's Digital Crown, turning a value from 0 to 100 shown after LABEL.  Each change is a :crown event
+   with the value.  (watchOS only.)"
+  (let ((b (%octets label)))
+    (swift-call "ui_crown_new" (%addr b) (length b) x y w h)))
 
 (defun ui-panel (x y w h rgb)
   (swift-call "ui_panel_new" x y w h rgb))

@@ -848,7 +848,8 @@
 (defun %story-keyboard ()
   "A field at the bottom that lifts when the keyboard comes up (posted by the buttons, as UIKit posts it) and
    returns when it goes down."
-  (let* ((field (kiln-swift:ui-label "bottom field" 24 640 350 40))
+  ;; 120 points above the bottom of the screen, whatever its height: under a 300-point keyboard on a phone or a tablet
+  (let* ((field (kiln-swift:ui-label "bottom field" 24 (- (kiln-swift:ui-screen-height) 120) 350 40))
          (raise (kiln-swift:ui-button "raise keyboard" 24 200 160 40))
          (lower (kiln-swift:ui-button "lower keyboard" 24 250 160 40)))
     (kiln-swift:ui-keyboard-avoid field)

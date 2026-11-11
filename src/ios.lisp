@@ -31,4 +31,15 @@
 (defun kiln-ios-main (&key autoplay)
   "The iPhone app (src/app.lisp), below the status bar.  No media for now: the desk,
    Clock and Terminal first (warp is not in this world)."
+  ;; KILN_STORYBOOK=1 (simctl launch passes it as SIMCTL_CHILD_KILN_STORYBOOK) opens the storybook at start: the UI
+  ;; suite's way in on any device, with no desk taps whose places depend on the screen
+  ;; looked up when it runs: this file is loaded before the storybook's
+  (when (modus-int::%cli-getenv "KILN_STORYBOOK")
+    (funcall (find-symbol "STORYBOOK" "KILN-STORYBOOK")))
   (kiln-app-main :autoplay autoplay :top 60 :media nil))
+
+(defun kiln-watch-main ()
+  "The watch app: the storybook of the watch's components, over the desk's frame loop (which delivers their
+   events).  The desk itself is glass at the phone's size; a watch screen shows its corner."
+  (funcall (find-symbol "WATCH-STORYBOOK" "KILN-WATCH-STORYBOOK"))
+  (kiln-app-main :top 0 :media nil))
