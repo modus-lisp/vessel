@@ -637,7 +637,8 @@
   (list (cons "editing" '%story-editing)
         (cons "editmenu" '%story-editmenu)
         (cons "popover" '%story-popover)
-        (cons "split" '%story-split)))
+        (cons "split" '%story-split)
+        (cons "dynamics" '%story-dynamics)))
 
 (defun %story-sections ()
   "A list in two sections, 'today' and 'later'; the readout names the row picked, by its number."
@@ -748,6 +749,15 @@
                                                 (kiln-swift:ui-modal-dismiss split)))
                            (setf split (kiln-swift:ui-split primary secondary)))))
     (list open)))
+
+(defun %story-dynamics ()
+  "A label that falls under gravity when 'drop' is tapped, and comes to rest on the bottom of the screen."
+  (let* ((ball (kiln-swift:ui-label "drop me" 24 200 200 40))
+         (drop (kiln-swift:ui-button "drop" 24 260 120 40)))
+    (kiln-swift:on-tap drop (lambda (value h)
+                              (declare (ignore value h))
+                              (kiln-swift:ui-gravity-drop ball)))
+    (list ball drop)))
 
 (defparameter *stories*
   (list (cons "label" #'%story-label)
