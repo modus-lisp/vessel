@@ -23,6 +23,12 @@
 ;;;;   #x10009200 cursor x   #x10009204 cursor y   #x10009208 cols
 ;;;;   #x1000920C rows       #x10009210 base       #x10009214 rowbytes
 ;;;;   #x10009218 depth      #x1000921C on (1 once %CONSOLE-INIT has run)
+;;;;   #x10009220 height (pixels)
+;;;;
+;;;; THE TEXT IS INSET by +MACC-PAD-X+ / +MACC-PAD-Y+ pixels from the screen's
+;;;; edge (a compact Mac's corners are rounded and its bezel covers the edge);
+;;;; %CONSOLE-INIT first clears the WHOLE screen to white, over the ROM's
+;;;; desktop pattern.
 ;;;;   #x10009400 the font, 95 glyphs x 8 bytes
 ;;;; The build defines MACC-FONT-BYTES before this text.
 
@@ -35,6 +41,8 @@
 (defun macc-depth ()    (mem-ref #x10009218 :u32))
 (defun macc-set-x (v)   (setf (mem-ref #x10009200 :u32) v))
 (defun macc-set-y (v)   (setf (mem-ref #x10009204 :u32) v))
+(defconstant +macc-pad-x+ 8 "Left / right margin, pixels (a multiple of 8).")
+(defconstant +macc-pad-y+ 6 "Top / bottom margin, pixels.")
 
 (defun macc-deref (h)
   "The pointer a handle H holds, or 0."
@@ -44,7 +52,11 @@
   "Read the screen the ROM set up into the console's words."
   (let* ((base (mem-ref #x824 :u32))
          (rowbytes (logand (mem-ref #x106 :u16) #x3FFF))
-         (gd (macc-deref (mem-ref #x8A4 :u32)))
+         ;; MainDevice only with Color QuickDraw (ROM85 $28E bit 14 clear):
+         ;; on a Classic the word is not a handle
+         (gd (if (zerop (logand (mem-ref #x28E :u16) #x4000))
+                 (macc-deref (mem-ref #x8A4 :u32))
+                 0))
          (pm (if (zerop gd) 0 (macc-deref (mem-ref (+ gd 22) :u32))))
          (depth (if (zerop pm) 1 (mem-ref (+ pm 32) :u16)))
          (width (if (zerop pm)
@@ -57,8 +69,21 @@
     (setf (mem-ref #x10009210 :u32) base)
     (setf (mem-ref #x10009214 :u32) rowbytes)
     (setf (mem-ref #x10009218 :u32) depth)
-    (setf (mem-ref #x10009208 :u32) (floor width 8))
-    (setf (mem-ref #x1000920C :u32) (floor height 8))))
+    (setf (mem-ref #x10009220 :u32) height)
+    (setf (mem-ref #x10009208 :u32) (floor (- width (* 2 +macc-pad-x+)) 8))
+    (setf (mem-ref #x1000920C :u32) (floor (- height (* 2 +macc-pad-y+)) 8))))
+
+(defun macc-clear-screen ()
+  "The whole screen white, in its depth: 0 at 1 and 8 bits, #x7FFF a pixel
+   at 16, #x00FFFFFF at 32 (written as two 16-bit halves: no bignum)."
+  (let* ((a (macc-base)) (d (macc-depth))
+         (end (+ a (* (macc-rowbytes) (mem-ref #x10009220 :u32)))))
+    (loop
+      (when (>= a end) (return nil))
+      (cond ((= d 16) (setf (mem-ref a :u16) #x7FFF) (setq a (+ a 2)))
+            ((= d 32) (setf (mem-ref a :u16) #x00FF) (setf (mem-ref (+ a 2) :u16) #xFFFF)
+                      (setq a (+ a 4)))
+            (t (setf (mem-ref a :u16) 0) (setq a (+ a 2)))))))
 
 (defun macc-put-pixel-row (addr bits)
   "Eight pixels of a glyph row (BITS, MSB leftmost) at ADDR in this depth."
@@ -76,7 +101,8 @@
          (setq x (+ x 1)))))))
 
 (defun macc-cell-addr (col row)
-  (+ (macc-base) (* row 8 (macc-rowbytes)) (floor (* col 8 (macc-depth)) 8)))
+  (+ (macc-base) (* (+ (* row 8) +macc-pad-y+) (macc-rowbytes))
+     (floor (* (+ (* col 8) +macc-pad-x+) (macc-depth)) 8)))
 
 (defun macc-render (code col row)
   (let* ((g (if (and (>= code 32) (<= code 126)) (- code 32) 0))
@@ -127,6 +153,7 @@
       (setf (mem-ref (+ #x10009400 i) :u8) (car p))
       (setq p (cdr p)) (setq i (+ i 1))))
   (macc-probe)
+  (macc-clear-screen)
   (let ((r 0) (n (macc-rows)))
     (loop
       (when (>= r n) (return nil))
