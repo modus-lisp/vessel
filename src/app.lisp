@@ -46,6 +46,43 @@
 (defconstant +kiln-rate+ 48000)
 (defparameter *kiln-cushion* 7200 "Samples to keep queued: 150 ms.")
 
+;;; KILN_AUDIO_STATS=1: once a second, how the loop that feeds the speaker is keeping up -- its
+;;; longest and mean pass, the longest paint, how often the pump found the device's queue nearly
+;;; dry (under one 20 ms frame), and collections.  The sound is only as steady as this loop.
+(defvar *kiln-stats* nil)
+(defvar *kiln-stats-player* nil "The media player whose shown frames the stats count, or NIL.")
+(defun %kiln-stats-init ()
+  (setf *kiln-stats* (and (modus-int::%cli-getenv "KILN_AUDIO_STATS")
+                          (list :t0 (get-internal-real-time) :passes 0 :sum 0 :max 0 :paint 0 :dry 0
+                                :gc (modus-int::%gc-epoch) :frame (%kiln-stats-frame-no) :gap 0
+                                :last-change (get-internal-real-time) :last-frame (%kiln-stats-frame-no)))))
+(defun %kiln-stats-frame-no ()
+  (if *kiln-stats-player* (funcall (find-symbol "PLAYER-FRAME-NO" "WARP-MEDIA") *kiln-stats-player*) 0))
+(defun %kiln-stats-pass (pass-ms paint-ms queued)
+  (let ((s *kiln-stats*))
+    (incf (getf s :passes)) (incf (getf s :sum) pass-ms)
+    (setf (getf s :max) (max (getf s :max) pass-ms) (getf s :paint) (max (getf s :paint) paint-ms))
+    (when (and queued (< queued 960)) (incf (getf s :dry)))
+    ;; the longest the picture stood still: the gap between one new frame and the next
+    (let ((f (%kiln-stats-frame-no)) (now (get-internal-real-time)))
+      (when (/= f (getf s :last-frame))
+        (setf (getf s :gap) (max (getf s :gap) (floor (- now (getf s :last-change)) 1000))
+              (getf s :last-change) now (getf s :last-frame) f)))
+    (when (>= (- (get-internal-real-time) (getf s :t0)) 1000000)
+      (when *kiln-stats-player*
+        (let ((pl *kiln-stats-player*))
+          (format t "~&kiln: player at ~,3F s, wall ~,3F s, queued audio ~D video ~D, state ~A~%"
+                  (funcall (find-symbol "PLAYER-POSITION" "WARP-MEDIA") pl)
+                  (/ (get-internal-real-time) (float internal-time-units-per-second 1d0))
+                  (funcall (find-symbol "%AUDIO-N" "WARP-MEDIA") pl)
+                  (funcall (find-symbol "%VIDEO-N" "WARP-MEDIA") pl)
+                  (funcall (find-symbol "PLAYER-STATE" "WARP-MEDIA") pl))))
+      (format t "~&kiln: loop ~D passes, mean ~D ms, max ~D ms, paint max ~D ms, speaker dry ~D, gc ~D, frames ~D, longest still ~D ms~%"
+              (getf s :passes) (floor (getf s :sum) (max 1 (getf s :passes))) (getf s :max) (getf s :paint)
+              (getf s :dry) (- (modus-int::%gc-epoch) (getf s :gc))
+              (- (%kiln-stats-frame-no) (getf s :frame)) (getf s :gap))
+      (%kiln-stats-init))))
+
 (defun %kiln-audio-write (frame)
   (%kiln-sys 1011 (+ (modus-int::%gc-word-of frame (modus-int::%conv-addr #x100050A0)) 7) (length frame) 0))
 
@@ -567,6 +604,13 @@
           (lambda (on) (%kiln-sys 1006 (if on 1 0) 0 0)))
     (glass.desk:desk-open desk (if media "Media" "Clock"))
     (format t "~&kiln: ~:[no speaker~;speaker at ~D Hz~]~%" speaker +kiln-rate+)
+    (when lib (setf *kiln-stats-player* (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib)))
+    (when (modus-int::%cli-getenv "KILN_AUDIO_STATS")
+      (setf (symbol-value (find-symbol "*WORKER-STATS*" "WARP-MEDIA")) t))
+    (%kiln-stats-init)
+    ;; KILN_AUTOPLAY=FILE: play one of the films at launch (devicectl / simctl pass it), as :AUTOPLAY does
+    (let ((a (modus-int::%cli-getenv "KILN_AUTOPLAY")))
+      (when (and a (> (length a) 0) (not autoplay)) (setq autoplay a)))
     (when (and media autoplay)
       (let ((path (concatenate 'string dir "media/" autoplay)))
         (if (probe-file path)
@@ -600,8 +644,11 @@
      (handler-case
       (let ((e (%kiln-sys 1004 0 0 0)))
         (if (zerop e)
-            (let ((t0 (get-internal-real-time)))
+            (let ((t0 (get-internal-real-time))
+                  (queued (and *kiln-stats* mixer (%kiln-sys 1012 0 0 0)))
+                  (tp 0))
               (when mixer (%kiln-pump-audio mixer sink))
+              (setf tp (get-internal-real-time))
               ;; ONLY WHAT CHANGED is magnified and shown: a video window is a fifth of the
               ;; screen, and the whole of it 2x was most of a frame
               (multiple-value-bind (changed x y w h) (glass.desk:desk-tick desk)
@@ -619,6 +666,9 @@
                       ;; A Y'CbCr desk (glass :I420) is shown as it is: the platform scans
                       ;; the planes out (pseudo-syscall 1007, the Zero's HVS)
                       (%kiln-sys 1007 (glass.desk:desk-fb desk) 0 0))))
+              (when *kiln-stats*
+                (%kiln-stats-pass (floor (- (get-internal-real-time) t0) 1000)
+                                  (floor (- (get-internal-real-time) tp) 1000) queued))
               (%kiln-run-queued-frame)
               (%kiln-run-frame-hooks)
               ;; a frame is 16 ms; sleep only what is left of it, not 16 ms on top of the work --
