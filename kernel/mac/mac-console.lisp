@@ -80,7 +80,8 @@
 
 (defun macc-render (code col row)
   (let* ((g (if (and (>= code 32) (<= code 126)) (- code 32) 0))
-         (font (+ #x10009400 (* g 8)))
+         ;; an address kept as a VALUE: %CONV-ADDR, so it moves with the region
+         (font (+ (%conv-addr #x10009400) (* g 8)))
          (addr (macc-cell-addr col row))
          (r 0))
     (loop
