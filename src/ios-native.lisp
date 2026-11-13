@@ -30,8 +30,8 @@
 (defpackage #:kiln-native
   (:use #:cl)
   (:import-from #:kiln-swift #:swift-call #:on-event)
-  (:export #:app-nav-new #:app-nav-root #:app-push #:app-screen #:app-show #:app-pop #:app-path-title #:app-browser #:app-browser-push #:app-browser-preview #:app-browser-preview-close #:app-browser-hex-total #:app-browser-hex-part #:app-browser-pop-to #:app-browser-set-path #:app-browser-subtitle
-           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order
+  (:export #:app-nav-new #:app-nav-root #:app-push #:app-screen #:app-show #:app-pop #:app-path-title #:app-browser #:app-browser-push #:app-browser-preview #:app-browser-preview-close #:app-browser-hex-total #:app-browser-hex-part #:app-browser-pop-to #:app-browser-set-path #:app-browser-subtitle #:app-browser-preview-toggle
+           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-theme
            #:app-bar-button-enable #:app-table #:app-table-set #:app-table-actions #:app-table-refresh
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
            #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show
@@ -96,6 +96,11 @@
   (swift-call "app_browser_hex_part" browser (ecase mode (:jump 0) (:after 1) (:before 2) (:edited 3)) start target))
 
 (defun app-browser-preview-close (browser) (swift-call "app_browser_preview_close" browser))
+(defun app-browser-preview-toggle (browser &key shown on)
+  "The preview's hex toggle: SHOWN for a file with a view besides its bytes, ON while its bytes are shown.  A tap
+   is a :hextoggle event with the browser."
+  (swift-call "app_browser_preview_toggle" browser (if shown 1 0) (if on 1 0)))
+
 (defun app-browser-subtitle (browser text)
   "A line under BROWSER's path, smaller: where the path is (a server's name).  \"\": none."
   (let ((b (kiln-swift::%octets text)))
@@ -134,6 +139,16 @@
   (%term-call "app_bar_menu" screen (list :symbol symbol :right right :items items)))
 
 (defun app-bar-menu-set (button items) (%term-call "app_bar_menu_set" button items))
+
+(defun app-table-menu (table items)
+  "The menu of a long press on TABLE where there is no row (under the last, or in an empty table): ITEMS,
+   plists of :ID :TITLE :IMAGE :DESTRUCTIVE.  A choice is a :menu event with TABLE, its value (-1 id)."
+  (%term-call "app_table_menu" table items))
+
+(defun app-theme (theme)
+  "THEME :mono -- black and white, inverted in dark mode -- or :system, the platform's blue.  Before the first
+   screen.  A row's :TINT and :DOT may name colours that follow it: :label :secondary :tertiary :gray :darkgray."
+  (swift-call "app_theme" (ecase theme (:mono 1) (:system 0))))
 
 (defun app-table-order (table &key key descending (groups-first t))
   "How TABLE's rows go: by KEY, a name among the rows' :KEYS (a string or keyword), or NIL for their :SORT (as
