@@ -31,7 +31,7 @@
   (:use #:cl)
   (:import-from #:kiln-swift #:swift-call #:on-event)
   (:export #:app-nav-new #:app-nav-root #:app-push #:app-screen #:app-show #:app-pop #:app-path-title #:app-browser #:app-browser-push #:app-browser-preview #:app-browser-preview-close #:app-browser-hex-total #:app-browser-hex-part #:app-browser-pop-to #:app-browser-set-path #:app-browser-subtitle #:app-browser-preview-toggle
-           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-table-info #:app-theme
+           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-table-info #:app-table-readme #:app-theme
            #:app-bar-button-enable #:app-table #:app-table-set #:app-table-actions #:app-table-refresh
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
            #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show
@@ -83,7 +83,7 @@
    :previewed event with the browser."
   (let ((pb (kiln-swift::%octets path)) (nb (kiln-swift::%octets name)))
     (swift-call "app_browser_preview" browser (kiln-swift::%addr pb) (length pb) (kiln-swift::%addr nb) (length nb)
-                (ecase kind (:quick-look 0) (:text 1) (:image 2) (:hex 3)))))
+                (ecase kind (:quick-look 0) (:text 1) (:image 2) (:hex 3) (:markdown 4)))))
 
 (defun app-browser-hex-total (browser size)
   "The size of the file the next :hex preview shows: where its dump ends."
@@ -150,6 +150,10 @@
    to.  \"\": none."
   (let ((b (kiln-swift::%octets text)))
     (swift-call "app_table_info" table (kiln-swift::%addr b) (length b))))
+
+(defun app-table-readme (table title text &key markdown)
+  "TEXT under TABLE's rows, headed TITLE -- a folder's README -- drawn as Markdown when MARKDOWN.  \"\": none."
+  (%term-call "app_table_readme" table (list title text (if markdown 1 0))))
 
 (defun app-theme (theme)
   "THEME :mono -- black and white, inverted in dark mode -- or :system, the platform's blue.  Before the first
