@@ -14,16 +14,22 @@
 ;;;; gdPMap at +22 -> PixMap: bounds at +6, pixelSize at +32).  Depths 1, 8,
 ;;;; 16 and 32: black text on white, as a Mac draws it.
 ;;;;
-;;;; At the bottom the cursor WRAPS to the top and clears the line ahead, like a
-;;;; storage-tube terminal, instead of scrolling: a scroll moves the whole frame
-;;;; buffer (1.2 MB at 640x480x32), which a later native helper can do.
+;;;; A TEXT-MODE BUFFER, as a terminal keeps one: the screen's characters, a
+;;;; byte a cell, COLS x ROWS at #x1000A000, its rows a RING whose first is the
+;;;; screen's top (#x10009224).  A character is stored there and its glyph
+;;;; drawn from the bitmap font -- one byte a pixel row on a 1-bit screen.  At
+;;;; the bottom the screen SCROLLS: its pixels move up a text row in one
+;;;; _BlockMove (SYSCALL3 service 2: the ROM's), the bottom row is cleared, and
+;;;; the ring turns.  No scrollback: a row that leaves the top is gone.
+;;;; MACC-REDRAW paints the whole screen from the buffer.
 ;;;;
 ;;;; State, in the low block's argv area (a Mac image has no argv; the serial
 ;;;; parameter blocks are below #x10009200):
 ;;;;   #x10009200 cursor x   #x10009204 cursor y   #x10009208 cols
 ;;;;   #x1000920C rows       #x10009210 base       #x10009214 rowbytes
 ;;;;   #x10009218 depth      #x1000921C on (1 once %CONSOLE-INIT has run)
-;;;;   #x10009220 height (pixels)
+;;;;   #x10009220 height (pixels)   #x10009224 the buffer's top row
+;;;;   #x1000A000 the text buffer, up to 8 KB (cols x rows is capped to it)
 ;;;;
 ;;;; THE TEXT IS INSET by +MACC-PAD-X+ / +MACC-PAD-Y+ pixels from the screen's
 ;;;; edge (a compact Mac's corners are rounded and its bezel covers the edge);
@@ -70,8 +76,12 @@
     (setf (mem-ref #x10009214 :u32) rowbytes)
     (setf (mem-ref #x10009218 :u32) depth)
     (setf (mem-ref #x10009220 :u32) height)
-    (setf (mem-ref #x10009208 :u32) (floor (- width (* 2 +macc-pad-x+)) 8))
-    (setf (mem-ref #x1000920C :u32) (floor (- height (* 2 +macc-pad-y+)) 8))))
+    (let ((cols (floor (- width (* 2 +macc-pad-x+)) 8))
+          (rows (floor (- height (* 2 +macc-pad-y+)) 8)))
+      ;; the text buffer holds 8 KB
+      (when (> (* cols rows) 8192) (setq rows (floor 8192 cols)))
+      (setf (mem-ref #x10009208 :u32) cols)
+      (setf (mem-ref #x1000920C :u32) rows))))
 
 (defun macc-clear-screen ()
   "The whole screen white, in its depth: 0 at 1 and 8 bits, #x7FFF a pixel
@@ -105,29 +115,102 @@
      (floor (* (+ (* col 8) +macc-pad-x+) (macc-depth)) 8)))
 
 (defun macc-render (code col row)
+  ;; The screen's geometry read ONCE: on a Mac Classic a glyph was ~20 calls
+  ;; (MACC-ROWBYTES a row, MACC-DEPTH a row inside MACC-PUT-PIXEL-ROW) and the
+  ;; console a quarter of a REPL form's time (MAME's PC samples).  On a 1-bit
+  ;; screen a glyph row is one byte.
   (let* ((g (if (and (>= code 32) (<= code 126)) (- code 32) 0))
          ;; an address kept as a VALUE: %CONV-ADDR, so it moves with the region
          (font (+ (%conv-addr #x10009400) (* g 8)))
-         (addr (macc-cell-addr col row))
+         (rb (macc-rowbytes))
+         (d (macc-depth))
+         (addr (+ (macc-base) (* (+ (* row 8) +macc-pad-y+) rb)
+                  (floor (* (+ (* col 8) +macc-pad-x+) d) 8)))
          (r 0))
-    (loop
-      (when (>= r 8) (return nil))
-      (macc-put-pixel-row (+ addr (* r (macc-rowbytes))) (mem-ref (+ font r) :u8))
-      (setq r (+ r 1)))))
+    (if (= d 1)
+        (loop
+          (when (>= r 8) (return nil))
+          (setf (mem-ref addr :u8) (mem-ref (+ font r) :u8))
+          (setq addr (+ addr rb))
+          (setq r (+ r 1)))
+        (loop
+          (when (>= r 8) (return nil))
+          (macc-put-pixel-row addr (mem-ref (+ font r) :u8))
+          (setq addr (+ addr rb))
+          (setq r (+ r 1))))))
 
 (defun macc-clear-row (row)
-  (let ((c 0) (n (macc-cols)))
+  ;; On a 1-bit screen a blank text row is 8 pixel lines of zero bytes (a
+  ;; space's glyph is all zeros) -- it was a space rendered in every column,
+  ;; over a thousand calls a newline.  Deeper screens still render spaces.
+  (if (= (macc-depth) 1)
+      (let* ((rb (macc-rowbytes)) (n (macc-cols))
+             (line (+ (macc-base) (* (+ (* row 8) +macc-pad-y+) rb) (floor +macc-pad-x+ 8)))
+             (r 0))
+        (loop
+          (when (>= r 8) (return nil))
+          (let ((a line) (e (+ line n)))
+            (loop
+              (when (>= a e) (return nil))
+              (setf (mem-ref a :u8) 0)
+              (setq a (+ a 1))))
+          (setq line (+ line rb))
+          (setq r (+ r 1))))
+      (let ((c 0) (n (macc-cols)))
+        (loop
+          (when (>= c n) (return nil))
+          (macc-render 32 c row)
+          (setq c (+ c 1))))))
+
+;;; ---- the text buffer ----
+
+(defun macc-cell (col row)
+  "The buffer address of screen cell COL, ROW (the ring's top is row 0)."
+  (let ((rows (macc-rows)))
+    (+ (%conv-addr #x1000A000)
+       (* (mod (+ (mem-ref #x10009224 :u32) row) rows) (macc-cols))
+       col)))
+
+(defun macc-blank-buffer-row (row)
+  (let* ((a (macc-cell 0 row)) (e (+ a (macc-cols))))
     (loop
-      (when (>= c n) (return nil))
-      (macc-render 32 c row)
-      (setq c (+ c 1)))))
+      (when (>= a e) (return nil))
+      (setf (mem-ref a :u8) 32)
+      (setq a (+ a 1)))))
+
+(defun macc-put (code col row)
+  "CODE at COL, ROW: in the buffer, and on the screen."
+  (setf (mem-ref (macc-cell col row) :u8) code)
+  (macc-render code col row))
+
+(defun macc-redraw ()
+  "Paint the whole screen from the text buffer."
+  (let ((row 0) (rows (macc-rows)) (cols (macc-cols)))
+    (loop
+      (when (>= row rows) (return nil))
+      (let ((col 0))
+        (loop
+          (when (>= col cols) (return nil))
+          (macc-render (mem-ref (macc-cell col row) :u8) col row)
+          (setq col (+ col 1))))
+      (setq row (+ row 1)))))
+
+(defun macc-scroll ()
+  "Up one text row: the pixels in one _BlockMove, the bottom row cleared, the
+   buffer's ring turned (its old top row becomes the blank bottom)."
+  (let* ((rb (macc-rowbytes)) (rows (macc-rows))
+         (top (+ (macc-base) (* +macc-pad-y+ rb))))
+    (syscall3 2 (+ top (* 8 rb)) top (* (- rows 1) 8 rb))
+    (setf (mem-ref #x10009224 :u32) (mod (+ (mem-ref #x10009224 :u32) 1) rows))
+    (macc-blank-buffer-row (- rows 1))
+    (macc-clear-row (- rows 1))))
 
 (defun macc-newline ()
   (macc-set-x 0)
   (let ((ny (+ (macc-y) 1)))
-    (when (>= ny (macc-rows)) (setq ny 0))
-    (macc-set-y ny)
-    (macc-clear-row ny)))
+    (if (>= ny (macc-rows))
+        (macc-scroll)
+        (macc-set-y ny))))
 
 (defun macc-write-char (c)
   (cond
@@ -136,9 +219,9 @@
     ((= c 8)
      (when (> (macc-x) 0)
        (macc-set-x (- (macc-x) 1))
-       (macc-render 32 (macc-x) (macc-y))))
+       (macc-put 32 (macc-x) (macc-y))))
     ((>= c 32)
-     (macc-render c (macc-x) (macc-y))
+     (macc-put c (macc-x) (macc-y))
      (let ((nx (+ (macc-x) 1)))
        (if (>= nx (macc-cols)) (macc-newline) (macc-set-x nx))))))
 
@@ -154,10 +237,11 @@
       (setq p (cdr p)) (setq i (+ i 1))))
   (macc-probe)
   (macc-clear-screen)
+  (setf (mem-ref #x10009224 :u32) 0)
   (let ((r 0) (n (macc-rows)))
     (loop
       (when (>= r n) (return nil))
-      (macc-clear-row r)
+      (macc-blank-buffer-row r)
       (setq r (+ r 1))))
   (macc-set-x 0) (macc-set-y 0)
   (setf (mem-ref #x1000921C :u32) 1))
