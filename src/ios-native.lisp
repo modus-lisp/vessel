@@ -30,8 +30,8 @@
 (defpackage #:kiln-native
   (:use #:cl)
   (:import-from #:kiln-swift #:swift-call #:on-event)
-  (:export #:app-nav-new #:app-nav-root #:app-push #:app-screen #:app-show #:app-pop #:app-path-title #:app-browser #:app-browser-push #:app-browser-preview #:app-browser-preview-close #:app-browser-hex-total #:app-browser-hex-part #:app-browser-pop-to #:app-browser-set-path #:app-browser-subtitle #:app-browser-preview-toggle
-           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-table-info #:app-table-readme #:app-theme
+  (:export #:app-nav-new #:app-nav-root #:app-push #:app-screen #:app-show #:app-pop #:app-path-title #:app-browser #:app-browser-push #:app-browser-preview #:app-browser-preview-close #:app-browser-hex-total #:app-browser-hex-part #:app-browser-pop-to #:app-browser-set-path #:app-browser-subtitle #:app-browser-preview-views
+           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-table-info #:app-table-options #:app-file-stamp #:app-set-mtime #:app-table-readme #:app-theme
            #:app-bar-button-enable #:app-table #:app-table-set #:app-table-actions #:app-table-refresh
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
            #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show
@@ -96,10 +96,11 @@
   (swift-call "app_browser_hex_part" browser (ecase mode (:jump 0) (:after 1) (:before 2) (:edited 3)) start target))
 
 (defun app-browser-preview-close (browser) (swift-call "app_browser_preview_close" browser))
-(defun app-browser-preview-toggle (browser &key shown on)
-  "The preview's hex toggle: SHOWN for a file with a view besides its bytes, ON while its bytes are shown.  A tap
-   is a :hextoggle event with the browser."
-  (swift-call "app_browser_preview_toggle" browser (if shown 1 0) (if on 1 0)))
+(defun app-browser-preview-views (browser views current)
+  "The ways the preview can show its file -- VIEWS, (title sf-symbol) each -- and CURRENT, the index of the one it
+   does: the view button's menu (none with fewer than two).  A choice is a :viewas event with the browser, its
+   value the index."
+  (%term-call "app_browser_preview_views" browser (append views (list current))))
 
 (defun app-browser-subtitle (browser text)
   "A line under BROWSER's path, smaller: where the path is (a server's name).  \"\": none."
@@ -150,6 +151,22 @@
    to.  \"\": none."
   (let ((b (kiln-swift::%octets text)))
     (swift-call "app_table_info" table (kiln-swift::%addr b) (length b))))
+
+(defun app-table-options (table items)
+  "A button beside TABLE's filter that opens a menu of ITEMS (as APP-BAR-MENU's); a choice is an :options event
+   with TABLE, its value the item's :ID."
+  (%term-call "app_table_options" table items))
+
+(defun app-file-stamp (path)
+  "PATH's (values size mtime) -- the mtime in seconds since 1970 -- or NIL when it is not there."
+  (let* ((b (kiln-swift::%octets path))
+         (mtime (swift-call "app_file_stamp" (kiln-swift::%addr b) (length b))))
+    (and (plusp mtime) (values (swift-call "app_file_size" (kiln-swift::%addr b) (length b)) mtime))))
+
+(defun app-set-mtime (path seconds)
+  "PATH's modification time set to SECONDS since 1970.  True if it was."
+  (let ((b (kiln-swift::%octets path)))
+    (eql 1 (swift-call "app_set_mtime" (kiln-swift::%addr b) (length b) seconds))))
 
 (defun app-table-readme (table title text &key markdown)
   "TEXT under TABLE's rows, headed TITLE -- a folder's README -- drawn as Markdown when MARKDOWN.  \"\": none."
