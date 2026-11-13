@@ -31,7 +31,7 @@
   (:use #:cl)
   (:import-from #:kiln-swift #:swift-call #:on-event)
   (:export #:app-nav-new #:app-nav-root #:app-push #:app-screen #:app-show #:app-pop #:app-path-title #:app-browser #:app-browser-push #:app-browser-preview #:app-browser-preview-close #:app-browser-hex-total #:app-browser-hex-part #:app-browser-pop-to #:app-browser-set-path #:app-browser-subtitle #:app-browser-preview-toggle
-           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-theme
+           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-table-info #:app-theme
            #:app-bar-button-enable #:app-table #:app-table-set #:app-table-actions #:app-table-refresh
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
            #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show
@@ -144,6 +144,12 @@
   "The menu of a long press on TABLE where there is no row (under the last, or in an empty table): ITEMS,
    plists of :ID :TITLE :IMAGE :DESTRUCTIVE.  A choice is a :menu event with TABLE, its value (-1 id)."
   (%term-call "app_table_menu" table items))
+
+(defun app-table-info (table text)
+  "Lines about what TABLE shows (TEXT, newlines between them), above its filter: out of sight until pulled down
+   to.  \"\": none."
+  (let ((b (kiln-swift::%octets text)))
+    (swift-call "app_table_info" table (kiln-swift::%addr b) (length b))))
 
 (defun app-theme (theme)
   "THEME :mono -- black and white, inverted in dark mode -- or :system, the platform's blue.  Before the first
