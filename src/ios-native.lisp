@@ -11,7 +11,7 @@
 ;;;;   (app-screen "Title") -> screen, filled and then (app-show nav screen): it slides in whole
 ;;;;   (app-bar-button screen "plus" :right t) -> button (a :tap)
 ;;;;   (app-table screen) -> table           (app-table-set table rows)   rows: plists, :title :subtitle :detail
-;;;;                                                                        :image :tint :chevron :section :sort
+;;;;                                                                        :image :tint :chevron :section :sort :italic
 ;;;;   (app-table-append table rows)   more rows after its own, a batch of a listing as it arrives
 ;;;;   (app-table-actions table '((:title "Delete" :destructive t)))      -> :rowaction (action row)
 ;;;;   (app-table-refresh table) -> :refresh   (app-table-refresh-end table)
