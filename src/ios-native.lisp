@@ -31,7 +31,7 @@
   (:use #:cl)
   (:import-from #:kiln-swift #:swift-call #:on-event)
   (:export #:app-nav-new #:app-nav-root #:app-push #:app-screen #:app-show #:app-pop #:app-path-title #:app-browser #:app-browser-push #:app-browser-preview #:app-browser-preview-close #:app-browser-hex-total #:app-browser-hex-part #:app-browser-pop-to #:app-browser-set-path #:app-browser-subtitle
-           #:app-orientation #:app-set-title #:app-bar-button
+           #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order
            #:app-bar-button-enable #:app-table #:app-table-set #:app-table-actions #:app-table-refresh
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
            #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show
@@ -127,6 +127,20 @@
   (let ((b (kiln-swift::%octets symbol-or-title)))
     (swift-call "app_bar_button" screen (kiln-swift::%addr b) (length b) (if right 1 0))))
 
+(defun app-bar-menu (screen symbol items &key right)
+  "A bar button on SCREEN (the SF Symbol SYMBOL) that opens a menu of ITEMS -- plists of :ID :TITLE :SUBTITLE :IMAGE :ON
+   (checked) :GROUP (a rule between groups; a group's first item may carry :HEADER).  A choice is a :menu event
+   with the button, its value the item's :ID."
+  (%term-call "app_bar_menu" screen (list :symbol symbol :right right :items items)))
+
+(defun app-bar-menu-set (button items) (%term-call "app_bar_menu_set" button items))
+
+(defun app-table-order (table &key key descending (groups-first t))
+  "How TABLE's rows go: by KEY, a name among the rows' :KEYS (a string or keyword), or NIL for their :SORT (as
+   the Finder sorts names); DESCENDING; lower :GROUPs first when GROUPS-FIRST.  Ties go by :SORT."
+  (%term-call "app_table_order" table (list :key (and key (string-upcase (string key)))
+                                            :descending descending :groups-first groups-first)))
+
 (defun app-bar-button-enable (button on) (swift-call "app_bar_button_enable" button (if on 1 0)))
 
 ;;; tables
@@ -182,11 +196,13 @@
   (let ((tb (kiln-swift::%octets title)) (sb (kiln-swift::%octets save)))
     (swift-call "app_form" (kiln-swift::%addr tb) (length tb) (kiln-swift::%addr sb) (length sb))))
 
-(defun app-form-field (form label value &key (kind :text) (placeholder ""))
-  "A field; KIND :text :number :secure :url or :switch (its value \"1\" or \"0\").  Returns its index."
+(defun app-form-field (form label value &key (kind :text) (placeholder "") choices)
+  "A field; KIND :text :number :secure :url, :switch (its value \"1\" or \"0\"), or :choice -- a pop-up menu
+   of CHOICES (strings), its value the index of the one chosen (\"0\" the first).  Returns its index."
   (%term-call "app_form_field" form
-              (list :label label :value (or value "") :placeholder placeholder
-                    :kind (ecase kind (:text 0) (:number 1) (:secure 2) (:url 3) (:switch 4)))))
+              (list* :label label :value (or value "") :placeholder placeholder
+                     :kind (ecase kind (:text 0) (:number 1) (:secure 2) (:url 3) (:switch 4) (:choice 5))
+                     (and choices (list :choices choices)))))
 
 (defun app-form-button (form title)
   (let ((b (kiln-swift::%octets title))) (swift-call "app_form_button" form (kiln-swift::%addr b) (length b))))
