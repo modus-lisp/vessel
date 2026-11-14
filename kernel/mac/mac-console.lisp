@@ -36,13 +36,20 @@
 ;;;; %CONSOLE-INIT first clears the WHOLE screen to white, over the ROM's
 ;;;; desktop pattern.
 ;;;;   #x10009400 the font, 95 glyphs x 8 bytes
+;;;;   #x10009700 a staging line, 2 KB (a screen at a HIGH address: see MACC-HIGH-P)
 ;;;; The build defines MACC-FONT-BYTES before this text.
 
 (defun macc-x ()        (mem-ref #x10009200 :u32))
 (defun macc-y ()        (mem-ref #x10009204 :u32))
 (defun macc-cols ()     (mem-ref #x10009208 :u32))
 (defun macc-rows ()     (mem-ref #x1000920C :u32))
-(defun macc-base ()     (mem-ref #x10009210 :u32))
+(defun macc-base ()
+  ;; signed, as MACC-SCRNBASE made it: stored as a 32-bit word, a high screen's
+  ;; base read back as :U32 is a positive bignum, and MACC-HIGH-P said no
+  (let ((hi (mem-ref #x10009210 :u16)))
+    (if (>= hi #xC000)
+        (+ (* (- hi #x10000) #x10000) (mem-ref #x10009212 :u16))
+        (mem-ref #x10009210 :u32))))
 (defun macc-rowbytes () (mem-ref #x10009214 :u32))
 (defun macc-depth ()    (mem-ref #x10009218 :u32))
 (defun macc-set-x (v)   (setf (mem-ref #x10009200 :u32) v))
@@ -51,12 +58,45 @@
 (defconstant +macc-pad-y+ 6 "Top / bottom margin, pixels.")
 
 (defun macc-deref (h)
-  "The pointer a handle H holds, or 0."
-  (if (or (zerop h) (>= h #x20000000)) 0 (mem-ref h :u32)))
+  "The pointer a handle H holds, or 0.  Its low 24 bits: the boot ROM's Memory
+   Manager may run 24-bit, its master pointers' top byte then holds the lock /
+   purge / resource flags (a Quadra's), and those pointers are in the system
+   heap, far below 16 MB.  Read as halves: a flagged pointer is no fixnum."
+  (if (or (zerop h) (>= h #x20000000))
+      0
+      (+ (* (logand (mem-ref h :u16) #xFF) #x10000) (mem-ref (+ h 2) :u16))))
+
+(defun macc-scrnbase ()
+  "ScrnBase ($824).  A screen at #xC0000000 or above -- the SE/30's at
+   #xFEE08040, the Quadras' and every NuBus card's in the slot space -- is
+   kept as the NEGATIVE fixnum with the same low 32 bits: as a :U32 read it is
+   a bignum, which no address arithmetic or MEM-REF can use (MACC-HIGH-P)."
+  (let ((hi (mem-ref #x824 :u16)))
+    (if (>= hi #xC000)
+        (+ (* (- hi #x10000) #x10000) (mem-ref #x826 :u16))
+        (mem-ref #x824 :u32))))
+
+(defun macc-high-p ()
+  "Is the screen at a high address?  MEM-REF cannot reach one: it untags its
+   address with a LOGICAL shift (compile-mem-ref: what lets a 32-bit port reach
+   #x40000000-#x7FFFFFFF), so a negative fixnum lands at the wrong place.  Such
+   a screen is written by staging pixels at #x10009700 and copying them with
+   SYSCALL3 service 4 (MACC-BLIT), whose untag is arithmetic."
+  (< (macc-base) 0))
+
+(defun macc-stage () (%conv-addr #x10009700))
+
+(defun macc-blit (src dst n)
+  "N bytes from SRC (low memory) to DST (the screen, anywhere): SYSCALL3
+   service 4, a plain copy.  Not _BlockMove (service 2): on a 68040 it copies
+   with MOVE16 line bursts, which the Quadras' video memory does not take --
+   MAME's Quadra 950 went into its interrupt handlers until the stack ran
+   into the heap."
+  (syscall3 4 src dst n))
 
 (defun macc-probe ()
   "Read the screen the ROM set up into the console's words."
-  (let* ((base (mem-ref #x824 :u32))
+  (let* ((base (macc-scrnbase))
          (rowbytes (logand (mem-ref #x106 :u16) #x3FFF))
          ;; MainDevice only with Color QuickDraw (ROM85 $28E bit 14 clear):
          ;; on a Classic the word is not a handle
@@ -86,6 +126,7 @@
 (defun macc-clear-screen ()
   "The whole screen white, in its depth: 0 at 1 and 8 bits, #x7FFF a pixel
    at 16, #x00FFFFFF at 32 (written as two 16-bit halves: no bignum)."
+  (when (macc-high-p) (return-from macc-clear-screen (macc-clear-screen-high)))
   (let* ((a (macc-base)) (d (macc-depth))
          (end (+ a (* (macc-rowbytes) (mem-ref #x10009220 :u32)))))
     (loop
@@ -94,6 +135,35 @@
             ((= d 32) (setf (mem-ref a :u16) #x00FF) (setf (mem-ref (+ a 2) :u16) #xFFFF)
                       (setq a (+ a 4)))
             (t (setf (mem-ref a :u16) 0) (setq a (+ a 2)))))))
+
+(defun macc-stage-white ()
+  "The staging line (2 KB) white in this depth."
+  (let ((d (macc-depth)) (st (macc-stage)) (i 0))
+    (loop
+      (when (>= i 2048) (return nil))
+      (cond ((= d 16) (setf (mem-ref (+ st i) :u16) #x7FFF) (setq i (+ i 2)))
+            ((= d 32) (setf (mem-ref (+ st i) :u16) #x00FF)
+                      (setf (mem-ref (+ st i 2) :u16) #xFFFF) (setq i (+ i 4)))
+            (t (setf (mem-ref (+ st i) :u16) 0) (setq i (+ i 2)))))))
+
+(defun macc-white-lines (line width count)
+  "COUNT scan lines of WIDTH bytes from screen address LINE white, from a
+   staging line MACC-STAGE-WHITE made, in pieces of at most 2 KB."
+  (let ((rb (macc-rowbytes)) (st (macc-stage)) (y 0))
+    (loop
+      (when (>= y count) (return nil))
+      (let ((off 0))
+        (loop
+          (when (>= off width) (return nil))
+          (macc-blit st (+ line off) (if (> (- width off) 2048) 2048 (- width off)))
+          (setq off (+ off 2048))))
+      (setq line (+ line rb))
+      (setq y (+ y 1)))))
+
+(defun macc-clear-screen-high ()
+  "MACC-CLEAR-SCREEN for a high screen."
+  (macc-stage-white)
+  (macc-white-lines (macc-base) (macc-rowbytes) (mem-ref #x10009220 :u32)))
 
 (defun macc-put-pixel-row (addr bits)
   "Eight pixels of a glyph row (BITS, MSB leftmost) at ADDR in this depth."
@@ -127,22 +197,42 @@
          (addr (+ (macc-base) (* (+ (* row 8) +macc-pad-y+) rb)
                   (floor (* (+ (* col 8) +macc-pad-x+) d) 8)))
          (r 0))
-    (if (= d 1)
+    (cond
+      ((< addr 0)
+       ;; a high screen (MACC-HIGH-P): each row staged, then _BlockMove'd
+       (let ((st (macc-stage)))
+         (loop
+           (when (>= r 8) (return nil))
+           (if (= d 1)
+               (setf (mem-ref st :u8) (mem-ref (+ font r) :u8))
+               (macc-put-pixel-row st (mem-ref (+ font r) :u8)))
+           (macc-blit st addr d)
+           (setq addr (+ addr rb))
+           (setq r (+ r 1)))))
+      ((= d 1)
         (loop
           (when (>= r 8) (return nil))
           (setf (mem-ref addr :u8) (mem-ref (+ font r) :u8))
           (setq addr (+ addr rb))
-          (setq r (+ r 1)))
+          (setq r (+ r 1))))
+      (t
         (loop
           (when (>= r 8) (return nil))
           (macc-put-pixel-row addr (mem-ref (+ font r) :u8))
           (setq addr (+ addr rb))
-          (setq r (+ r 1))))))
+          (setq r (+ r 1)))))))
 
 (defun macc-clear-row (row)
   ;; On a 1-bit screen a blank text row is 8 pixel lines of zero bytes (a
   ;; space's glyph is all zeros) -- it was a space rendered in every column,
   ;; over a thousand calls a newline.  Deeper screens still render spaces.
+  (when (macc-high-p)
+    ;; a high screen: the text row's 8 scan lines white, staged
+    (let* ((d (macc-depth)) (rb (macc-rowbytes)))
+      (macc-stage-white)
+      (macc-white-lines (+ (macc-base) (* (+ (* row 8) +macc-pad-y+) rb) (floor (* +macc-pad-x+ d) 8))
+                        (floor (* (macc-cols) 8 d) 8) 8)
+      (return-from macc-clear-row nil)))
   (if (= (macc-depth) 1)
       (let* ((rb (macc-rowbytes)) (n (macc-cols))
              (line (+ (macc-base) (* (+ (* row 8) +macc-pad-y+) rb) (floor +macc-pad-x+ 8)))
@@ -200,7 +290,9 @@
    buffer's ring turned (its old top row becomes the blank bottom)."
   (let* ((rb (macc-rowbytes)) (rows (macc-rows))
          (top (+ (macc-base) (* +macc-pad-y+ rb))))
-    (syscall3 2 (+ top (* 8 rb)) top (* (- rows 1) 8 rb))
+    ;; a high screen by plain copy (MACC-BLIT's reason); a low one, a 68000
+    ;; Mac's, by the ROM's _BlockMove, which is faster there
+    (syscall3 (if (< top 0) 4 2) (+ top (* 8 rb)) top (* (- rows 1) 8 rb))
     (setf (mem-ref #x10009224 :u32) (mod (+ (mem-ref #x10009224 :u32) 1) rows))
     (macc-blank-buffer-row (- rows 1))
     (macc-clear-row (- rows 1))))
