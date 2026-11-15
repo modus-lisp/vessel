@@ -78,12 +78,13 @@
   "The local file PATH in BROWSER's pane -- KIND :text, monospaced in a view of ours; :image, in a zoomable
    viewer of ours; :hex, a hex dump of the file's first part, which PATH holds (APP-BROWSER-HEX-TOTAL first; it
    asks for other parts with a :hexmore event, (mode offset), answered with APP-BROWSER-HEX-PART, and a line's
-   edit is a :hexedit event, (offset hex-text)); :quick-look, Quick Look -- under the list in portrait, a column beside it in
+   edit is a :hexedit event, (offset hex-text)); :log, as :text but its end, followed as it grows (shown again,
+   as more is written); :quick-look, Quick Look -- under the list in portrait, a column beside it in
    landscape -- headed NAME, with share and close buttons.  Another file replaces it.  Its close button is a
    :previewed event with the browser."
   (let ((pb (kiln-swift::%octets path)) (nb (kiln-swift::%octets name)))
     (swift-call "app_browser_preview" browser (kiln-swift::%addr pb) (length pb) (kiln-swift::%addr nb) (length nb)
-                (ecase kind (:quick-look 0) (:text 1) (:image 2) (:hex 3) (:markdown 4)))))
+                (ecase kind (:quick-look 0) (:text 1) (:image 2) (:hex 3) (:markdown 4) (:log 5)))))
 
 (defun app-browser-hex-total (browser size)
   "The size of the file the next :hex preview shows: where its dump ends."
