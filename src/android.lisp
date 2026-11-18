@@ -1,7 +1,7 @@
 ;;;; android.lisp — the Android app's entry point: glass on the phone's own screen.
 ;;;; The app itself is src/app.lisp; this is Android's way to the screen.
 ;;;;
-;;;; Loaded into the world `kiln android' snapshots (kiln's boot/ios-world.lisp with
+;;;; Loaded into the world `kiln android' snapshots (vessel's src/ios-world.lisp with
 ;;;; KILN_APP=android).  The app's modus.args say
 ;;;;   --core @kiln.core --eval (kiln-android-main)
 ;;;; On Android the image is not alone in its process: it is the CHILD of the

@@ -1,7 +1,7 @@
 ;;;; ios.lisp — the iPhone app's entry point: glass on the phone's own screen.
 ;;;; The app itself is src/app.lisp; this is iOS's way to the screen.
 ;;;;
-;;;; Loaded into the world `kiln ios' snapshots (kiln's boot/ios-world.lisp), so it is
+;;;; Loaded into the world `kiln ios' snapshots (vessel's src/ios-world.lisp), so it is
 ;;;; native code by the time the phone runs it.  The app's modus.args say
 ;;;;   --core @kiln.core --eval (kiln-ios-main)
 ;;;; and this takes it from there: a glass framebuffer, the media player drawn

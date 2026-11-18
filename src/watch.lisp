@@ -1,7 +1,7 @@
 ;;;; watch.lisp -- the watch app on a real watch: the storybook of its native components, and nothing else.
 ;;;;
-;;;; A watch (arm64_32: 4 GB of address space, ~300 MB of memory) carries a world of its own, kiln's
-;;;; boot/watch-world.lisp: modus, the term codec, the Swift bridge (ios-swift.lisp) and the watch storybook --
+;;;; A watch (arm64_32: 4 GB of address space, ~300 MB of memory) carries a world of its own, vessel's
+;;;; src/watch-world.lisp: modus, the term codec, the Swift bridge (ios-swift.lisp) and the watch storybook --
 ;;;; no desk, no glass, no media.  So no desk frame loop either: this file is the little of app.lisp and
 ;;;; ios.lisp the bridge needs -- the pseudo-syscall, the frame hooks -- and a loop that runs them.
 ;;;;

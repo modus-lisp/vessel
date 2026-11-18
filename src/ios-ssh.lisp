@@ -1,8 +1,8 @@
 ;;;; ios-ssh.lisp -- the SSH that the phone's Terminal uses: conch for the connection, and the
 ;;;; device's identity and known hosts kept in the system keychain (modus-ui.m's pseudo-syscalls
 ;;;; 1030-1032), not in a file.  The Terminal finds this package by the three names its ssh needs,
-;;;; as it finds the board's (zero-ssh.lisp), and it is loaded into the phone's world (kiln's
-;;;; boot/ios-world.lisp).
+;;;; as it finds the board's (zero-ssh.lisp), and it is loaded into the phone's world (vessel's
+;;;; src/ios-world.lisp).
 
 (defpackage #:kiln-ios-ssh
   (:use #:cl)
