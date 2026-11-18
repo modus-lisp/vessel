@@ -322,6 +322,14 @@
 ;;; ------------------------------------------------------------
 
 (defun %console-init ()
+  ;; a Mac OS application (the static block's #x10006054, translate-68k
+  ;; +68K-MAC-HOST+): the application draws the console in its window, and
+  ;; the screen is not ours (and a saved core's "on" is put back off)
+  (if (zerop (mem-ref #x10006054 :u32))
+      (macc-take-screen)
+      (setf (mem-ref #x1000921C :u32) 0)))
+
+(defun macc-take-screen ()
   (let ((p (macc-font-bytes)) (i 0))
     (loop
       (when (null p) (return nil))
