@@ -36,6 +36,8 @@
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
            #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show
            #:app-status #:app-pick-file #:app-share-file #:app-preview #:app-copy #:app-documents #:app-utc-offset #:app-resolve
+           #:app-nav-present #:app-nav-dismiss #:app-compose #:app-table-scroll-end
+           #:ble-start #:ble-send #:ble-stop
            #:on-event))
 
 (in-package #:kiln-native)
@@ -56,6 +58,30 @@
    back button that is a bare chevron."
   (%text-call "app_nav_new" title (if quiet 1 0)))
 (defun app-nav-root (nav) (swift-call "app_nav_root" nav))
+(defun app-nav-present (title)
+  "A navigation controller shown full-screen over what is there (the desk): an app within an app.  Its bar holds
+   still.  APP-NAV-DISMISS takes it away."
+  (%text-call "app_nav_present" title))
+(defun app-nav-dismiss (nav) (swift-call "app_nav_dismiss" nav))
+(defun app-compose (screen placeholder)
+  "A text field and a send button along SCREEN's bottom, above the keyboard: what is sent is a :compose event
+   with the text, on the handle this returns."
+  (let ((b (kiln-swift::%octets placeholder)))
+    (swift-call "app_compose" screen (kiln-swift::%addr b) (length b))))
+(defun app-table-scroll-end (table &key animated) (swift-call "app_table_scroll_end" table (if animated 1 0)))
+
+;;; ---- Bluetooth LE links (Bluetooth.swift): this phone a central and a peripheral of one service ----
+;;; Events, as :ble with handle 0, the value one of (:state on) (:link link up max) (:data link bytes) (:log text).
+
+(defun ble-start (service characteristic)
+  "The radio on: finding peers that offer SERVICE (a UUID string), and offering it, its one CHARACTERISTIC."
+  (let ((s (kiln-swift::%octets service)) (c (kiln-swift::%octets characteristic)))
+    (swift-call "ble_start" (kiln-swift::%addr s) (length s) (kiln-swift::%addr c) (length c))))
+(defun ble-send (link bytes)
+  "BYTES (an (unsigned-byte 8) vector) to LINK's peer.  T if it went."
+  (let ((b (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
+    (= 1 (swift-call "ble_send" link (kiln-swift::%addr b) (length b)))))
+(defun ble-stop () (swift-call "ble_stop"))
 (defun app-push (nav title)
   (let ((b (kiln-swift::%octets title))) (swift-call "app_push" nav (kiln-swift::%addr b) (length b))))
 (defun app-screen (title)

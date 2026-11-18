@@ -597,6 +597,11 @@
     (when (find-package "KILN-STORYBOOK")
       (glass.desk:desk-register-action desk "Storybook"
                                        (lambda () (funcall (find-symbol "STORYBOOK" "KILN-STORYBOOK")))))
+    ;; BITCHAT (chirp/app), where the image has it: a chat with phones nearby over Bluetooth, in native screens
+    ;; over the desk -- like the storybook, a menu action
+    (when (find-package "CHIRP-APP")
+      (glass.desk:desk-register-action desk "Bitchat"
+                                       (lambda () (funcall (find-symbol "OPEN-CHAT" "CHIRP-APP")))))
     ;; THE KEYBOARD follows the focus: the desk raises the phone's keyboard (pseudo-syscall 1006)
     ;; when a window that takes text is opened or tapped into, and puts it away when you tap
     ;; elsewhere; what is typed arrives as key events below
