@@ -592,6 +592,12 @@
         (glass.desk:desk-register-app desk "Speak" (symbol-function speak) :width (min dw 400) :height 300))
       (when (and listen (fboundp listen))
         (glass.desk:desk-register-app desk "Listen" (symbol-function listen) :width (min dw 400) :height 320)))
+    ;; THE MIXER (glass/mixer-desk), where the image has it: what is playing into the speaker, each thing's
+    ;; level, mute and gain, and who reads the mix -- this loop's mixer, the one the speaker hears
+    (let ((app (find-symbol "MIXER-APP" "GLASS.DESK")))
+      (when (and app (fboundp app))
+        (glass.desk:desk-register-app desk "Mixer" (lambda (fb) (funcall app fb mixer))
+                                      :width (min dw 420) :height 360)))
     ;; THE STORYBOOK of the native components (ios-storybook.lisp), where the image has it: not a window -- its
     ;; views are the platform's own, over the desk -- so a menu action
     (when (find-package "KILN-STORYBOOK")
