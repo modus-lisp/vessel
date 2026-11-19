@@ -602,6 +602,51 @@
     (%kiln-sys 1005 addr (+ (* w k) (* (* h k) 65536))
                (+ (+ x0 (* x k)) (* (+ y0 (* y k)) 65536)) bw bpp)))
 
+;;; ---- the phone's files: Documents, and the document picker (host/ios/swift/Files.swift) ----------
+
+(defun %kiln-swift (name &rest args)
+  "Call the Swift function NAME (kiln-swift's SWIFT-CALL), or answer NIL where the image has no Swift
+   bridge or the host no such function (the Mac's modus-mac, the Zero)."
+  (let ((call (and (find-package "KILN-SWIFT") (find-symbol "SWIFT-CALL" "KILN-SWIFT"))))
+    (and call (fboundp call) (ignore-errors (apply call name args)))))
+
+(defun %kiln-swift-text (name text &rest more)
+  "Call NAME with TEXT's UTF-8 bytes (address, length) then MORE."
+  (let ((addr (find-symbol "%ADDR" "KILN-SWIFT")) (octets (find-symbol "%OCTETS" "KILN-SWIFT")))
+    (when (and addr octets)
+      (let ((b (funcall octets text)))
+        (apply #'%kiln-swift name (funcall addr b) (length b) more)))))
+
+(defun %kiln-documents-dir ()
+  "The app's Documents folder, ending in /, which the Files app shows as On My iPhone > the app
+   (Info.plist's UIFileSharingEnabled): or NIL without the Swift side."
+  (let* ((addr (find-symbol "%ADDR" "KILN-SWIFT"))
+         (buf (make-array 1024 :element-type '(unsigned-byte 8) :initial-element 0))
+         (n (and addr (%kiln-swift "files_documents" (funcall addr buf) 1024))))
+    (when (and n (< 0 n 1024))
+      (let ((s (map 'string #'code-char (subseq buf 0 n))))
+        (if (char= (char s (1- (length s))) #\/) s (concatenate 'string s "/"))))))
+
+(defun %kiln-media-dir (bundle)
+  "Where Media plays from: Documents/media/, which the Files app shows as On My iPhone > the app >
+   media, and where the + picker puts what it brings in (iCloud Drive and the rest); the bundle's
+   sample media are copied into its Samples folder the first time (a marker file remembers, so
+   Samples deleted stay deleted).  Without the Swift side, the bundle's own media/ folder."
+  (let ((docs (%kiln-documents-dir)))
+    (if (null docs)
+        (concatenate 'string bundle "media/")
+        (let* ((root (concatenate 'string docs "media/"))
+               (marker (concatenate 'string root ".kiln-seeded")))
+          (ignore-errors (ensure-directories-exist root))
+          (unless (probe-file marker)
+            (let ((addr (find-symbol "%ADDR" "KILN-SWIFT")) (octets (find-symbol "%OCTETS" "KILN-SWIFT")))
+              (let ((src (funcall octets (concatenate 'string bundle "media")))
+                    (dst (funcall octets (concatenate 'string root "Samples"))))
+                (%kiln-swift "files_copy" (funcall addr src) (length src) (funcall addr dst) (length dst))))
+            (ignore-errors (with-open-file (o marker :direction :output :if-exists :supersede)
+                             (write-line "seeded" o))))
+          root))))
+
 (defun kiln-app-main (&key autoplay (top 60) (media t))
   "The app: a glass desk (glass/desk) on the phone's screen -- windows dragged by their title
    bars, a root menu on the background -- with the Actions window open (the media player
@@ -615,6 +660,8 @@
   (let* ((sw (%kiln-sys 1001 0 0 0))
          (sh (%kiln-sys 1001 1 0 0))
          (dir (or (%kiln-bundle-dir) "./"))
+         ;; MEDIA'S FOLDER is the phone's Documents (Files: On My iPhone > the app), not the bundle
+         (mdir (if media (%kiln-media-dir dir) (concatenate 'string dir "media/")))
          ;; THE SCREEN IS IN DEVICE PIXELS and the desk is laid out in desktop pixels, so glass
          ;; magnifies it, at the screen's own scale (3 on this phone): ONE DESK PIXEL IS ONE
          ;; POINT, and 16-pixel text is iOS's 16-point text.  At 2x it was two-thirds of that
@@ -641,14 +688,14 @@
                                                  (symbol-value ext))
                                          :test #'string=)))))
          (lib (and media (funcall (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")
-                                  :root (concatenate 'string dir "media/") :mixer mixer)))
+                                  :root mdir :mixer mixer)))
          (desk (%kiln-make-desk (glass:make-framebuffer dw dh))))
     (declare (ignorable _))
     (setf *kiln-desk* desk)
     ;; a window's copy box puts its text on the host's clipboard (the iPhone's pasteboard)
     (when (fboundp '%kiln-copy-text)
       (setf glass.desk:*desk-copy* (symbol-function '%kiln-copy-text)))
-    (format t "~&kiln: ~Dx~D screen, desk ~Dx~D at ~Dx, media from ~A~%" sw sh dw dh k dir)
+    (format t "~&kiln: ~Dx~D screen, desk ~Dx~D at ~Dx, media from ~A~%" sw sh dw dh k mdir)
     (%kiln-sys 1002 0 (+ sw (* sh 65536)) #x1E2530)
     ;; TOUCH-SIZED CHROME: a 34-point title bar to drag by, 44-point menu rows (iOS's
     ;; minimum touch target), 16-point labels
@@ -668,7 +715,19 @@
             (progn
               (setf glass.desk::*media-library* lib
                     glass.desk::*media-mixer* mixer
-                    glass.desk::*media-root* (concatenate 'string dir "media/"))
+                    glass.desk::*media-root* mdir)
+              ;; THE + at the end of Media's tabs: the system's document picker, iCloud Drive and
+              ;; every other provider, its picks copied into the folder Media is showing
+              (let ((import (find-symbol "*MEDIA-IMPORT*" "GLASS.DESK")))
+                (when (and import (%kiln-documents-dir))
+                  (setf (symbol-value import)
+                        (lambda ()
+                          (let ((lib glass.desk::*media-library*))
+                            (%kiln-swift-text "files_pick"
+                                              (namestring
+                                               (if lib
+                                                   (funcall (find-symbol "LIBRARY-FOLDER" "WARP-MEDIA") lib)
+                                                   mdir))))))))
               (%kiln-desk-register-app desk "Media"
                                        (lambda (fb)
                                          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
@@ -763,8 +822,7 @@
             (format t "~&kiln: autoplay ~A: no such file~%" autoplay))))
     (when media
       (format t "~&kiln: ~D track~:P~%"
-              (length (funcall (find-symbol "FOLDER-TRACKS" "WARP-MEDIA")
-                               (concatenate 'string dir "media/")))))
+              (length (funcall (find-symbol "FOLDER-TRACKS" "WARP-MEDIA") mdir))))
     ;; THE UI SYNC: what has changed is shown now.  A Return is handled only after this, so a line
     ;; is drawn before it is evaluated (a form may block for a long time), and pasted text, which
     ;; arrives as keys, shows before its newline runs.
