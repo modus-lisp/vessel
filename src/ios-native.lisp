@@ -21,6 +21,8 @@
 ;;;;   (app-form "Title" :save "Save") -> form   (app-form-field form "Label" "value" :kind :text :placeholder "")
 ;;;;   (app-form-button form "Copy") -> button (a :tap)   (app-form-note form "...")   (app-form-show form)
 ;;;;                                                        -> :form (saved value ...)
+;;;;   (app-invoice "Top Up" "5,000 sats" bolt11) -> invoice: its QR code, Copy, Open in Wallet; :invoice when closed
+;;;;   (app-invoice-status invoice "Paid" :paid t)
 ;;;;   (app-status nav "Downloading x" :progress 0.4 :cancel t)  (app-status nav "")   -> :statuscancel
 ;;;;   (app-preview path) -> handle, Quick Look; :previewed when closed
 ;;;;   (app-pick-file) -> picker, :picked path ("" cancelled)   (app-share-file path) -> :share
@@ -34,7 +36,7 @@
            #:app-orientation #:app-set-title #:app-bar-button #:app-bar-menu #:app-bar-menu-set #:app-table-order #:app-table-menu #:app-table-info #:app-table-options #:app-file-stamp #:app-set-mtime #:app-table-readme #:app-theme
            #:app-bar-button-enable #:app-table #:app-table-set #:app-table-actions #:app-table-refresh
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
-           #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show
+           #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show #:app-invoice #:app-invoice-status #:app-thumbnail #:app-image-jpeg
            #:app-status #:app-pick-file #:app-share-file #:app-preview #:app-copy #:app-documents #:app-utc-offset #:app-resolve
            #:app-nav-present #:app-nav-dismiss #:app-compose #:app-table-scroll-end
            #:ble-start #:ble-send #:ble-stop
@@ -278,6 +280,42 @@
 (defun app-form-note (form text)
   (let ((b (kiln-swift::%octets text))) (swift-call "app_form_note" form (kiln-swift::%addr b) (length b))))
 (defun app-form-show (form) (swift-call "app_form_show" form))
+
+;;; a Lightning invoice
+
+(defun app-invoice (title amount bolt11)
+  "Show BOLT11 to be paid: AMOUNT (text) above its QR code, Copy and Open in Wallet below, a status line under
+   them (APP-INVOICE-STATUS).  Done closes it: an :invoice event.  Returns its handle."
+  (%term-call "app_invoice" 0 (list :title title :amount amount :bolt11 bolt11)))
+
+(defun app-invoice-status (invoice text &key paid)
+  (%term-call "app_invoice_status" invoice (list :text text :paid (if paid 1 0))))
+
+;;; a picture, small
+
+(defun app-thumbnail (path max-side &key (background 0))
+  "The picture at PATH scaled to fit MAX-SIDE pixels, over BACKGROUND (#xRRGGBB): (values W H PIXELS),
+   PIXELS a vector of #xRRGGBB words, row by row -- or NIL when it does not decode.  Native (ImageIO)."
+  (let* ((cap (* max-side max-side 4))
+         (buf (make-array cap :element-type '(unsigned-byte 8) :initial-element 0))
+         (pb (kiln-swift::%octets path))
+         (r (swift-call "app_thumbnail" (kiln-swift::%addr pb) (length pb) max-side
+                        (kiln-swift::%addr buf) cap background)))
+    (when (and (integerp r) (plusp r))
+      (let* ((w (ash r -16)) (h (logand r #xffff))
+             (px (make-array (* w h) :element-type '(unsigned-byte 32))))
+        (dotimes (i (* w h))
+          (let ((j (* 4 i)))
+            (setf (aref px i) (logior (aref buf j) (ash (aref buf (+ j 1)) 8) (ash (aref buf (+ j 2)) 16)))))
+        (values w h px)))))
+
+(defun app-image-jpeg (path max-side out &key (quality 75))
+  "The picture at PATH, scaled to fit MAX-SIDE pixels, written to OUT as a JPEG.  The size written,
+   or NIL.  Native (ImageIO)."
+  (let* ((pb (kiln-swift::%octets path)) (ob (kiln-swift::%octets out))
+         (r (swift-call "app_image_jpeg" (kiln-swift::%addr pb) (length pb) max-side
+                        (kiln-swift::%addr ob) (length ob) quality)))
+    (and (integerp r) (plusp r) r)))
 
 ;;; the status bar, files, the pasteboard
 

@@ -517,7 +517,8 @@
 
 (defun kiln-app-main (&key autoplay (top 60) (media t))
   "The app: a glass desk (glass/desk) on the phone's screen -- windows dragged by their title
-   bars, a root menu on the background -- with the media player open.  AUTOPLAY, a file name in
+   bars, a root menu on the background -- with the Actions window open (the media player
+   without it).  AUTOPLAY, a file name in
    the bundle's media folder, starts playing once the first picture is up (kiln ios
    --autoplay=FILE) -- for trying a build without touching it.  MEDIA NIL leaves out the
    player and its codecs (warp, reel, reed, cassette) and opens the Clock instead: the
@@ -543,10 +544,19 @@
          (speaker (zerop (%kiln-sys 1010 +kiln-rate+ 0 0)))
          (mixer (and speaker (glass:make-mixer :rate +kiln-rate+)))
          (sink (and mixer (glass:mixer-subscribe mixer :name "speaker" :rate +kiln-rate+)))
-         ;; warp is looked up when media is on: the iOS world may not carry it
+         ;; warp is looked up when media is on: the iOS world may not carry it.  Its player lists
+         ;; audio only now (a phone watching the DESKTOP over WebRTC cannot afford a video stream beside
+         ;; it); here the films are on the phone itself, so their containers go back on, as the Zero's do
+         (_ (when media
+              (let ((ext (find-symbol "*EXTENSIONS*" "WARP-MEDIA")))
+                (setf (symbol-value ext)
+                      (remove-duplicates (append '("webm" "mkv" "mp4" "m4v" "mov" "mpg" "mpeg" "ts")
+                                                 (symbol-value ext))
+                                         :test #'string=)))))
          (lib (and media (funcall (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")
                                   :root (concatenate 'string dir "media/") :mixer mixer)))
          (desk (glass.desk:make-desk (glass:make-framebuffer dw dh))))
+    (declare (ignorable _))
     (setf *kiln-desk* desk)
     ;; a window's copy box puts its text on the host's clipboard (the iPhone's pasteboard)
     (when (fboundp '%kiln-copy-text)
@@ -608,16 +618,31 @@
     (when (find-package "CHIRP-APP")
       (glass.desk:desk-register-action desk "Bitchat"
                                        (lambda () (funcall (find-symbol "OPEN-CHAT" "CHIRP-APP")))))
+    ;; WEB (browser.lisp), where the image has it: loom, the browser over weft
+    (let ((app (and (find-package "KILN-BROWSER") (find-symbol "BROWSER-APP" "KILN-BROWSER"))))
+      (when (and app (fboundp app))
+        (glass.desk:desk-register-app desk "Web" (symbol-function app) :width dw :height (min dh 680))))
+    ;; FILES (files.lisp), where the image has it: warren, the column file browser, over Documents/
+    (let ((app (and (find-package "KILN-FILES") (find-symbol "FILES-APP" "KILN-FILES"))))
+      (when (and app (fboundp app))
+        (glass.desk:desk-register-app desk "Files" (symbol-function app) :width dw :height (min dh 560))))
+    ;; OPERANDI (operandi.lisp), where the image has it: the agent's chat in a window, the phone's own input
+    (let ((app (and (find-package "KILN-OPERANDI") (find-symbol "OPERANDI-APP" "KILN-OPERANDI"))))
+      (when (and app (fboundp app))
+        (glass.desk:desk-register-app desk "Operandi" (symbol-function app) :width dw :height (min dh 640))))
     ;; THE KEYBOARD follows the focus: the desk raises the phone's keyboard (pseudo-syscall 1006)
     ;; when a window that takes text is opened or tapped into, and puts it away when you tap
     ;; elsewhere; what is typed arrives as key events below
     (setf (glass.desk:desk-keyboard-fn desk)
           (lambda (on) (%kiln-sys 1006 (if on 1 0) 0 0)))
-    (glass.desk:desk-open desk (if media "Media" "Clock"))
+    ;; THE FIRST WINDOW: Actions, where the image has it (a phone's first look is what it can do); else the
+    ;; media player, else the Clock.  An autoplay opens the player too, below.
+    (glass.desk:desk-open desk (cond ((fboundp '%kiln-actions-app) "Actions") (media "Media") (t "Clock")))
     (format t "~&kiln: ~:[no speaker~;speaker at ~D Hz~]~%" speaker +kiln-rate+)
     (when lib (setf *kiln-stats-player* (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib)))
     (when (modus-int::%cli-getenv "KILN_AUDIO_STATS")
-      (setf (symbol-value (find-symbol "*WORKER-STATS*" "WARP-MEDIA")) t))
+      ;; master's player has no worker stats (they were the modus-threads branch's): ask, don't assume
+      (let ((s (find-symbol "*WORKER-STATS*" "WARP-MEDIA"))) (when s (setf (symbol-value s) t))))
     (%kiln-stats-init)
     ;; KILN_AUTOPLAY=FILE: play one of the films at launch (devicectl / simctl pass it), as :AUTOPLAY does
     (let ((a (modus-int::%cli-getenv "KILN_AUTOPLAY")))
@@ -626,6 +651,7 @@
       (let ((path (concatenate 'string dir "media/" autoplay)))
         (if (probe-file path)
             (progn (format t "~&kiln: autoplay ~A~%" autoplay)
+                   (when (fboundp '%kiln-actions-app) (glass.desk:desk-open desk "Media"))
                    (funcall (find-symbol "PLAY-PATH" "WARP-MEDIA")
                             (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib) path))
             (format t "~&kiln: autoplay ~A: no such file~%" autoplay))))
