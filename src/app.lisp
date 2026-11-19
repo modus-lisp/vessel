@@ -49,14 +49,53 @@
 ;;; KILN_AUDIO_STATS=1: once a second, how the loop that feeds the speaker is keeping up -- its
 ;;; longest and mean pass, the longest paint, how often the pump found the device's queue nearly
 ;;; dry (under one 20 ms frame), and collections.  The sound is only as steady as this loop.
+;;;
+;;; KILN_STATS_SINK=HOST:PORT, set when the WORLD IS BUILT (kiln ios), rides in the snapshot: the app
+;;; then keeps these stats from launch and also sends every line over TCP to HOST:PORT -- a phone
+;;; installed over the air, with no cable for its console, reports to a listener on the Mac
+;;; (`nc -lk PORT').  Unset (the default), nothing is sent and the stats follow KILN_AUDIO_STATS.
+(defvar *kiln-stats-sink* (let ((s (modus-int::%cli-getenv "KILN_STATS_SINK"))) (and s (plusp (length s)) s)))
+(defvar *kiln-stats-stream* nil "The sink's connection, once made.")
+(defvar *kiln-stats-retry* 0 "When (internal real time) to try the sink again after a failed connect.")
+(defun %kiln-stats-say (fmt &rest args)
+  "A stats line to stdout, and to the sink when there is one."
+  (let ((line (apply #'format nil fmt args)))
+    (format t "~&~A~%" line)
+    ;; a failed connect is tried again 5 s later: the first one may lose to iOS's Local Network prompt
+    (when (and *kiln-stats-sink* (null *kiln-stats-stream*)
+               (>= (get-internal-real-time) *kiln-stats-retry*))
+      (setf *kiln-stats-retry* (+ (get-internal-real-time) (* 5 internal-time-units-per-second)))
+      (setf *kiln-stats-stream*
+            (or (ignore-errors
+                 (let* ((c (position #\: *kiln-stats-sink* :from-end t))
+                        (host (subseq *kiln-stats-sink* 0 c))
+                        (port (parse-integer *kiln-stats-sink* :start (1+ c))))
+                   (funcall (find-symbol "OPEN-STREAM-FOR" "WEFT.FETCH") "http" host port 3)))
+                nil)))
+    (let ((st *kiln-stats-stream*))
+      (when st
+        (unless (ignore-errors
+                 (write-sequence (map '(vector (unsigned-byte 8)) #'char-code
+                                      (concatenate 'string line (string #\Newline)))
+                                 st)
+                 (finish-output st) t)
+          (ignore-errors (close st :abort t))
+          (setf *kiln-stats-stream* nil))))))
 (defvar *kiln-stats* nil)
 (defvar *kiln-stats-player* nil "The media player whose shown frames the stats count, or NIL.")
+(defun %kiln-stats-on-p () (or (modus-int::%cli-getenv "KILN_AUDIO_STATS") *kiln-stats-sink*))
+(defun %kiln-radio-stats-reset ()
+  "A fresh count for spool's radio, when this image has spool."
+  (let ((v (find-symbol "*RADIO-STATS*" "SPOOL")) (mk (find-symbol "MAKE-RADIO-STATS" "SPOOL")))
+    (when (and v mk (fboundp mk)) (setf (symbol-value v) (funcall mk)))))
 (defun %kiln-stats-init ()
-  (setf *kiln-stats* (and (modus-int::%cli-getenv "KILN_AUDIO_STATS")
+  (when (%kiln-stats-on-p) (%kiln-radio-stats-reset))
+  (setf *kiln-stats* (and (%kiln-stats-on-p)
                           (list :t0 (get-internal-real-time) :passes 0 :sum 0 :max 0 :paint 0 :dry 0
                                 :gc (modus-int::%gc-epoch) :frame (%kiln-stats-frame-no) :gap 0
                                 :last-change (get-internal-real-time) :last-frame (%kiln-stats-frame-no)
-                                :tick 0 :scale 0 :blit 0 :hooks 0 :px 0 :blits 0 :input 0 :events 0 :wait 0))))
+                                :tick 0 :scale 0 :blit 0 :hooks 0 :px 0 :blits 0 :input 0 :events 0 :wait 0
+                                :qmin most-positive-fixnum))))
 (defun %kiln-stats-add (key us)
   "Add US microseconds (or a count) to the stats' KEY, when stats are on."
   (when *kiln-stats* (incf (getf *kiln-stats* key) us)))
@@ -73,6 +112,7 @@
     (incf (getf s :passes)) (incf (getf s :sum) pass-ms)
     (setf (getf s :max) (max (getf s :max) pass-ms) (getf s :paint) (max (getf s :paint) paint-ms))
     (when (and queued (< queued 960)) (incf (getf s :dry)))
+    (when queued (setf (getf s :qmin) (min (getf s :qmin) queued)))
     ;; the longest the picture stood still: the gap between one new frame and the next
     (let ((f (%kiln-stats-frame-no)) (now (get-internal-real-time)))
       (when (/= f (getf s :last-frame))
@@ -81,22 +121,57 @@
     (when (>= (- (get-internal-real-time) (getf s :t0)) 1000000)
       (when *kiln-stats-player*
         (let ((pl *kiln-stats-player*))
-          (format t "~&kiln: player at ~,3F s, wall ~,3F s, queued audio ~D video ~D, state ~A~%"
+          (%kiln-stats-say "kiln: player at ~,3F s, wall ~,3F s, queued audio ~D video ~D, state ~A"
                   (funcall (find-symbol "PLAYER-POSITION" "WARP-MEDIA") pl)
                   (/ (get-internal-real-time) (float internal-time-units-per-second 1d0))
                   (funcall (find-symbol "%AUDIO-N" "WARP-MEDIA") pl)
                   (funcall (find-symbol "%VIDEO-N" "WARP-MEDIA") pl)
                   (funcall (find-symbol "PLAYER-STATE" "WARP-MEDIA") pl))))
-      (format t "~&kiln: loop ~D passes, mean ~D ms, max ~D ms, paint max ~D ms, speaker dry ~D, gc ~D, frames ~D, longest still ~D ms~%"
+      (%kiln-stats-say "kiln: loop ~D passes, mean ~D ms, max ~D ms, paint max ~D ms, speaker dry ~D (queued min ~D), gc ~D, frames ~D, longest still ~D ms"
               (getf s :passes) (floor (getf s :sum) (max 1 (getf s :passes))) (getf s :max) (getf s :paint)
-              (getf s :dry) (- (modus-int::%gc-epoch) (getf s :gc))
+              (getf s :dry) (if (= (getf s :qmin) most-positive-fixnum) -1 (getf s :qmin)) (- (modus-int::%gc-epoch) (getf s :gc))
               (- (%kiln-stats-frame-no) (getf s :frame)) (getf s :gap))
-      (format t "~&kiln: per second: input ~D ms (~D events), tick ~D ms, scale ~D ms, blit ~D ms, hooks ~D ms, waiting ~D ms; ~D blits, ~D Kpx shown~%"
+      (%kiln-stats-say "kiln: per second: input ~D ms (~D events), tick ~D ms, scale ~D ms, blit ~D ms, hooks ~D ms, waiting ~D ms; ~D blits, ~D Kpx shown"
               (floor (getf s :input) 1000) (getf s :events) (floor (getf s :tick) 1000) (floor (getf s :scale) 1000) (floor (getf s :blit) 1000)
               (floor (getf s :hooks) 1000) (floor (getf s :wait) 1000) (getf s :blits) (floor (getf s :px) 1000))
+      (let ((rs (let ((v (find-symbol "*RADIO-STATS*" "SPOOL"))) (and v (symbol-value v)))))
+        (when (and rs (plusp (+ (funcall (find-symbol "RADIO-STATS-IN" "SPOOL") rs)
+                                (funcall (find-symbol "RADIO-STATS-WAITING" "SPOOL") rs)
+                                (funcall (find-symbol "RADIO-STATS-OUT" "SPOOL") rs))))
+          (%kiln-stats-say "kiln: ~A" (funcall (find-symbol "RADIO-STATS-LINE" "SPOOL") rs))))
       (%kiln-stats-init))))
 
+;;; KILN_AUDIO_TAP=SECONDS: the first SECONDS of what is written to the speaker, kept and then saved
+;;; as Documents/audio-tap.raw (signed 16-bit little-endian, mono, +KILN-RATE+) -- exactly what the
+;;; device was handed, to listen to off the phone (`devicectl device copy from').
+(defvar *kiln-tap* nil "While tapping: (octets . fill).")
+(defun %kiln-tap-start ()
+  (let ((v (modus-int::%cli-getenv "KILN_AUDIO_TAP")))
+    (when (and v (plusp (length v)))
+      (let ((secs (or (ignore-errors (parse-integer v)) 20)))
+        (setf *kiln-tap* (cons (make-array (* 2 +kiln-rate+ secs) :element-type '(unsigned-byte 8)) 0))
+        (format t "~&kiln: tapping ~D s of the speaker~%" secs)))))
+(defun %kiln-tap (frame)
+  ;; from the first sound, not from launch: the silence before a station is tapped is no use
+  (when (and (zerop (cdr *kiln-tap*)) (every #'zerop frame))
+    (return-from %kiln-tap))
+  (let* ((buf (car *kiln-tap*)) (at (cdr *kiln-tap*)) (n (min (length frame) (floor (- (length buf) at) 2))))
+    (dotimes (i n)
+      (let ((x (logand (aref frame i) #xffff)))
+        (setf (aref buf (+ at (* 2 i))) (logand x 255) (aref buf (+ at (* 2 i) 1)) (ash x -8))))
+    (setf (cdr *kiln-tap*) (+ at (* 2 n)))
+    (when (>= (cdr *kiln-tap*) (length buf))
+      (let ((dir (%kiln-documents-dir)))
+        (setf *kiln-tap* nil)
+        (when dir
+          (with-open-file (o (concatenate 'string dir "audio-tap.raw") :direction :output
+                                                                         :element-type '(unsigned-byte 8)
+                                                                         :if-exists :supersede)
+            (write-sequence buf o))
+          (format t "~&kiln: speaker tap saved to ~Aaudio-tap.raw~%" dir))))))
+
 (defun %kiln-audio-write (frame)
+  (when *kiln-tap* (%kiln-tap frame))
   (%kiln-sys 1011 (+ (modus-int::%gc-word-of frame (modus-int::%conv-addr #x100050A0)) 7) (length frame) 0))
 
 (defun %kiln-pump-audio (mixer sink)
@@ -805,10 +880,11 @@
     (%kiln-desk-open desk (cond ((fboundp '%kiln-actions-app) "Actions") (media "Media") (t "Clock")))
     (format t "~&kiln: ~:[no speaker~;speaker at ~D Hz~]~%" speaker +kiln-rate+)
     (when lib (setf *kiln-stats-player* (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib)))
-    (when (modus-int::%cli-getenv "KILN_AUDIO_STATS")
+    (when (%kiln-stats-on-p)
       ;; master's player has no worker stats (they were the modus-threads branch's): ask, don't assume
       (let ((s (find-symbol "*WORKER-STATS*" "WARP-MEDIA"))) (when s (setf (symbol-value s) t))))
     (%kiln-stats-init)
+    (%kiln-tap-start)
     ;; KILN_AUTOPLAY=FILE: play one of the films at launch (devicectl / simctl pass it), as :AUTOPLAY does
     (let ((a (modus-int::%cli-getenv "KILN_AUTOPLAY")))
       (when (and a (> (length a) 0) (not autoplay)) (setq autoplay a)))
