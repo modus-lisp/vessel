@@ -656,6 +656,10 @@
     (%kiln-desk-register-app desk "Clock" #'%kiln-clock-app :width 260 :height 110)
     (%kiln-desk-register-app desk "Notes" #'%kiln-notes-app
                                   :width (if media dw (min dw 420)) :height 300)
+    ;; PAINT, glass's own (desk-apps), as the served desktop has it: a finger draws
+    (let ((app (find-symbol "PAINT-APP" "GLASS.DESK")))
+      (when (and app (fboundp app))
+        (%kiln-desk-register-app desk "Paint" (symbol-function app) :width dw :height (min dh 420))))
     ;; the terminal-emulating Terminal (zero-term.lisp: glass/term + quill) where the image has it
     (%kiln-desk-register-app desk "Terminal"
                                   (if (fboundp '%kiln-vt-terminal-app)
