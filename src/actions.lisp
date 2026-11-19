@@ -36,12 +36,12 @@
   (let ((desk *kiln-desk*))
     (setf *kiln-frame-queue*
           (append *kiln-frame-queue*
-                  (list (lambda () (glass.desk:desk-open desk "Terminal"))
+                  (list (lambda () (%kiln-desk-open desk "Terminal"))
                         (lambda () (loop for c across form
-                                         do (glass.desk:desk-key desk t (char-code c))))
+                                         do (%kiln-desk-key desk t (char-code c))))
                         (lambda ()
                           (funcall *kiln-present-changes*)
-                          (glass.desk:desk-key desk t #xff0d)))))))
+                          (%kiln-desk-key desk t #xff0d)))))))
 
 (defun %kiln-actions-app (fb)
   "The Actions window's content: the buttons, and a press on one runs its form."
