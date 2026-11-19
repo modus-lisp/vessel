@@ -55,7 +55,17 @@
   (setf *kiln-stats* (and (modus-int::%cli-getenv "KILN_AUDIO_STATS")
                           (list :t0 (get-internal-real-time) :passes 0 :sum 0 :max 0 :paint 0 :dry 0
                                 :gc (modus-int::%gc-epoch) :frame (%kiln-stats-frame-no) :gap 0
-                                :last-change (get-internal-real-time) :last-frame (%kiln-stats-frame-no)))))
+                                :last-change (get-internal-real-time) :last-frame (%kiln-stats-frame-no)
+                                :tick 0 :scale 0 :blit 0 :hooks 0 :px 0 :blits 0 :input 0 :events 0 :wait 0))))
+(defun %kiln-stats-add (key us)
+  "Add US microseconds (or a count) to the stats' KEY, when stats are on."
+  (when *kiln-stats* (incf (getf *kiln-stats* key) us)))
+(defmacro %kiln-timed ((key) &body body)
+  "BODY, its time added to the stats' KEY (microseconds)."
+  (let ((t0 (gensym)))
+    `(let ((,t0 (get-internal-real-time)))
+       (multiple-value-prog1 (progn ,@body)
+         (%kiln-stats-add ,key (- (get-internal-real-time) ,t0))))))
 (defun %kiln-stats-frame-no ()
   (if *kiln-stats-player* (funcall (find-symbol "PLAYER-FRAME-NO" "WARP-MEDIA") *kiln-stats-player*) 0))
 (defun %kiln-stats-pass (pass-ms paint-ms queued)
@@ -81,6 +91,9 @@
               (getf s :passes) (floor (getf s :sum) (max 1 (getf s :passes))) (getf s :max) (getf s :paint)
               (getf s :dry) (- (modus-int::%gc-epoch) (getf s :gc))
               (- (%kiln-stats-frame-no) (getf s :frame)) (getf s :gap))
+      (format t "~&kiln: per second: input ~D ms (~D events), tick ~D ms, scale ~D ms, blit ~D ms, hooks ~D ms, waiting ~D ms; ~D blits, ~D Kpx shown~%"
+              (floor (getf s :input) 1000) (getf s :events) (floor (getf s :tick) 1000) (floor (getf s :scale) 1000) (floor (getf s :blit) 1000)
+              (floor (getf s :hooks) 1000) (floor (getf s :wait) 1000) (getf s :blits) (floor (getf s :px) 1000))
       (%kiln-stats-init))))
 
 (defun %kiln-audio-write (frame)
@@ -646,13 +659,28 @@
     ;; FIVE values, then NIL: warp's MAKE-MEDIA-WINDOW answers the WM surface contract, whose
     ;; sixth value is its CONSUMER -- and the desk reads an app's sixth value as TEXT-P, so the
     ;; player counted as a text window and raised the keyboard at launch.
+    ;; MEDIA is glass's, as the served desktop's: tabs for Music (warp's player, over this library),
+    ;; Stations (internet radio through spool, on this mixer), Pictures and Documents -- or warp's
+    ;; player alone where the image has no glass Media.
     (when media
-      (%kiln-desk-register-app desk "Media"
-                                    (lambda (fb)
-                                      (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
-                                          (funcall (find-symbol "MAKE-MEDIA-WINDOW" "WARP-MEDIA-GLASS") fb lib)
-                                        (values on-key on-pointer dirty-p copy-p close-fn nil)))
-                                    :width dw :height 440))
+      (let ((glass-media (find-symbol "MEDIA-APP" "GLASS.DESK")))
+        (if (and glass-media (fboundp glass-media))
+            (progn
+              (setf glass.desk::*media-library* lib
+                    glass.desk::*media-mixer* mixer
+                    glass.desk::*media-root* (concatenate 'string dir "media/"))
+              (%kiln-desk-register-app desk "Media"
+                                       (lambda (fb)
+                                         (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
+                                             (funcall glass-media fb)
+                                           (values on-key on-pointer dirty-p copy-p close-fn nil)))
+                                       :width dw :height (min dh 560)))
+            (%kiln-desk-register-app desk "Media"
+                                     (lambda (fb)
+                                       (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
+                                           (funcall (find-symbol "MAKE-MEDIA-WINDOW" "WARP-MEDIA-GLASS") fb lib)
+                                         (values on-key on-pointer dirty-p copy-p close-fn nil)))
+                                     :width dw :height 440))))
     (%kiln-desk-register-app desk "Clock" #'%kiln-clock-app :width 260 :height 110)
     (%kiln-desk-register-app desk "Notes" #'%kiln-notes-app
                                   :width (if media dw (min dw 420)) :height 300)
@@ -755,9 +783,20 @@
                     (%kiln-sys 1007 (%kiln-desk-fb desk) 0 0))))))
     ;; A tap or a repaint that signals is logged and dropped: one bad gesture
     ;; must not take the app down (an error out of here ends the process).
+    (let ((vsync (and (not (fboundp '%kiln-frame-wait)) (>= (%kiln-sys 1008 34 0 0) 0)))
+          (held nil))
+    (format t "~&kiln: frames paced by ~:[a sleep~;the display~]~%" vsync)
     (loop
      (handler-case
-      (let ((e (%kiln-sys 1004 0 0 0)))
+      (let ((e (or (shiftf held nil) (%kiln-sys 1004 0 0 0))))
+        ;; MOVES COALESCE: of a run of finger moves waiting together only the last matters -- a
+        ;; drag recomposited the window for every one, and a 120 Hz touch screen reports two or
+        ;; more a frame.  The first event that is not a move is held for the next pass.
+        (when (= (floor e 1099511627776) 2)
+          (loop (let ((n (%kiln-sys 1004 0 0 0)))
+                  (cond ((zerop n) (return))
+                        ((= (floor n 1099511627776) 2) (setq e n))
+                        (t (setq held n) (return))))))
         (if (zerop e)
             (let ((t0 (get-internal-real-time))
                   (queued (and *kiln-stats* mixer (%kiln-sys 1012 0 0 0)))
@@ -766,18 +805,19 @@
               (setf tp (get-internal-real-time))
               ;; ONLY WHAT CHANGED is magnified and shown: a video window is a fifth of the
               ;; screen, and the whole of it 2x was most of a frame
-              (multiple-value-bind (changed x y w h) (%kiln-desk-tick desk)
+              (multiple-value-bind (changed x y w h) (%kiln-timed (:tick) (%kiln-desk-tick desk))
                 (when changed
+                  (%kiln-stats-add :blits 1) (%kiln-stats-add :px (* w h))
                   (if (eq (glass:fb-format (%kiln-desk-fb desk)) :xrgb)
                       (progn
                         ;; at 1x the magnified copy IS the desk: show it straight from there
                         ;; (the copy was a tenth of a Pi Zero's drag frame)
                         (if (= k 1)
-                            (%kiln-blit-region (%kiln-desk-fb desk) 1 x0 y0 x y w h)
+                            (%kiln-timed (:blit) (%kiln-blit-region (%kiln-desk-fb desk) 1 x0 y0 x y w h))
                             (progn
-                              (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) k x y w h)
-                              (%kiln-blit-region big k x0 y0 x y w h)))
-                        (%kiln-sys 1003 0 0 0))
+                              (%kiln-timed (:scale) (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) k x y w h))
+                              (%kiln-timed (:blit) (%kiln-blit-region big k x0 y0 x y w h))))
+                        (%kiln-timed (:blit) (%kiln-sys 1003 0 0 0)))
                       ;; A Y'CbCr desk (glass :I420) is shown as it is: the platform scans
                       ;; the planes out (pseudo-syscall 1007, the Zero's HVS)
                       (%kiln-sys 1007 (%kiln-desk-fb desk) 0 0))))
@@ -785,13 +825,19 @@
                 (%kiln-stats-pass (floor (- (get-internal-real-time) t0) 1000)
                                   (floor (- (get-internal-real-time) tp) 1000) queued))
               (%kiln-run-queued-frame)
-              (%kiln-run-frame-hooks)
+              (%kiln-timed (:hooks) (%kiln-run-frame-hooks))
               ;; a frame is 16 ms; sleep only what is left of it, not 16 ms on top of the work --
               ;; or spend it on the platform's own work (the Zero's sockets, when they share
               ;; this thread) if it has a way to wait that does that
-              (let ((left (- 16 (floor (- (get-internal-real-time) t0) 1000))))
-                (when (> left 1)
-                  (if (fboundp '%kiln-frame-wait) (funcall '%kiln-frame-wait left) (modus-int::%sleep-ms left)))))
+              ;; THE PHONE'S FRAME CLOCK (pseudo-syscall 1008, a CADisplayLink): wait for the
+              ;; screen's next refresh, so a frame is drawn once a refresh and in step with it.  A
+              ;; 16 ms sleep overslept to ~22 (45 frames a second) and drifted against the display:
+              ;; a drag stuttered.  Elsewhere the sleep stays.
+              (if vsync
+                  (%kiln-timed (:wait) (%kiln-sys 1008 34 0 0))
+                  (let ((left (- 16 (floor (- (get-internal-real-time) t0) 1000))))
+                    (when (> left 1)
+                      (if (fboundp '%kiln-frame-wait) (funcall '%kiln-frame-wait left) (modus-int::%sleep-ms left))))))
             (let ((type (floor e 1099511627776))
                   (y (logand (floor e 1048576) #xFFFFF))
                   (x (logand e #xFFFFF)))
@@ -807,7 +853,10 @@
                                  (funcall *kiln-present-changes*))   ; the line is drawn before it runs
                                (%kiln-desk-key desk t ks)
                                (%kiln-desk-key desk nil ks))))
-                  (%kiln-desk-pointer desk (if (or (= type 3) (= type 5)) 0 1)
-                                           (floor (- x x0) k) (floor (- y y0) k))))))
+                  (progn
+                    (%kiln-stats-add :events 1)
+                    (%kiln-timed (:input)
+                      (%kiln-desk-pointer desk (if (or (= type 3) (= type 5)) 0 1)
+                                          (floor (- x x0) k) (floor (- y y0) k))))))))
        (error (c) (format t "~&kiln: ~A~%"
-                          (if (fboundp 'modus-int::%escape-describe) (modus-int::%escape-describe c) c)))))))
+                          (if (fboundp 'modus-int::%escape-describe) (modus-int::%escape-describe c) c))))))))
