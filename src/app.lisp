@@ -44,7 +44,11 @@
 ;;; MIXER-TICK and one sink frame at a time.  The device -- an AudioQueue in the shim,
 ;;; pseudo-syscalls 1010-1012 -- keeps the real time and plays silence if the loop is late.
 (defconstant +kiln-rate+ 48000)
-(defparameter *kiln-cushion* 7200 "Samples to keep queued: 150 ms.")
+;;; 400 ms.  The device takes its buffers 40 ms at a time and keeps up to three (modus-audio.c), so a
+;;; 150 ms ring ran dry on a main-loop pass of only ~120 ms -- stutters every few seconds in the radio.
+;;; Latency here costs little: a station holds seconds of its own (spool), and a file's pause and seek
+;;; act on the player, whose clock is the samples handed out.
+(defparameter *kiln-cushion* 19200 "Samples to keep queued: 400 ms.")
 
 ;;; KILN_AUDIO_STATS=1: once a second, how the loop that feeds the speaker is keeping up -- its
 ;;; longest and mean pass, the longest paint, how often the pump found the device's queue nearly
@@ -95,7 +99,8 @@
                                 :gc (modus-int::%gc-epoch) :frame (%kiln-stats-frame-no) :gap 0
                                 :last-change (get-internal-real-time) :last-frame (%kiln-stats-frame-no)
                                 :tick 0 :scale 0 :blit 0 :hooks 0 :px 0 :blits 0 :input 0 :events 0 :wait 0
-                                :qmin most-positive-fixnum))))
+                                :qmin most-positive-fixnum
+                                :underruns (max 0 (%kiln-sys 1013 0 0 0))))))
 (defun %kiln-stats-add (key us)
   "Add US microseconds (or a count) to the stats' KEY, when stats are on."
   (when *kiln-stats* (incf (getf *kiln-stats* key) us)))
@@ -127,9 +132,10 @@
                   (funcall (find-symbol "%AUDIO-N" "WARP-MEDIA") pl)
                   (funcall (find-symbol "%VIDEO-N" "WARP-MEDIA") pl)
                   (funcall (find-symbol "PLAYER-STATE" "WARP-MEDIA") pl))))
-      (%kiln-stats-say "kiln: loop ~D passes, mean ~D ms, max ~D ms, paint max ~D ms, speaker dry ~D (queued min ~D), gc ~D, frames ~D, longest still ~D ms"
+      (%kiln-stats-say "kiln: loop ~D passes, mean ~D ms, max ~D ms, paint max ~D ms, speaker dry ~D (queued min ~D, device underruns ~D), gc ~D, frames ~D, longest still ~D ms"
               (getf s :passes) (floor (getf s :sum) (max 1 (getf s :passes))) (getf s :max) (getf s :paint)
-              (getf s :dry) (if (= (getf s :qmin) most-positive-fixnum) -1 (getf s :qmin)) (- (modus-int::%gc-epoch) (getf s :gc))
+              (getf s :dry) (if (= (getf s :qmin) most-positive-fixnum) -1 (getf s :qmin))
+              (- (max 0 (%kiln-sys 1013 0 0 0)) (getf s :underruns)) (- (modus-int::%gc-epoch) (getf s :gc))
               (- (%kiln-stats-frame-no) (getf s :frame)) (getf s :gap))
       (%kiln-stats-say "kiln: per second: input ~D ms (~D events), tick ~D ms, scale ~D ms, blit ~D ms, hooks ~D ms, waiting ~D ms; ~D blits, ~D Kpx shown"
               (floor (getf s :input) 1000) (getf s :events) (floor (getf s :tick) 1000) (floor (getf s :scale) 1000) (floor (getf s :blit) 1000)
@@ -177,7 +183,7 @@
 (defun %kiln-pump-audio (mixer sink)
   "Mix and queue until the device holds *KILN-CUSHION* samples; at most a few ticks a call,
    so a long pause costs one cushion's catching-up and not a stall of the picture."
-  (dotimes (i 12)
+  (dotimes (i 30)
     (when (>= (%kiln-sys 1012 0 0 0) *kiln-cushion*) (return))
     (glass:mixer-tick mixer)
     (let ((f (glass:sink-next-frame sink)))
