@@ -40,12 +40,14 @@
 
 (in-package #:kiln-zero-display)
 
-(defun %k (name) (fdefinition (find-symbol name "MODUS-INT")))
-(defun %wr (a v) (funcall (%k "HDMI-WR") a v))
-(defun %rd (a) (funcall (%k "HDMI-RD") a))
-(defun %buf () (funcall (%k "HDMI-MBOX-BUF")))
-(defun %hget (off) (funcall (%k "HCON-GET") off))
-(defun %hput (off v) (funcall (%k "HCON-PUT") off v))
+;;; The console's and the HDMI driver's functions are the KERNEL's: called by name here, they
+;;; compile to direct calls.  (Looked up with FDEFINITION they are not there -- most kernel
+;;; functions have no entry in the runtime's function table -- which is what a first cut did.)
+(defun %wr (a v) (modus-int::hdmi-wr a v))
+(defun %rd (a) (modus-int::hdmi-rd a))
+(defun %buf () (modus-int::hdmi-mbox-buf))
+(defun %hget (off) (modus-int::hcon-get off))
+(defun %hput (off v) (modus-int::hcon-put off v))
 
 ;;; ---- the mailbox ---------------------------------------------------------------------------
 
@@ -54,7 +56,7 @@
 
 (defun %drain ()
   "Empty the read FIFO of answers nobody waited for; how many there were."
-  (let ((st (funcall (%k "HDMI-MBOX-STATUS"))) (rd (funcall (%k "HDMI-MBOX-READ"))))
+  (let ((st (modus-int::hdmi-mbox-status)) (rd (modus-int::hdmi-mbox-read)))
     (loop for n from 0 to 64
           when (logtest (%rd st) #x40000000) return n
           do (%rd rd))))
@@ -62,15 +64,15 @@
 (defun %call ()
   "Send the property buffer on channel 8 and wait for its answer: T, or NIL if none came in 1 s."
   (%drain)
-  (let ((base (funcall (%k "HDMI-MBOX-BASE"))) (st (funcall (%k "HDMI-MBOX-STATUS")))
+  (let ((base (modus-int::hdmi-mbox-base)) (st (modus-int::hdmi-mbox-status))
         (limit (floor internal-time-units-per-second 1)))
     (let ((t0 (get-internal-real-time)))
       (loop until (zerop (logand (%rd (+ base #x38)) #x80000000))
             when (> (- (get-internal-real-time) t0) limit) return nil))
-    (%wr (funcall (%k "HDMI-MBOX-WRITE")) (logior (funcall (%k "HDMI-MBOX-BUF-BUS")) 8))
+    (%wr (modus-int::hdmi-mbox-write) (logior (modus-int::hdmi-mbox-buf-bus) 8))
     (let ((t0 (get-internal-real-time)))
       (loop (unless (logtest (%rd st) #x40000000)
-              (%rd (funcall (%k "HDMI-MBOX-READ")))
+              (%rd (modus-int::hdmi-mbox-read))
               (return (= (%rd (+ (%buf) 4)) #x80000000)))
             (when (> (- (get-internal-real-time) t0) limit) (return nil))))))
 
@@ -102,12 +104,12 @@
 (defun %adopt (w h fb pitch)
   "Make FB (W x H) the console's framebuffer: mapped non-cacheable, its geometry recorded where
    the console, the desk's blit and the screenshot code read it."
-  (funcall (%k "HCON-MAP-NC") fb (* h pitch))
+  (modus-int::hcon-map-nc fb (* h pitch))
   (%hput #x04 fb) (%hput #x08 pitch) (%hput #x0C w) (%hput #x10 h)
   (%hput #x14 (floor w 8)) (%hput #x18 (floor h 8)) (%hput #x1C 0) (%hput #x20 0)
-  (let ((st (funcall (%k "HDMI-FB-STATE"))))
+  (let ((st (modus-int::hdmi-fb-state)))
     (%wr st fb) (%wr (+ st 8) pitch) (%wr (+ st 12) w) (%wr (+ st 16) h))
-  (funcall (%k "HCON-NFILL") fb (* h pitch) (%hget #x28))
+  (modus-int::hcon-nfill fb (* h pitch) (%hget #x28))
   t)
 
 (defun %set-screen (w h margins)
@@ -318,58 +320,50 @@
                  (text (+ x 10) (+ y (floor (- h size) 2) -1) label :size size :color (if on +bg+ +ink+))
                  (push (list kind x y w h) hits))
                (redraw ()
+                 ;; compact: each label beside its controls, so the window fits a 640x400 desk
                  (setf hits '())
                  (glass:fb-fill fb +bg+)
-                 (let ((y 12) (w (glass:fb-width fb)))
-                   (text 12 y "Display" :size 16 :bold t)
-                   (incf y 26)
-                   (text 12 y (format nil "~A, output ~{~D x ~D~}"
-                                      (or (getf info :name) "Screen")
-                                      (getf info :output))
+                 (let ((y 10) (w (glass:fb-width fb)) (cx 112))
+                   (text 12 y "Display" :size 15 :bold t)
+                   (text cx (+ y 2) (format nil "~A, output ~{~D x ~D~}"
+                                            (or (getf info :name) "screen") (getf info :output))
                          :size 12 :color +dim+)
-                   (when (getf info :preferred)
-                     (text 12 (+ y 16) (format nil "Preferred mode ~{~D x ~D~}" (getf info :preferred))
-                           :size 12 :color +dim+))
-                   (incf y 42)
-                   ;; resolution
-                   (text 12 y "Resolution" :size 14 :bold t)
-                   (incf y 22)
-                   (let ((x 12))
+                   (incf y 28)
+                   ;; resolution: as many buttons a row as fit beside the label
+                   (text 12 (+ y 5) "Resolution" :size 13 :bold t)
+                   (let ((x cx))
                      (dolist (r (resolutions))
-                       (let ((label (format nil "~D x ~D" (first r) (second r))))
-                         (when (> (+ x 120) w) (setf x 12) (incf y 34))
-                         (button x y 112 28 label (list :res r)
-                                 :on (equal r (subseq choice 0 2)) :size 12)
-                         (incf x 120))))
-                   (incf y 44)
+                       (when (> (+ x 104) w) (setf x cx) (incf y 28))
+                       (button x y 98 24 (format nil "~D x ~D" (first r) (second r)) (list :res r)
+                               :on (equal r (subseq choice 0 2)) :size 12)
+                       (incf x 104)))
+                   (incf y 32)
                    ;; density
-                   (text 12 y "Window chrome" :size 14 :bold t)
-                   (incf y 22)
-                   (loop for d in '(1 2 3) for x from 12 by 70
-                         do (button x y 62 28 (format nil "~Dx" d) (list :density d)
-                                    :on (= d (third choice))))
-                   (incf y 44)
-                   ;; margins
-                   (text 12 y "Margins (for a TV that cuts the edges)" :size 14 :bold t)
-                   (incf y 24)
+                   (text 12 (+ y 5) "Chrome" :size 13 :bold t)
+                   (loop for d in '(1 2 3) for x from cx by 52
+                         do (button x y 46 24 (format nil "~Dx" d) (list :density d)
+                                    :on (= d (third choice)) :size 12))
+                   (incf y 32)
+                   ;; margins, two to a row
+                   (text 12 (+ y 5) "Margins" :size 13 :bold t)
                    (loop for name in '("Top" "Bottom" "Left" "Right") for i from 3
-                         for x = (if (evenp (- i 3)) 12 (floor w 2))
-                         do (text x (+ y 6) name :size 13)
-                            (button (+ x 62) y 30 26 "-" (list :margin i -8))
-                            (text (+ x 100) (+ y 6) (format nil "~D" (nth i choice)) :size 13)
-                            (button (+ x 136) y 30 26 "+" (list :margin i 8))
-                            (when (oddp (- i 3)) (incf y 34)))
-                   (incf y 12)
+                         for x = (if (evenp (- i 3)) cx (+ cx 172))
+                         do (text x (+ y 5) name :size 12 :color +dim+)
+                            (button (+ x 52) y 26 24 "-" (list :margin i -8) :size 12)
+                            (text (+ x 84) (+ y 5) (format nil "~D" (nth i choice)) :size 12)
+                            (button (+ x 112) y 26 24 "+" (list :margin i 8) :size 12)
+                            (when (oddp (- i 3)) (incf y 28)))
+                   (text cx (+ y 2) "for a TV that cuts off the edges" :size 11 :color +dim+)
+                   (incf y 24)
                    ;; apply, or keep what is being tried
                    (let ((left (pending-left)))
                      (if left
                          (progn
-                           (text 12 (+ y 6) (format nil "Keep these settings? Going back in ~D s." left)
-                                 :size 13 :color +warn+ :bold t)
-                           (incf y 30)
-                           (button 12 y 90 30 "Keep" (list :keep) :on t)
-                           (button 112 y 90 30 "Go back" (list :revert)))
-                         (button 12 y 90 30 "Apply" (list :apply)
+                           (button 12 y 80 28 "Keep" (list :keep) :on t)
+                           (button 100 y 80 28 "Go back" (list :revert))
+                           (text 192 (+ y 7) (format nil "Going back in ~D s" left)
+                                 :size 13 :color +warn+ :bold t))
+                         (button 12 y 80 28 "Apply" (list :apply)
                                  :on (not (equal choice (settings)))))))
                  (setf shown-left (pending-left)))
                (press (x y)
@@ -405,9 +399,8 @@
 (defun %on-desk (desk dw dh)
   "app.lisp's desk-setup hook: the Settings window in the menu, the keep-or-go-back watch as a
    frame hook, and the window opened at once when settings are being tried."
-  (declare (ignore dh))
   (funcall (find-symbol "%KILN-DESK-REGISTER-APP" "COMMON-LISP-USER") desk "Settings"
-           #'settings-app :width (min dw 470) :height 420)
+           #'settings-app :width (min dw 480) :height (min (- dh 60) 290))
   (let ((hooks (find-symbol "*KILN-FRAME-HOOKS*" "COMMON-LISP-USER")))
     (pushnew '%frame-hook (symbol-value hooks)))
   (when *pending-since*
