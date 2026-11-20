@@ -18,6 +18,12 @@
   (declare (ignore e))
   (modus-int::%gc-safe-block-6 n a b c d))
 
+;; the iOS shim answers 1001 3..6 with the safe area's insets (modus-ui.m), so a turned phone
+;; lays the desk out inside it (%KILN-LAYOUT).  A SETQ, not a DEFVAR: app.lisp's DEFVAR may come first.
+(setq *kiln-safe-area* t)
+;; the phone's desk is glass.wm's RACK (app.lisp, %KILN-MAKE-DESK): a SETQ for the same reason
+(setq *kiln-desk-layout* :rack)
+
 (defun %kiln-copy-text (text)
   "Put TEXT on the iPhone's pasteboard: pseudo-syscall 1007 reads the bytes in place and makes
    the UTF-8 string from them.  Characters past ASCII come out as ?, which is what a copy of a

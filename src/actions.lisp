@@ -73,4 +73,8 @@
                            (glass:fb-rect fb x y bw bh (if (eql i pressed) #x4b6a94 #x2d4a6b))
                            (glass:fb-text fb (+ x 8) (+ y (floor bh 2) -8) (first entry)
                                           :size 16 :color #xe6ebf2)))
-                t)))))
+                t))
+            nil nil nil nil nil
+            ;; DRAG-P: no drag is the buttons' -- a drag across them scrolls the phone's rack
+            ;; (glass.wm's rack.lisp asks before the press reaches a button, which acts on a press)
+            (lambda (x y) (declare (ignore x y)) nil))))
