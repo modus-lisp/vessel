@@ -483,12 +483,20 @@
 (defun %wm-desk-p (desk)
   (let ((ty (%wm-sym "WM"))) (and ty (typep desk ty))))
 
+(defvar *kiln-wm-scale* 2
+  "glass.wm's density for the desk's chrome: 2, touch-sized, unless the platform says otherwise
+   before the desk is made (the Zero's Settings: zero-display.lisp).")
+
+(defvar *kiln-desk-setup-hooks* nil
+  "Functions of (DESK DW DH) run once the desk's own apps are registered: a platform's own windows
+   go on the desk here (the Zero's Settings).")
+
 (defun %kiln-make-desk (fb)
   "A window manager over FB: glass.wm, at touch density, where the image has it."
   (if (%wm-sym "MAKE-WM")
       (progn
         ;; TOUCH-SIZED CHROME: 2x OPEN LOOK -- a 44-point title bar, 40-point menu rows
-        (setf (symbol-value (%wm-sym "*WM-SCALE*")) 2)
+        (setf (symbol-value (%wm-sym "*WM-SCALE*")) *kiln-wm-scale*)
         (%wm-call "MAKE-WM" fb))
       (glass.desk:make-desk fb)))
 
@@ -877,6 +885,10 @@
     (let ((app (and (find-package "KILN-OPERANDI") (find-symbol "OPERANDI-APP" "KILN-OPERANDI"))))
       (when (and app (fboundp app))
         (%kiln-desk-register-app desk "Operandi" (symbol-function app) :width dw :height (min dh 640))))
+    ;; the platform's own windows
+    (dolist (f *kiln-desk-setup-hooks*)
+      (handler-case (funcall f desk dw dh)
+        (serious-condition (e) (format t "~&desk setup hook ~A: ~A~%" f e))))
     ;; THE KEYBOARD follows the focus: the desk raises the phone's keyboard (pseudo-syscall 1006)
     ;; when a window that takes text is opened or tapped into, and puts it away when you tap
     ;; elsewhere; what is typed arrives as key events below
