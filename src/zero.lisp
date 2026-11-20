@@ -936,7 +936,7 @@
                (when restart (setf (symbol-value restart) nil))
                (catch 'kiln-zero-restart
                  (when (and start (fboundp start))
-                   (handler-case (funcall start)
+                   (handler-case (funcall start :yuv (and media yuv))
                      (error (e) (format t "~&display settings: ~A~%" e))))
                  (if (and media yuv)
                      ;; the screen in Y'CbCr: every framebuffer :I420, pictures stay planes

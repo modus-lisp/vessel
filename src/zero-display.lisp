@@ -249,17 +249,45 @@
   "The size and margins the scanout was last set to here, (W H TOP BOTTOM LEFT RIGHT); NIL until
    then, when it is the console's own size with no margins.")
 
-(defun display-start ()
+(defun %displist () (cl-user::mem-ref (+ #x3F400000 #x24) :u32))
+
+(defun %refresh-cursor (before)
+  "BEFORE: DISPLIST1 as it was before the allocation."
+  "Put the hardware cursor back after the scanout was allocated again.  zero.lisp's RGB cursor
+   is a plane appended to a COPY of the firmware's display list (slots 2200.., DISPLIST1 pointed
+   at the copy); an allocation makes the firmware write a fresh list and point DISPLIST1 at it,
+   so the plane was gone while *KZ-CUR* still said it was there -- no pointer on the screen,
+   the mouse moving an entry nobody scans.  The copy is made again from the firmware's new list;
+   if that list is not one plane this understands, the drawn arrow comes back instead."
+  (flet ((sym (n) (find-symbol n "COMMON-LISP-USER")))
+    (let ((cur (sym "*KZ-CUR*")) (install (sym "%KZ-CUR-INSTALL-RGB")) (hw (sym "*KZ-HW-CURSOR*")))
+      (when (and cur (boundp cur) (symbol-value cur) install (fboundp install))
+        ;; THE FIRMWARE WRITES ITS NEW LIST AT THE NEXT FRAME: copied at once, the list read was
+        ;; still OURS, cursor plane and all -- two planes, refused, and the drawn arrow came back
+        ;; on every resolution change (measured).  Wait (1 s at most) until DISPLIST1 moves.
+        (let ((t0 (get-internal-real-time)))
+          (loop while (and (= (%displist) before)
+                           (< (- (get-internal-real-time) t0) internal-time-units-per-second))))
+        (setf (symbol-value cur) nil)
+        (unless (funcall install)
+          (when hw (setf (symbol-value hw) nil)))))))
+
+(defun display-start (&key yuv)
   "Before the desk is made: the scanout at the saved (or pending) size and margins, and the
-   window manager's density.  Called by KILN-ZERO-MAIN each time it starts the desk."
+   window manager's density.  Called by KILN-ZERO-MAIN each time it starts the desk.  YUV: the
+   desk is the media player's Y'CbCr one, scanned out from OUR display list (zero.lisp
+   %ZERO-PRESENT-YUV) -- an allocation would make the firmware point the HVS back at its own,
+   so there only the density applies."
   (multiple-value-bind (cur pend) (settings)
     (let ((use (or pend cur)))
       (destructuring-bind (w h d top bottom left right) use
         (let ((want (list w h top bottom left right))
               (have (or *applied* (append (list (%hget #x0C) (%hget #x10)) (list 0 0 0 0)))))
-          (unless (equal want have)
-            (let ((got (%set-screen w h (list top bottom left right))))
-              (setf *applied* (if (equal got (list w h)) want (append got (list 0 0 0 0)))))))
+          (unless (or yuv (equal want have))
+            (let* ((before (%displist))
+                   (got (%set-screen w h (list top bottom left right))))
+              (setf *applied* (if (equal got (list w h)) want (append got (list 0 0 0 0))))
+              (%refresh-cursor before))))
         (%wm-scale d)
         (setf *pending-since* (and pend (get-internal-real-time)))
         use))))
