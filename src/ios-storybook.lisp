@@ -660,7 +660,69 @@
 
 ;; the ninth page: sound
 (defparameter *stories-9*
-  (list (cons "mic" '%story-microphone)))
+  (list (cons "mic" '%story-microphone)
+        (cons "playing" '%story-playing)))
+
+;;; ---- now playing and the media keys -------------------------------------------------------------------------
+
+(defparameter *pretend-album* '("First Light" "Long Division" "The Quiet Car")
+  "The playing story's tracks: nothing is heard; the system is told they play.")
+(defvar *pretend* nil "The playing story's state: (track playing position-at started-at), times in seconds.")
+
+(defun %pretend-position ()
+  (destructuring-bind (track playing at started) *pretend*
+    (declare (ignore track))
+    (if playing (+ at (/ (- (get-internal-real-time) started) internal-time-units-per-second)) at)))
+
+(defun %pretend-show (label)
+  "Tell the system what the playing story is playing, and say it in LABEL."
+  (destructuring-bind (track playing at started) *pretend*
+    (declare (ignore at started))
+    (let ((title (nth track *pretend-album*)))
+      (kiln-media:now-playing :title title :artist "The Storybook" :album "Native Components"
+                              :duration 180 :position (%pretend-position) :playing playing)
+      (kiln-swift:ui-set-text label (format nil "~:[paused~;playing~]: ~D. ~A" playing (1+ track) title)))))
+
+(defun %pretend-tick ()
+  "A frame hook: off the playing story, the system is told nothing plays."
+  (when (and *pretend* (not (equal *story-name* "playing")))
+    (kiln-media:now-playing-clear)
+    (setf *pretend* nil)))
+
+(defun %story-playing ()
+  "Now Playing and the media keys: a pretend album, shown where the system shows what plays (a Mac's Control Center,
+   the phone's lock screen); the play/pause, next and previous keys -- the keyboard's, headphones', Control
+   Center's -- drive it, and the last command is shown."
+  (setf *pretend* (list 0 t 0 (get-internal-real-time)))
+  (pushnew '%pretend-tick cl-user::*kiln-frame-hooks*)
+  (let* ((label (kiln-swift:ui-label "" 24 200 560 30))
+         (heard (kiln-swift:ui-label "media keys: none pressed yet" 24 236 560 30))
+         (prev (kiln-swift:ui-button "previous" 24 276 100 36))
+         (toggle (kiln-swift:ui-button "play/pause" 134 276 110 36))
+         (next (kiln-swift:ui-button "next" 254 276 100 36)))
+    (labels ((go-to (track)
+               (setf *pretend* (list (mod track (length *pretend-album*)) (second *pretend*) 0
+                                     (get-internal-real-time))))
+             (command (c)
+               (destructuring-bind (track playing at started) *pretend*
+                 (declare (ignore at started))
+                 (case (if (consp c) (car c) c)
+                   ((:play :pause :toggle :stop)
+                    (let ((now (%pretend-position))
+                          (on (case c (:play t) ((:pause :stop) nil) (t (not playing)))))
+                      (setf *pretend* (list track on now (get-internal-real-time)))))
+                   (:next (go-to (1+ track)))
+                   (:previous (go-to (1- track)))
+                   (:seek (setf *pretend* (list track playing (second c) (get-internal-real-time))))))
+               (%pretend-show label)))
+      (kiln-media:on-media (lambda (c)
+                             (kiln-swift:ui-set-text heard (format nil "media keys: ~(~S~)" c))
+                             (command c)))
+      (kiln-swift:on-tap prev (lambda (v h) (declare (ignore v h)) (command :previous)))
+      (kiln-swift:on-tap toggle (lambda (v h) (declare (ignore v h)) (command :toggle)))
+      (kiln-swift:on-tap next (lambda (v h) (declare (ignore v h)) (command :next)))
+      (%pretend-show label))
+    (list label heard prev toggle next)))
 
 ;;; ---- the microphone -----------------------------------------------------------------------------------------
 
