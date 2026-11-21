@@ -273,6 +273,63 @@
   (e1000-me-wait)
   (e1000-write-reg reg (logior (e1000-read-reg reg) set)))
 
+;; The PHY, over MDIO (MDIC 0x20): [data 16][reg 5][phy 5][op 2: 1 write, 2
+;; read][ready bit 28][error bit 30].  The 82579's PHY is at address 1.
+(defun e1000-phy-read (reg)
+  "PHY register REG, or NIL (no answer)."
+  (e1000-write-reg #x20 (logior (ash reg 16) (ash 1 21) (ash 2 26)))
+  (dotimes (i 20000)
+    (let ((m (e1000-read-reg #x20)))
+      (when (logtest m #x10000000)
+        (return (if (logtest m #x40000000) nil (logand m #xFFFF)))))))
+
+(defun e1000-phy-write (reg val)
+  (e1000-write-reg #x20 (logior (logand val #xFFFF) (ash reg 16) (ash 1 21) (ash 1 26)))
+  (dotimes (i 20000)
+    (when (logtest (e1000-read-reg #x20) #x10000000) (return t))))
+
+(defun e1000-swflag (take)
+  "Take (or give back) the software semaphore the management engine respects
+   (EXTCNF_CTRL bit 5) around PHY access."
+  (if take
+      (dotimes (i 1000)
+        (e1000-write-reg #xF00 (logior (e1000-read-reg #xF00) #x20))
+        (when (logtest (e1000-read-reg #xF00) #x20) (return t))
+        (io-delay))
+      (e1000-write-reg #xF00 (logand (e1000-read-reg #xF00) (lognot #x20)))))
+
+(defun e1000-pch-phy-up ()
+  "Wake the 82579's PHY: firmware that boots no OS driver can leave it powered
+   down -- no link, no port lights.  Linux e1000e's order: if the PHY does not
+   answer (its ID1 is 0154h), power-cycle it through the LANPHYPC override
+   (CTRL bits 16/17) and give it 50 ms; then clear power-down and isolate in
+   its control register and restart autonegotiation.  Returns the PHY's ID1."
+  (e1000-swflag t)
+  (let ((id (e1000-phy-read 2)))
+    (unless (eql id #x0154)
+      (let ((ctrl (e1000-read-reg 0)))
+        (e1000-write-reg 0 (logand (logior ctrl #x10000) (lognot #x20000)))
+        (io-delay)
+        (e1000-write-reg 0 (logand ctrl (lognot #x30000))))
+      (dotimes (i 500) (io-delay))
+      (setq id (e1000-phy-read 2)))
+    (let ((bmcr (e1000-phy-read 0)))
+      (when bmcr
+        ;; BMCR: power-down 0800h, isolate 0400h off; autoneg 1000h, restart 0200h on
+        (e1000-phy-write 0 (logior (logand bmcr (lognot #x0C00)) #x1200))))
+    (e1000-swflag nil)
+    id))
+
+(defun e1000-phy-status ()
+  "For a person at the REPL, in hex: PHY ID1 ID2 BMCR BMSR, then CTRL STATUS
+   EXTCNF_CTRL FWSM PHY_CTRL.  BMSR bit 2 and STATUS bit 1 are link."
+  (e1000-swflag t)
+  (let ((phy (mapcar (function e1000-phy-read) (list 2 3 0 1 1))))
+    (e1000-swflag nil)
+    (mapcar (lambda (v) (if v (format nil "~x" v) "-"))
+            (append (butlast phy)
+                    (mapcar (function e1000-read-reg) (list 0 8 #xF00 #x5B54 #xF10))))))
+
 (defun e1000-init-pch ()
   (let ((state (e1000-state-base)))
     ;; the ME: a host driver is loaded (SWSM.DRV_LOAD, CTRL_EXT.DRV_LOAD)
@@ -298,6 +355,10 @@
     (dotimes (i 128) (e1000-write-reg (+ #x5200 (* i 4)) 0))
     (e1000-init-rx)
     (e1000-init-tx)
+    ;; the PHY: awake and negotiating (firmware may have left it powered down)
+    (let ((id (e1000-pch-phy-up)))
+      (%serial-byte 80) (%serial-byte 72) (%serial-byte 89) (%serial-byte 58)
+      (print-hex32 (or id 0)) (%serial-byte 10))
     ;; link: set SLU, keep everything the firmware chose
     (e1000-rmw 0 #x40)
     ;; RX: EN | BAM | BSIZE 2048 | SECRC
@@ -325,6 +386,13 @@
       (e1000-rmw #x5820 #x1000))
     (setf (mem-ref (+ state #x18) :u32) 0)
     (setf (mem-ref (+ state #x1C) :u32) 0)
+    ;; link up within 5 s?  ("LINK:" then 1 / 0)
+    (let ((up nil))
+      (dotimes (i 50000)
+        (when (logtest (e1000-read-reg 8) 2) (setq up t) (return nil))
+        (io-delay))
+      (%serial-byte 76) (%serial-byte 73) (%serial-byte 78) (%serial-byte 75) (%serial-byte 58)
+      (%serial-byte (if up 49 48)) (%serial-byte 10))
     ;; "E1000:PCH" + newline
     (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
     (%serial-byte 48) (%serial-byte 58) (%serial-byte 80) (%serial-byte 67)
