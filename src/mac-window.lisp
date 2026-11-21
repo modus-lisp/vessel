@@ -20,7 +20,8 @@
 
 (defpackage #:kiln-mac
   (:use #:cl)
-  (:export #:window-title #:window-chrome #:window-size #:window-min-size #:window-fullscreen #:window-remember))
+  (:export #:window-title #:window-chrome #:window-size #:window-min-size #:window-fullscreen #:window-remember
+           #:window-pointer-lock))
 
 (in-package #:kiln-mac)
 
@@ -49,6 +50,12 @@
 (defun window-fullscreen (on)
   "Into full screen (ON true) or out of it."
   (kiln-swift:swift-call "window_fullscreen" (if on 1 0)))
+
+(defun window-pointer-lock (on)
+  "A game's mouse-look: ON locks the pointer -- hidden, held still, its moves sent as motion events (type 13: DX in
+   the low 20 bits, DY in the next 20, two's complement, points) rather than places; NIL lets it go.  The window
+   losing the keyboard lets it go too."
+  (kiln-swift:swift-call "window_pointer_lock" (if on 1 0)))
 
 (defun window-remember (name)
   "Keep the window's frame under NAME: where the person leaves it is where it opens next time."

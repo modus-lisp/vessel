@@ -14,11 +14,25 @@
 ;;;;   (with-gpu-pass (pass view :clear #x101820) (gpu-use pass pipeline) (gpu-bind pass buffer 0) (gpu-draw pass 3))
 ;;;;
 ;;;; A single-float vector's payload is IEEE singles already, so vertex data and uniforms go to the GPU as they are.
+;;;;
+;;;; For 3D: a view has a depth buffer, tested and written by default (GPU-DEPTH changes that); faces are kept both
+;;;; ways round unless GPU-CULL says (counter-clockwise is the front).
+;;;;   (gpu-view 0 0 0 0)                       a view filling the window, following it as it resizes
+;;;;   (gpu-view-size view)                     (values width height) of its drawable, in pixels
+;;;;   (gpu-depth pass :test-and-write)         or :none, or :test (see-through things)
+;;;;   (gpu-cull pass :back)                    or :none, :front
+;;;;   (gpu-constants pass floats index)        a few KB of constants for the next draws (a model matrix): copied
+;;;;   (gpu-texture rgba width height)          an RGBA8 texture, mipmapped; RGBA an (unsigned-byte 8) vector
+;;;;   (gpu-bind-texture pass texture index)    and a linear, repeating sampler at the same index
+;;;;   (gpu-indices list-or-vector)             an index buffer of 16-bit indices
+;;;;   (gpu-draw-indexed pass indices count)
 
 (defpackage #:kiln-gpu
   (:use #:cl)
   (:export #:gpu-view #:gpu-shader #:gpu-pipeline #:gpu-buffer #:gpu-write
-           #:gpu-pass-begin #:gpu-pass-end #:with-gpu-pass #:gpu-use #:gpu-bind #:gpu-draw #:floats))
+           #:gpu-pass-begin #:gpu-pass-end #:with-gpu-pass #:gpu-use #:gpu-bind #:gpu-draw #:floats
+           #:gpu-view-size #:gpu-depth #:gpu-cull #:gpu-constants #:gpu-texture #:gpu-bind-texture
+           #:gpu-indices #:gpu-draw-indexed))
 
 (in-package #:kiln-gpu)
 
@@ -86,3 +100,49 @@
 
 (defun gpu-draw (pass count &key (start 0) (primitive :triangles))
   (%call "gpu_draw" pass (ecase primitive (:triangles 0) (:triangle-strip 1) (:lines 2) (:points 3)) start count))
+
+;;; ---- 3D ------------------------------------------------------------------------------------------------------
+
+(defun %stage (stage) (ecase stage (:vertex 0) (:fragment 1) (:both 2)))
+
+(defun gpu-view-size (view)
+  "VIEW's drawable size in pixels: (values width height), 0 0 before it is on the screen."
+  (let ((s (%call "gpu_view_size" view)))
+    (values (floor s 65536) (mod s 65536))))
+
+(defun gpu-depth (pass mode)
+  (%call "gpu_set_depth" pass (ecase mode (:none 0) (:test-and-write 1) (:test 2))))
+
+(defun gpu-cull (pass mode)
+  (%call "gpu_set_cull" pass (ecase mode (:none 0) (:back 1) (:front 2))))
+
+(defun gpu-constants (pass data index &key (stage :both))
+  "DATA (a single-float vector, at most 4 KB) as constants at INDEX for the draws that follow: copied now, so the
+   next draw's may differ (a model matrix each)."
+  (multiple-value-bind (a n) (%data data)
+    (%call "gpu_set_bytes" pass a n index (%stage stage))))
+
+(defun gpu-texture (rgba width height)
+  "An RGBA8 texture of WIDTH x HEIGHT pixels from RGBA (an (unsigned-byte 8) vector, 4 bytes a pixel), with its
+   smaller levels made; NIL if it cannot be."
+  (assert (>= (length rgba) (* 4 width height)))
+  (let ((h (%call "gpu_texture_new" (kiln-swift::%addr rgba) width height)))
+    (and (plusp h) h)))
+
+(defun gpu-bind-texture (pass texture index &key (stage :fragment))
+  "TEXTURE at INDEX, and the sampler (linear, mipmapped, repeating) at the same index."
+  (%call "gpu_set_texture" pass texture index (%stage stage)))
+
+(defun gpu-indices (indices)
+  "An index buffer of INDICES (a list or vector of integers below 65536), as 16-bit indices."
+  (let* ((n (length indices))
+         (b (make-array (* 2 n) :element-type '(unsigned-byte 8))))
+    (let ((i 0))
+      (map nil (lambda (x) (setf (aref b i) (ldb (byte 8 0) x) (aref b (1+ i)) (ldb (byte 8 8) x)) (incf i 2))
+           indices))
+    (gpu-buffer b)))
+
+(defun gpu-draw-indexed (pass indices count &key (first 0) (primitive :triangles))
+  "Draw COUNT of the 16-bit INDICES (a GPU-INDICES buffer) from FIRST."
+  (%call "gpu_draw_indexed" pass (ecase primitive (:triangles 0) (:triangle-strip 1) (:lines 2) (:points 3))
+         indices count first 0))
