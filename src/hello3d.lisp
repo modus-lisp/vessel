@@ -6,6 +6,7 @@
 ;;;;   W A S D  move   Q E (or Shift Space)  down and up   the arrows  turn
 ;;;;   click     look around with the mouse (the pointer is held)     Esc  let the pointer go
 ;;;;   a game controller: the left stick moves, the right looks, the triggers lift and lower, A turns spin on and off
+;;;;   and every cube hums its own note, placed where it is: louder near, to the left or the right as you turn
 ;;;;   the native controls: the frame rate, spin on or off, and how fast
 ;;;;
 ;;;; Its own app, not the desk's: kiln's boot/hello3d-world.lisp loads it and `kiln mac --app=hello3d' builds it.
@@ -190,7 +191,18 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (spin t) (speed 1.0) (angle 0.0)
   fps-label (frames 0) (fps-at 0)
   ;; a game controller: its state, read each frame (gamepad.lisp); A as it was, to see it pressed; the HUD's line
-  (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1))
+  (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1)
+  ;; sound (sound.lisp): a humming voice per cube, the ring's then the middle one's; a blip; on or off
+  (hums '()) blip (sound t))
+
+;;; WHERE THE CUBES ARE, for the picture and the sound alike: the ring's Ith at ANGLE, and the middle one
+(defun ring-position (i angle)
+  (let ((around (+ (* i (/ pi 4)) (* 0.25 angle))))
+    (values (* 6 (sin around)) 1.0 (* 6 (cos around)))))
+
+(defun middle-height (angle) (+ 2.2 (* 0.35 (sin (* 1.3 angle)))))
+
+(defparameter *ring-notes* '(220 247 294 330 370 440 494 587) "A pentatonic of A, a note a ring cube.")
 
 (defun hue (h)
   "A bright colour at hue H (0..1), as a tint."
@@ -230,6 +242,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
         (let ((a (kiln-pad:pad-button p :a)))
           (when (and a (not (game-pad-a g)))
             (setf (game-spin g) (not (game-spin g)))
+            (blip g)
             (kiln-pad:pad-rumble 0 0.5 80))
           (setf (game-pad-a g) a))))
     (setf (game-pitch g) (max -1.45 (min 1.45 (game-pitch g))))
@@ -249,11 +262,26 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
              (kiln-mac:window-pointer-lock nil) (setf (game-locked g) nil))))
       (9 (remhash (logand e #xFFFFFFFFFF) (game-held g)))
       (1 (unless (game-locked g)
-           (kiln-mac:window-pointer-lock t) (setf (game-locked g) t)))
+           (kiln-mac:window-pointer-lock t) (setf (game-locked g) t) (blip g)))
       (13 (when (game-locked g)
             (let ((dx (%signed20 (logand e #xFFFFF))) (dy (%signed20 (logand (ash e -20) #xFFFFF))))
               (decf (game-yaw g) (* 0.0025 dx))
               (setf (game-pitch g) (max -1.45 (min 1.45 (- (game-pitch g) (* 0.0025 dy)))))))))))
+
+(defun blip (g)
+  (when (game-blip g) (kiln-sound:play (game-blip g) :gain 0.35)))
+
+(defun hear (g)
+  "Each cube's hum placed where it is now, heard from the eye; then the speaker fed."
+  (when (game-hums g)
+    (destructuring-bind (ex ey ez) (game-eye g)
+      (declare (ignore ey))
+      (let ((a (game-angle g)) (yaw (game-yaw g)))
+        (loop for v in (game-hums g) for i from 0
+              do (multiple-value-bind (x y z) (if (< i 8) (ring-position i a) (values 0 (middle-height a) 0))
+                   (multiple-value-bind (gain pan) (kiln-sound:place ex ez yaw x y z :loudness (if (< i 8) 0.14 0.22))
+                     (kiln-sound:voice-set v :gain gain :pan pan))))))
+    (kiln-sound:sound-pump)))
 
 (defun draw-thing (pass vertices indices count texture model tint)
   "One object: its vertices, texture, model matrix and tint, drawn."
@@ -285,14 +313,14 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                       (identity-mat) (floats 1 1 1 1))
           ;; the ring: eight cubes, each its own colour, turning as it goes round
           (dotimes (i 8)
-            (let ((around (+ (* i (/ pi 4)) (* 0.25 a))))
+            (multiple-value-bind (x y z) (ring-position i a)
               (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
-                          (mat* (translation (* 6 (sin around)) 1.0 (* 6 (cos around)))
+                          (mat* (translation x y z)
                                 (mat* (rotation-y (+ a (* i 0.7))) (rotation-x (* 0.6 a))))
                           (hue (/ i 8.0)))))
           ;; and in the middle, a bigger one, bobbing
           (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
-                      (mat* (translation 0 (+ 2.2 (* 0.35 (sin (* 1.3 a)))) 0)
+                      (mat* (translation 0 (middle-height a) 0)
                             (mat* (rotation-y (* -0.5 a)) (scaling 1.8)))
                       (floats 1.0 0.85 0.55 1)))))))
 
@@ -302,6 +330,12 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (setf (game-fps-label g) (kiln-swift:ui-label "" 20 46 300 22))
   (kiln-swift:ui-label "click: look around   Esc: let go   WASD, QE: move   arrows: turn" 20 70 600 22)
   (setf (game-pad-label g) (kiln-swift:ui-label "" 20 140 600 22))
+  (let ((sound (kiln-swift:ui-button "sound: on" 360 100 110 32)))
+    (kiln-swift:on-tap sound (lambda (value h)
+                               (declare (ignore value h))
+                               (setf (game-sound g) (not (game-sound g))
+                                     kiln-sound:*master* (if (game-sound g) 1.0 0.0))
+                               (kiln-swift:ui-set-text sound (if (game-sound g) "sound: on" "sound: off")))))
   (let ((spin (kiln-swift:ui-button "spin: on" 20 100 110 32))
         (speed (kiln-swift:ui-slider 50 140 104 200 24)))
     (kiln-swift:on-tap spin (lambda (value h)
@@ -325,6 +359,12 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
       (setf (game-floor-vertices g) (kiln-gpu:gpu-buffer v) (game-floor-indices g) (kiln-gpu:gpu-indices i)))
     (setf (game-crate-texture g) (kiln-gpu:gpu-texture (texture-pixels 128 #'crate) 128 128)
           (game-floor-texture g) (kiln-gpu:gpu-texture (texture-pixels 256 #'checker) 256 256))
+    ;; SOUND: a hum a cube, looping and placed each frame (HEAR); a blip for a press
+    (when (kiln-sound:sound-open)
+      (setf (game-hums g)
+            (append (loop for f in *ring-notes* collect (kiln-sound:play (kiln-sound:tone f) :gain 0.0 :loop t))
+                    (list (kiln-sound:play (kiln-sound:tone 110 :timbre '(0.5 0.3 0.15 0.08)) :gain 0.0 :loop t)))
+            (game-blip g) (kiln-sound:pluck 880)))
     (make-hud g)
     (setf (game-fps-at g) (get-internal-real-time))
     g))
@@ -344,6 +384,8 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
         (setf last now)
         (steer g dt)
         (when (game-spin g) (incf (game-angle g) (* dt (game-speed g))))
+        (handler-case (hear g)
+          (serious-condition (c) (format t "~&hello3d: sound: ~A~%" c)))
         (handler-case (render g)
           (serious-condition (c) (format t "~&hello3d: ~A~%" c)))
         ;; the frame rate, twice a second
