@@ -774,6 +774,58 @@
       (let ((s (map 'string #'code-char (subseq buf 0 n))))
         (if (char= (char s (1- (length s))) #\/) s (concatenate 'string s "/"))))))
 
+;;; MEDIA'S PLACES, on a computer with a person's home (the Mac; vessel's boot sets *KILN-HOME-PLACES*): at the
+;;; root of Media's folder, their Music, Movies and Downloads, their home, and every folder they have chosen with
+;;; + -- which on a Mac chooses a folder to open where it is (and keeps it as a place) rather than copying files in.
+;;; The phone has none: its sandbox holds only the app's own folder, and its + copies in.
+
+(defvar *kiln-home-places* nil "True where Media should offer the person's own folders (a Mac).")
+
+(defun %kiln-places-file ()
+  (let ((d (%kiln-documents-dir))) (and d (concatenate 'string d "media-places"))))
+
+(defun %kiln-chosen-places ()
+  "The folders chosen with Media's +, as directories, those that are still there."
+  (let ((f (%kiln-places-file)))
+    (when (and f (probe-file f))
+      (with-open-file (in f)
+        (loop for line = (read-line in nil) while line
+              for d = (and (plusp (length line)) (uiop:directory-exists-p line))
+              when d collect d)))))
+
+(defun %kiln-remember-place (dir)
+  (let ((f (%kiln-places-file)) (name (namestring dir)))
+    (when (and f (not (member name (mapcar #'namestring (%kiln-chosen-places)) :test #'string=)))
+      (with-open-file (o f :direction :output :if-exists :append :if-does-not-exist :create)
+        (write-line name o)))))
+
+(defun %kiln-media-places ()
+  "(label . directory) for each of Media's places: the person's Music, Movies, Downloads and home, then what
+   they chose."
+  (let ((home (user-homedir-pathname)))
+    (append (loop for (label sub) in '(("Music" "Music/") ("Movies" "Movies/") ("Downloads" "Downloads/"))
+                  for d = (uiop:directory-exists-p (merge-pathnames sub home))
+                  when d collect (cons label d))
+            (list (cons "Home" home))
+            (loop for d in (%kiln-chosen-places)
+                  collect (cons (car (last (pathname-directory d))) d)))))
+
+(defun %kiln-set-places (lib)
+  (funcall (fdefinition (list 'setf (find-symbol "LIBRARY-PLACES" "WARP-MEDIA"))) (%kiln-media-places) lib))
+
+(defun %kiln-choose-folder ()
+  "Media's + on a Mac: the folder chooser; the folder chosen is opened where it is, and kept as a place."
+  (let ((h (%kiln-swift "files_choose_folder")))
+    (when (and h (plusp h))
+      (funcall (find-symbol "ON-EVENT" "KILN-SWIFT") :folder h
+               (lambda (path h)
+                 (declare (ignore h))
+                 (let ((lib glass.desk::*media-library*) (dir (uiop:directory-exists-p path)))
+                   (when (and lib dir)
+                     (%kiln-remember-place dir)
+                     (%kiln-set-places lib)
+                     (funcall (find-symbol "LIBRARY-OPEN" "WARP-MEDIA") lib dir))))))))
+
 (defun %kiln-media-dir (bundle)
   "Where Media plays from: Documents/media/, which the Files app shows as On My iPhone > the app >
    media, and where the + picker puts what it brings in (iCloud Drive and the rest); the bundle's
@@ -902,6 +954,8 @@
     (declare (ignorable _))
     ;; NOW PLAYING: Media's player shown where the system shows what plays, and driven by the media keys
     ;; (vessel's now-playing.lisp, where the world has it)
+    (when (and lib *kiln-home-places* (find-symbol "LIBRARY-PLACES" "WARP-MEDIA"))
+      (%kiln-set-places lib))
     (let ((follow (and (find-package "KILN-MEDIA") (find-symbol "FOLLOW-PLAYER" "KILN-MEDIA"))))
       (when (and lib follow (fboundp follow))
         (funcall follow (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib))))
@@ -941,13 +995,15 @@
               (let ((import (find-symbol "*MEDIA-IMPORT*" "GLASS.DESK")))
                 (when (and import (%kiln-documents-dir))
                   (setf (symbol-value import)
+                        (if *kiln-home-places*
+                            #'%kiln-choose-folder
                         (lambda ()
                           (let ((lib glass.desk::*media-library*))
                             (%kiln-swift-text "files_pick"
                                               (namestring
                                                (if lib
                                                    (funcall (find-symbol "LIBRARY-FOLDER" "WARP-MEDIA") lib)
-                                                   mdir))))))))
+                                                   mdir)))))))))
               (%kiln-desk-register-app desk "Media"
                                        (lambda (fb)
                                          ;; EVERY value: its RESIZE-FN (the rack widens it when the phone
