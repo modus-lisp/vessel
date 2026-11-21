@@ -815,7 +815,9 @@
   "True where pseudo-syscall 1001 answers 3..6 with the safe area's insets (iOS: src/ios.lisp).
    Elsewhere it answers something else for them -- the Zero, 1 -- and the layout is portrait's.")
 
-(defun %kiln-layout (sw sh k top)
+(defun %kiln-layout (sw sh k top &optional full)
+  (when full                                       ; over the whole screen: no margins at all
+    (return-from %kiln-layout (list 0 0 (floor sw k) (floor sh k))))
   (flet ((inset (i) (and *kiln-safe-area*
                          (let ((v (%kiln-sys 1001 i 0 0))) (if (and (integerp v) (>= v 0)) v nil)))))
     (let ((st (inset 3)) (sl (inset 4)) (sb (inset 5)) (sr (inset 6)))
@@ -824,6 +826,17 @@
             (list st (+ sl (floor (- uw (* dw k)) 2)) dw dh))
           (let* ((y0 (* top k)) (dw (floor sw k)) (dh (floor (- sh y0 (* 20 k)) k)))
             (list y0 (floor (- sw (* dw k)) 2) dw dh))))))
+
+(defun %kiln-apply-desk-size (desk sw sh dw dh)
+  "The desk is now DW x DH desk pixels on a SW x SH screen: clear the screen, resize the window
+   manager's (it lays its windows out again), and show all of it."
+  (%kiln-sys 1002 0 (+ sw (* sh 65536)) #x1E2530)
+  (if (%wm-desk-p desk)
+      (%wm-call "WM-RESIZE-SCREEN" desk dw dh)
+      (glass:fb-resize (%kiln-desk-fb desk) dw dh))
+  (glass:fb-mark-frame (%kiln-desk-fb desk) :full)
+  (when *kiln-present-changes* (funcall *kiln-present-changes*))
+  (%kiln-sys 1003 0 0 0))
 
 (defun kiln-app-main (&key autoplay (top 60) (media t))
   "The app: a glass desk (glass/desk) on the phone's screen -- windows dragged by their title
@@ -906,10 +919,10 @@
                                                    mdir))))))))
               (%kiln-desk-register-app desk "Media"
                                        (lambda (fb)
-                                         ;; its RESIZE-FN too: the rack widens it when the phone turns
-                                         (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn)
-                                             (funcall glass-media fb)
-                                           (values on-key on-pointer dirty-p copy-p close-fn resize-fn)))
+                                         ;; EVERY value: its RESIZE-FN (the rack widens it when the phone
+                                         ;; turns), DRAG-P (in THEATER a swipe is the rack's) and its tenth,
+                                         ;; FULLSCREEN-P (in THEATER it is shown over the whole screen)
+                                         (values-list (multiple-value-list (funcall glass-media fb))))
                                        :width dw :height (min dh 560)))
             (%kiln-desk-register-app desk "Media"
                                      (lambda (fb)
@@ -1031,7 +1044,8 @@
     ;; A tap or a repaint that signals is logged and dropped: one bad gesture
     ;; must not take the app down (an error out of here ends the process).
     (let ((vsync (and (not (fboundp '%kiln-frame-wait)) (>= (%kiln-sys 1008 34 0 0) 0)))
-          (held nil))
+          (held nil)
+          (full nil))                     ; the desk is over the whole screen, for a unit that asked
     (format t "~&kiln: frames paced by ~:[a sleep~;the display~]~%" vsync)
     (loop
      (handler-case
@@ -1048,6 +1062,17 @@
             (let ((t0 (get-internal-real-time))
                   (queued (and *kiln-stats* mixer (%kiln-sys 1012 0 0 0)))
                   (tp 0))
+              ;; FULL SCREEN: a unit filling a turned screen asks for all of it (Media's theater):
+              ;; the desk goes over the safe area's margins, and comes back inside them after
+              (when (and (%wm-desk-p desk) (%wm-sym "WM-WANTS-FULLSCREEN"))
+                (let ((want (and (%wm-call "WM-WANTS-FULLSCREEN" desk) t)))
+                  (unless (eq want full)
+                    (setq full want)
+                    (let ((lay (%kiln-layout sw sh k top full)))
+                      (setq y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
+                            big (if (= k 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
+                      (%wm-call "WM-SET-FULLSCREEN" desk full)
+                      (%kiln-apply-desk-size desk sw sh dw dh)))))
               (setf *kiln-phase* :audio)
               (when mixer (%kiln-pump-audio mixer sink))
               (setf *kiln-phase* :tick)
@@ -1106,17 +1131,13 @@
                 ;; client's resize); it repaints the whole screen.
                 ((= type 6)
                  (let ((lay (%kiln-layout x y k top)))
-                   (setq sw x sh y
+                   (setq sw x sh y full nil
                          y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
                          big (if (= k 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
                    (format t "~&kiln: turned: ~Dx~D screen, desk ~Dx~D~%" sw sh dw dh)
-                   (%kiln-sys 1002 0 (+ sw (* sh 65536)) #x1E2530)
-                   (if (%wm-desk-p desk)
-                       (%wm-call "WM-RESIZE-SCREEN" desk dw dh)
-                       (glass:fb-resize (%kiln-desk-fb desk) dw dh))
-                   (glass:fb-mark-frame (%kiln-desk-fb desk) :full)
-                   (when *kiln-present-changes* (funcall *kiln-present-changes*))
-                   (%kiln-sys 1003 0 0 0)))
+                   (when (and (%wm-desk-p desk) (%wm-sym "WM-SET-FULLSCREEN"))
+                     (%wm-call "WM-SET-FULLSCREEN" desk nil))
+                   (%kiln-apply-desk-size desk sw sh dw dh)))
                 (t
               (if (= type 4)
                   ;; a key: the keysym is the low 40 bits; a press and its release
