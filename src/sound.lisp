@@ -13,11 +13,21 @@
 ;;;;   (sound-pump)                         once a frame: mix and write until the speaker holds *CUSHION* ahead
 ;;;;   (place listener-x listener-z yaw source-x source-y source-z &key loudness)
 ;;;;                                        (values gain pan) for a source heard from a listener facing YAW
+;;;;
+;;;; SPATIAL: sound placed in three dimensions by Apple's binaural renderer (modus's host/ios/swift/Spatial.swift):
+;;;; in front, behind, above, below -- and with AirPods, held still in the world as the head turns.  The samples
+;;;; are still Lisp's (TONE, PLUCK); the placing and the rendering are the platform's.
+;;;;   (spatial-open)                       T when the renderer is there
+;;;;   (spatial-voice sound &key loop)      a voice, from a sound handed over once
+;;;;   (spatial-place voice x y z &key gain)   where it is, each frame
+;;;;   (spatial-listener x y z yaw pitch)   where the listener is and which way it faces (yaw 0 down -Z)
+;;;;   (spatial-stop voice)   (spatial-volume 0.0..1.0)
 
 (defpackage #:kiln-sound
   (:use #:cl)
   (:export #:sound-open #:tone #:pluck #:play #:voice-set #:voice-stop #:sound-pump #:place #:*rate* #:*cushion*
-           #:*master*))
+           #:*master*
+           #:spatial-open #:spatial-voice #:spatial-place #:spatial-listener #:spatial-stop #:spatial-volume))
 
 (in-package #:kiln-sound)
 
@@ -141,3 +151,45 @@
          ;; the listener's right, level: (cos yaw, -sin yaw) in x z
          (pan (if (< d 1e-3) 0.0 (/ (+ (* dx (cos yaw)) (* dz (- (sin yaw)))) d))))
     (values (float gain 1.0) (float pan 1.0))))
+
+;;; ---- spatial ------------------------------------------------------------------------------------------------------
+
+(defvar *spatial* nil "True once the platform's 3D renderer is running.")
+(defvar *spatial-sounds* (make-hash-table :test 'eq) "A sound's handle there, by the sound: handed over once.")
+(defvar *args* (make-array 9 :element-type 'single-float :initial-element 0.0) "Floats for a call, reused.")
+
+(defun %call (name &rest args) (apply #'kiln-swift:swift-call name args))
+(defun %addr (v) (kiln-swift::%addr v))
+
+(defun spatial-open ()
+  "The platform's 3D sound renderer: T when it is there and running."
+  (or *spatial*
+      (setf *spatial* (and (find-package "KILN-SWIFT") (eql 1 (ignore-errors (%call "spatial_start")))))))
+
+(defun %spatial-sound (sound)
+  (or (gethash sound *spatial-sounds*)
+      (setf (gethash sound *spatial-sounds*) (%call "spatial_sound" (%addr sound) (length sound) *rate*))))
+
+(defun spatial-voice (sound &key loop)
+  "SOUND (a TONE or PLUCK) playing in 3D, at the listener until placed: a voice, or NIL."
+  (when (spatial-open)
+    (let ((v (%call "spatial_voice" (%spatial-sound sound) (if loop 1 0))))
+      (and (plusp v) v))))
+
+(defun spatial-place (voice x y z &key (gain 1.0))
+  (let ((a *args*))
+    (setf (aref a 0) (float x 1.0) (aref a 1) (float y 1.0) (aref a 2) (float z 1.0) (aref a 3) (float gain 1.0))
+    (%call "spatial_place" voice (%addr a))))
+
+(defun spatial-listener (x y z yaw &optional (pitch 0.0))
+  "The listener at X Y Z, facing YAW (about the vertical; 0 is down -Z, positive turns left) and PITCH (up)."
+  (let* ((a *args*) (cp (cos pitch))
+         (fx (* -1 (sin yaw) cp)) (fy (sin pitch)) (fz (* -1 (cos yaw) cp))
+         ;; up: perpendicular to forward, in the plane of forward and the world's up
+         (ux (* (sin yaw) (sin pitch))) (uy cp) (uz (* (cos yaw) (sin pitch))))
+    (loop for v in (list x y z fx fy fz ux uy uz) for i from 0 do (setf (aref a i) (float v 1.0)))
+    (%call "spatial_listener" (%addr a))))
+
+(defun spatial-stop (voice) (%call "spatial_stop" voice))
+
+(defun spatial-volume (v) (%call "spatial_volume" (round (* 1000 (max 0.0 (min 1.0 v))))))

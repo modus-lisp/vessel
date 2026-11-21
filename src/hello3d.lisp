@@ -6,7 +6,8 @@
 ;;;;   W A S D  move   Q E (or Shift Space)  down and up   the arrows  turn
 ;;;;   click     look around with the mouse (the pointer is held)     Esc  let the pointer go
 ;;;;   a game controller: the left stick moves, the right looks, the triggers lift and lower, A turns spin on and off
-;;;;   and every cube hums its own note, placed where it is: louder near, to the left or the right as you turn
+;;;;   and every cube hums its own note, placed where it is: in 3D through the platform's binaural renderer (with
+;;;;   AirPods, still in the world as your head turns), or else panned left and right
 ;;;;   the native controls: the frame rate, spin on or off, and how fast
 ;;;;
 ;;;; Its own app, not the desk's: kiln's boot/hello3d-world.lisp loads it and `kiln mac --app=hello3d' builds it.
@@ -188,12 +189,12 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   crate-texture floor-texture
   (eye (list 0.0 1.6 9.0)) (yaw 0.0) (pitch -0.08)
   (held (make-hash-table)) (locked nil)
-  (spin t) (speed 1.0) (angle 0.0)
+  (spin t) (speed 0.4) (angle 0.0)
   fps-label (frames 0) (fps-at 0)
   ;; a game controller: its state, read each frame (gamepad.lisp); A as it was, to see it pressed; the HUD's line
   (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1)
   ;; sound (sound.lisp): a humming voice per cube, the ring's then the middle one's; a blip; on or off
-  (hums '()) blip (sound t))
+  (hums '()) blip (sound t) (spatial nil))
 
 ;;; WHERE THE CUBES ARE, for the picture and the sound alike: the ring's Ith at ANGLE, and the middle one
 (defun ring-position (i angle)
@@ -272,15 +273,19 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (when (game-blip g) (kiln-sound:play (game-blip g) :gain 0.35)))
 
 (defun hear (g)
-  "Each cube's hum placed where it is now, heard from the eye; then the speaker fed."
+  "Each cube's hum placed where it is now, heard from the eye -- in 3D by the platform, or panned here -- then the
+   speaker fed (the blip's)."
   (when (game-hums g)
     (destructuring-bind (ex ey ez) (game-eye g)
-      (declare (ignore ey))
       (let ((a (game-angle g)) (yaw (game-yaw g)))
+        (when (game-spatial g) (kiln-sound:spatial-listener ex ey ez yaw (game-pitch g)))
         (loop for v in (game-hums g) for i from 0
               do (multiple-value-bind (x y z) (if (< i 8) (ring-position i a) (values 0 (middle-height a) 0))
-                   (multiple-value-bind (gain pan) (kiln-sound:place ex ez yaw x y z :loudness (if (< i 8) 0.14 0.22))
-                     (kiln-sound:voice-set v :gain gain :pan pan))))))
+                   (if (game-spatial g)
+                       (kiln-sound:spatial-place v x y z :gain (if (< i 8) 0.35 0.5))
+                       (multiple-value-bind (gain pan)
+                           (kiln-sound:place ex ez yaw x y z :loudness (if (< i 8) 0.14 0.22))
+                         (kiln-sound:voice-set v :gain gain :pan pan)))))))
     (kiln-sound:sound-pump)))
 
 (defun draw-thing (pass vertices indices count texture model tint)
@@ -335,16 +340,17 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                                (declare (ignore value h))
                                (setf (game-sound g) (not (game-sound g))
                                      kiln-sound:*master* (if (game-sound g) 1.0 0.0))
+                               (when (game-spatial g) (kiln-sound:spatial-volume (if (game-sound g) 1.0 0.0)))
                                (kiln-swift:ui-set-text sound (if (game-sound g) "sound: on" "sound: off")))))
   (let ((spin (kiln-swift:ui-button "spin: on" 20 100 110 32))
-        (speed (kiln-swift:ui-slider 50 140 104 200 24)))
+        (speed (kiln-swift:ui-slider 50 140 104 200 24)))     ; mid-way: 0.4
     (kiln-swift:on-tap spin (lambda (value h)
                               (declare (ignore value h))
                               (setf (game-spin g) (not (game-spin g)))
                               (kiln-swift:ui-set-text spin (if (game-spin g) "spin: on" "spin: off"))))
     (kiln-swift:on-event :slider speed (lambda (value h)
                                          (declare (ignore h))
-                                         (setf (game-speed g) (/ value 50.0))))))
+                                         (setf (game-speed g) (/ value 125.0))))))
 
 (defun start ()
   "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
@@ -360,11 +366,16 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     (setf (game-crate-texture g) (kiln-gpu:gpu-texture (texture-pixels 128 #'crate) 128 128)
           (game-floor-texture g) (kiln-gpu:gpu-texture (texture-pixels 256 #'checker) 256 256))
     ;; SOUND: a hum a cube, looping and placed each frame (HEAR); a blip for a press
+    ;; in 3D where the platform renders it (Spatial.swift), else panned in Lisp's own mix
     (when (kiln-sound:sound-open)
-      (setf (game-hums g)
-            (append (loop for f in *ring-notes* collect (kiln-sound:play (kiln-sound:tone f) :gain 0.0 :loop t))
-                    (list (kiln-sound:play (kiln-sound:tone 110 :timbre '(0.5 0.3 0.15 0.08)) :gain 0.0 :loop t)))
-            (game-blip g) (kiln-sound:pluck 880)))
+      (let ((tones (append (loop for f in *ring-notes* collect (kiln-sound:tone f))
+                           (list (kiln-sound:tone 110 :timbre '(0.5 0.3 0.15 0.08))))))
+        (setf (game-spatial g) (kiln-sound:spatial-open)
+              (game-hums g) (if (game-spatial g)
+                                (loop for tone in tones collect (kiln-sound:spatial-voice tone :loop t))
+                                (loop for tone in tones collect (kiln-sound:play tone :gain 0.0 :loop t)))
+              (game-blip g) (kiln-sound:pluck 880))
+        (format t "~&hello3d: sound ~:[panned left and right~;in 3D (the platform's renderer)~]~%" (game-spatial g))))
     (make-hud g)
     (setf (game-fps-at g) (get-internal-real-time))
     g))
