@@ -4,7 +4,7 @@
 ;;;;
 ;;;;   (now-playing &key title artist album duration position playing artwork)
 ;;;;        shown as what is playing: DURATION and POSITION in seconds, PLAYING true or false (the system moves the
-;;;;        position on while it is), ARTWORK an image file's path.  Call again when anything changes.
+;;;;        position on while it is), ARTWORK an image file's path or its bytes.  Call again when anything changes.
 ;;;;   (now-playing-clear)   nothing is playing
 ;;;;   (on-media fn)         FN is called with a command: :play :pause :toggle :stop :next :previous, or
 ;;;;                         (:seek seconds).  One FN at a time: the app that plays.
@@ -32,8 +32,11 @@
   (%text 0 title)
   (%text 1 artist)
   (%text 2 album)
-  (let ((b (kiln-swift::%octets (or artwork ""))))
-    (kiln-swift:swift-call "np_artwork" (kiln-swift::%addr b) (length b)))
+  ;; ARTWORK: an image file's path, or the image's own bytes (a cover read out of the track)
+  (if (and (vectorp artwork) (not (stringp artwork)))
+      (kiln-swift:swift-call "np_artwork_data" (kiln-swift::%addr artwork) (length artwork))
+      (let ((b (kiln-swift::%octets (or artwork ""))))
+        (kiln-swift:swift-call "np_artwork" (kiln-swift::%addr b) (length b))))
   (kiln-swift:swift-call "np_times" (max 0 (round (* 1000 duration))) (max 0 (round (* 1000 position)))
                          (if playing 1 0))
   t)
@@ -104,13 +107,23 @@
             (:seek (%wm "SEEK" p (second c)))))))
   (%follow-tick t))
 
+(defvar *artwork-of* nil "The track *ARTWORK* is for: a track's cover is looked for once.")
+(defvar *artwork* nil)
+
 (defun %artwork (track)
-  "A cover beside TRACK (cover, folder or front, .jpg or .png), or NIL."
-  (when track
-    (let ((dir (directory-namestring track)))
-      (dolist (name '("cover.jpg" "folder.jpg" "front.jpg" "cover.png" "folder.png" "front.png"))
-        (let ((f (concatenate 'string dir name)))
-          (when (probe-file f) (return f)))))))
+  "TRACK's cover: its own, read out of the file (warp-media's TRACK-ARTWORK: ID3, MP4, FLAC) as its bytes, else a
+   cover beside it (cover, folder or front, .jpg or .png) as a path; NIL for none."
+  (if (equal track *artwork-of*)
+      *artwork*
+      (setf *artwork-of* track
+            *artwork*
+            (when track
+              (or (let ((read (find-symbol "TRACK-ARTWORK" "WARP-MEDIA")))
+                    (and read (fboundp read) (values (funcall read track))))
+                  (let ((dir (directory-namestring track)))
+                    (dolist (name '("cover.jpg" "folder.jpg" "front.jpg" "cover.png" "folder.png" "front.png"))
+                      (let ((f (concatenate 'string dir name)))
+                        (when (probe-file f) (return f))))))))))
 
 (defun %album (track)
   "TRACK's folder's name: what a music folder is named for."
