@@ -12,16 +12,18 @@ user's uploads plus public downloads, and everything built goes under
 | `mcl-join-cpt.lisp` | joins the three-segment Compact Pro archive `MCL 2.0.sea` / `.#2` / `.#3` (on MCL floppies 1-3) into one archive `unar` can extract |
 | `ndif.lisp DATA APPLEDOUBLE OUT` | a Disk Copy 6 NDIF image (the Allegro disks) as the raw disk: fs-apple's `ndif-read` and `appledouble-read`, cram's ADC |
 | `strip.lisp RUNDIR [Y0 Y1]` | the Listener band of `shot-02.png` .. into `RUNDIR/strip.png`, one image to read every result from (pigment decodes, png-pure encodes) |
-| `mkvol.lisp APPS OUT.hfv [MB] [START]` | the System volume (fs-apple's HFS): `APPS` is a comma list of `pearl,mcl,acl,modus` and `START` picks the one launched at boot. `SYSTEM=753` uses the System Folder of the uploaded System 7.5.3 image instead of 6.0.8, with START's application copied into Startup Items. `MODUS_FORKS=DIR` names the Modus application (`scripts/mac68k-chain.lisp DISK OUT.bin --forks DIR`) |
+| `mkvol.lisp APPS OUT.hfv [MB] [START]` | the System volume (fs-apple's HFS): `APPS` is a comma list of `pearl,mcl,acl,modus` and `START` picks the one launched at boot. `SYSTEM=753` uses the System Folder of the uploaded System 7.5.3 image instead of 6.0.8, with START's application copied into Startup Items. `MODUS_FORKS=DIR` names the Modus application (modus's `scripts/mac68k-chain.lisp DISK OUT.bin --forks DIR`) |
 | `lisp.lua` | MAME autoboot driver. It waits `DELAY` emulated seconds, then types each `|`-separated form of `MAC_FORMS` plus Return, `GAP` seconds apart, and saves `SNAPDIR/shot-NN.png` before each form and once at the end |
 | `run-lisp.sh WHICH OUTDIR [MACHINE] [RAM]` | boots `disks/WHICH.hd.chd` (or `DISK=`) and types `bench-forms.lisp`, each form wrapped as `(time (eval (quote F)))` (`TIMED=0` to send them as is; `MAC_FORMS=` to override). `shot-(k+1)` shows form k's result |
 | `bench-forms.lisp` | the timing forms |
 
 ## Rebuild
 
+From the workspace root (modus, vessel, fs-apple and cram side by side):
+
 ```sh
-scripts/period-lisps/build-disks.sh pearl mcl           # ~1 min, needs network
-scripts/period-lisps/run-lisp.sh mcl /tmp/x macclasc 4M  # then Read /tmp/x/shot-*.png
+vessel/tools/mac68k/period-lisps/build-disks.sh pearl mcl           # ~1 min, needs network
+vessel/tools/mac68k/period-lisps/run-lisp.sh mcl /tmp/x macclasc 4M  # then Read /tmp/x/shot-*.png
 ```
 
 MCL and Modus on one volume (System 6.0.8 for the Classic, 7.5.3 for the Quadra 950;
@@ -29,10 +31,10 @@ MCL and Modus on one volume (System 6.0.8 for the Classic, 7.5.3 for the Quadra 
 
 ```sh
 L=/mnt/data-fast/claude/rss/lisps
-sbcl --script scripts/mac68k-chain.lisp /tmp/rss/m-n68j/c.dsk $L/modus/n68j/Modus.bin --forks $L/modus/n68j
-MODUS_FORKS=$L/modus/n68j sbcl --script scripts/period-lisps/mkvol.lisp mcl,modus mm.hfv 24 modus
-SYSTEM=753 MODUS_FORKS=$L/modus/q3 sbcl --script scripts/period-lisps/mkvol.lisp mcl,modus mmq.hfv 48 mcl
-sbcl --script scripts/mac68k-hd.lisp mm.hfv mm.hd --chd "env LD_LIBRARY_PATH=/tmp/rss/mame/root/usr/lib/x86_64-linux-gnu /tmp/rss/mame/root/usr/bin/chdman"
+sbcl --script modus/scripts/mac68k-chain.lisp /tmp/rss/m-n68j/c.dsk $L/modus/n68j/Modus.bin --forks $L/modus/n68j
+MODUS_FORKS=$L/modus/n68j sbcl --script vessel/tools/mac68k/period-lisps/mkvol.lisp mcl,modus mm.hfv 24 modus
+SYSTEM=753 MODUS_FORKS=$L/modus/q3 sbcl --script vessel/tools/mac68k/period-lisps/mkvol.lisp mcl,modus mmq.hfv 48 mcl
+sbcl --script modus/scripts/mac68k-hd.lisp mm.hfv mm.hd --chd "env LD_LIBRARY_PATH=/tmp/rss/mame/root/usr/lib/x86_64-linux-gnu /tmp/rss/mame/root/usr/bin/chdman"
 ```
 
 `macqd950` is not in MAME 0.251. `run-lisp.sh` uses the Quadra-only 0.289 build at
@@ -45,14 +47,14 @@ whichever dependencies the host lacked, rather than installed:
 
 - `$RSS/b2/` (Basilisk II): `basilisk2`, and for its headless display `xvfb`,
   `xserver-common`, `x11-xkb-utils`, `xkb-data`, `xauth`, `libxfont2`, `libgtk2.0-0`,
-  `libgtk2.0-common`, `libtinyxml2-9`.  `scripts/basilisk-unpie.lisp` relinks its JIT
+  `libgtk2.0-common`, `libtinyxml2-9`.  modus's `scripts/basilisk-unpie.lisp` relinks its JIT
   binary low (`BasiliskII-jit-lo`).
 - `$RSS/mame/` (MAME 0.251): `mame`, `mame-data`, `mame-tools` (chdman) and the Qt 5,
   SDL2-ttf, Lua 5.3, PortAudio/PortMidi, libinput and pugixml libraries they pull in.
   `$RSS/mdev/` holds the development headers the Quadra-only MAME 0.289 build needed.
 - `unar`, for the Lisp archives: `build-disks.sh` step 3.
 
-`scripts/mac68k-prof/romlink.lisp` then gives each machine's ROMs their MAME names.
+`tools/mac68k/prof/romlink.lisp` then gives each machine's ROMs their MAME names.
 
 ## Gotchas
 

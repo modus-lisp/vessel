@@ -16,7 +16,7 @@
 ;;;;                68040 Quadras.  System 7's Finder ignores "Set Startup", so a copy of
 ;;;;                START's application also goes into System Folder:Startup Items.
 ;;;;   MODUS_FORKS  directory with data and rsrc of the Modus application, as written by
-;;;;                scripts/mac68k-chain.lisp DISK OUT.bin --forks DIR (required for modus)
+;;;;                modus's scripts/mac68k-chain.lisp DISK OUT.bin --forks DIR (required for modus)
 ;;;;   VOLNAME      the volume's name (default Macintosh HD)
 ;;;;   MODUS_DESKTOP  V,H: Modus on the desktop (System 7), its icon there, not in a folder
 ;;;;
@@ -27,7 +27,7 @@
   (let ((w (sb-ext:posix-getenv "WORKSPACE")))
     (if (and w (plusp (length w)))
         (pathname (if (char= (char w (1- (length w))) #\/) w (concatenate 'string w "/")))
-        (merge-pathnames "../../../" (make-pathname :name nil :type nil :defaults *load-truename*)))))
+        (merge-pathnames "../../../../" (make-pathname :name nil :type nil :defaults *load-truename*)))))
 (push (lambda (name)
         (let ((base (subseq name 0 (or (position #\/ name) (length name)))))
           (probe-file (merge-pathnames (format nil "~A/~A.asd" base base) *workspace*))))

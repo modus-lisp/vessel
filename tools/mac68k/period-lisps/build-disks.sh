@@ -7,7 +7,7 @@
 set -eu
 LISPS=${LISPS:-/mnt/data-fast/claude/rss/lisps}; export LISPS
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=${REPO:-/home/claude/modus-mac}
+REPO=${REPO:-$(cd "$HERE/../../../../modus" 2>/dev/null && pwd)}   # modus: its mac68k-hd.lisp
 UP=${UP:-/mnt/data-fast/claude/rss/romsrc/uploads}
 MAME=${MAME:-/mnt/data-fast/claude/rss/mame}
 L=$MAME/root/usr/lib/x86_64-linux-gnu

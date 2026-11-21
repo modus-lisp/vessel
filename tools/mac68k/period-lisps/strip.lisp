@@ -1,7 +1,7 @@
 ;;;; strip.lisp -- the Listener band of a MAME run's screenshots, stacked into one
 ;;;; image to read all the results from.
 ;;;;
-;;;;   sbcl --script scripts/period-lisps/strip.lisp RUNDIR [Y0 Y1]
+;;;;   sbcl --script tools/mac68k/period-lisps/strip.lisp RUNDIR [Y0 Y1]
 ;;;;
 ;;;; RUNDIR/shot-02.png .. shot-NN.png (run-lisp.sh's; shot-01 is before the first
 ;;;; form), rows Y0..Y1 of each (default 215..330), stacked with a 2-pixel grey
@@ -15,7 +15,7 @@
   (let ((w (sb-ext:posix-getenv "WORKSPACE")))
     (if (and w (plusp (length w)))
         (pathname (if (char= (char w (1- (length w))) #\/) w (concatenate 'string w "/")))
-        (merge-pathnames "../../../" (make-pathname :name nil :type nil :defaults *load-truename*)))))
+        (merge-pathnames "../../../../" (make-pathname :name nil :type nil :defaults *load-truename*)))))
 (push (lambda (name)
         (let ((base (subseq name 0 (or (position #\/ name) (length name)))))
           (probe-file (merge-pathnames (format nil "~A/~A.asd" base base) *workspace*))))

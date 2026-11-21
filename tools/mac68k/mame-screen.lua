@@ -1,4 +1,4 @@
--- mac68k-mame-screen.lua -- drive the modus REPL on MAME by its SCREEN console
+-- mame-screen.lua -- drive the modus REPL on MAME by its SCREEN console
 -- (no serial port in MAME's SE/30 / II / Quadra; the Classic works the same way).
 --
 -- The prompt is read from the console's text buffer in the image's runtime-data

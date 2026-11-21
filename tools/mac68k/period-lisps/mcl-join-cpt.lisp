@@ -16,7 +16,7 @@
   (let ((w (sb-ext:posix-getenv "WORKSPACE")))
     (if (and w (plusp (length w)))
         (pathname (if (char= (char w (1- (length w))) #\/) w (concatenate 'string w "/")))
-        (merge-pathnames "../../../" (make-pathname :name nil :type nil :defaults *load-truename*)))))
+        (merge-pathnames "../../../../" (make-pathname :name nil :type nil :defaults *load-truename*)))))
 (push (lambda (name)
         (let ((base (subseq name 0 (or (position #\/ name) (length name)))))
           (probe-file (merge-pathnames (format nil "~A/~A.asd" base base) *workspace*))))

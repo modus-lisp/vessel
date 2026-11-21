@@ -1,6 +1,6 @@
 #!/bin/bash
-# mac68k-mame-run.sh DIR MACHINE RAM TAG FORMS [SECONDS] -- a REPL session on DIR/c.hd.chd by the
-# screen console (scripts/mac68k-mame-screen.lua); transcript in $RSS/qd/TAG.txt.  macclasc and
+# mame-run.sh DIR MACHINE RAM TAG FORMS [SECONDS] -- a REPL session on DIR/c.hd.chd by the
+# screen console (mame-screen.lua beside it); transcript in $RSS/qd/TAG.txt.  macclasc and
 # friends run Debian bookworm's MAME 0.251; macqd950/macqd700 a MAME 0.289 built from source
 # (make SUBTARGET=qd SOURCES=src/mame/apple/macquadra700.cpp), which also needs FAKESCREEN=0x600000.
 D=$(readlink -f $1); M=$2; RAM=$3; T=$4; F=$5; S=${6:-300}; RSS=${RSS:-/tmp/rss}
@@ -14,5 +14,5 @@ esac
 export HOME=$RSS/mame
 REGION=${REGION:-0x2B0000} MAC_OUT=$RSS/qd/$T.txt MAC_SNAP=$RSS/qd/$T.png MAC_FORMS="$F" MAC_SECONDS=$S \
   timeout 3000 $BIN $M -rompath $RSS/mame/roms -ramsize $RAM -hard $D/c.hd.chd -video none -sound none \
-  -nothrottle -skip_gameinfo -autoboot_script $HERE/mac68k-mame-screen.lua > $RSS/qd/$T.log 2>&1
+  -nothrottle -skip_gameinfo -autoboot_script $HERE/mame-screen.lua > $RSS/qd/$T.log 2>&1
 cat $RSS/qd/$T.txt
