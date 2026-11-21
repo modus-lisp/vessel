@@ -196,6 +196,7 @@
   (pcc-copy-bytes (pcc-scan-normal) #x1B400)
   (pcc-copy-bytes (pcc-scan-shifted) #x1B480)
   (setf (mem-ref #x1B040 :u32) 0)
+  (setf (mem-ref #x1B078 :u32) 0)                 ; text mode, whatever RAM held
   ;; A clean screen: what boot drew before the font was here is blanks at
   ;; best, and whatever firmware left at worst.
   (let ((i 0))
@@ -213,7 +214,8 @@
 (defun %console-write-char (code)
   ;; The write-char-serial hook: COM1 always, then the screens.
   (write-char-serial code)
-  (vga-write-char code)
+  ;; not once a VBE graphics mode is set (pc-vbe.lisp's #x1B078): text memory is no longer the screen
+  (unless (= (mem-ref #x1B078 :u32) 1) (vga-write-char code))
   (when (fb-on-p) (fb-write-char code)))
 
 (defun %console-read-char ()
