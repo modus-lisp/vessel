@@ -1,4 +1,4 @@
-| harness.s -- scripts/mac68k-lzma.inc as a Linux/m68k program, to check it
+| harness.s -- kernel/scripts/mac68k-lzma.inc as a Linux/m68k program, to check it
 | against other LZMA1 decoders: `harness SIZE [DSIZE] < [DICT] STREAM > OUT`
 | (sizes in decimal; the stream lc=2 lp=1 pb=2, raw; with DSIZE, the input's
 | first DSIZE bytes are a preset dictionary, the stream after them).  Linux/m68k

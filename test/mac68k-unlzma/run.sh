@@ -1,5 +1,5 @@
 #!/bin/sh
-# run.sh [IMAGE] -- check scripts/mac68k-lzma.inc (the Mac floppy's LZMA decoder)
+# run.sh [IMAGE] -- check kernel/scripts/mac68k-lzma.inc (the Mac floppy's LZMA decoder)
 # against xz's encoder under qemu-m68k-static (68040): edge cases, random data,
 # text, and IMAGE if given (a Mac image, the thing the floppy carries).
 # (cram's encoder, which the floppy uses, was checked the same way.)  Then
@@ -9,7 +9,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-m68k-linux-gnu-as -m68020 -I "$here/../../scripts" -o "$tmp/h.o" "$here/harness.s"
+m68k-linux-gnu-as -m68020 -I "$here/../../kernel/scripts" -o "$tmp/h.o" "$here/harness.s"
 m68k-linux-gnu-ld -o "$tmp/harness" "$tmp/h.o"
 printf a > "$tmp/one"
 head -c 100000 /dev/zero > "$tmp/zeros"
