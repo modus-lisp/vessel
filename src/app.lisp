@@ -858,9 +858,17 @@
          ;; POINT, and 16-pixel text is iOS's 16-point text.  At 2x it was two-thirds of that
          ;; and read as tiny.  Touches divide by the same K.
          (k (max 1 (%kiln-sys 1001 2 0 0)))
+         ;; HIDPI: the desk is laid out in POINTS (DW x DH below) and drawn in the screen's own
+         ;; pixels -- glass.wm's density (WM-SET-DENSITY) -- so what knows about density (a page, a
+         ;; picture, a film) is sharp, and what does not is magnified by the window manager, as the
+         ;; whole desk used to be.  KILN_HIDPI=0: the whole desk magnified K times, as before.
+         (hidpi (and (%wm-sym "WM-SET-DENSITY") (> k 1)
+                     (not (equal (ignore-errors (modus-int::%cli-getenv "KILN_HIDPI")) "0"))))
+         (dens (if hidpi k 1))            ; desk pixels to a point
+         (mag (if hidpi 1 k))             ; screen pixels to a desk pixel
          (lay (%kiln-layout sw sh k top))
          (y0 (first lay)) (x0 (second lay)) (dw (third lay)) (dh (fourth lay))
-         (big (if (= k 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
+         (big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
          ;; SOUND: a mixer whose clock is this loop (see %KILN-PUMP-AUDIO), and a
          ;; speaker at its rate.  No speaker, no mixer -- the player then paces the
          ;; picture by the wall clock, as it did before there was sound.
@@ -878,9 +886,15 @@
                                          :test #'string=)))))
          (lib (and media (funcall (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")
                                   :root mdir :mixer mixer)))
-         (desk (%kiln-make-desk (glass:make-framebuffer dw dh))))
+         (desk (%kiln-make-desk (glass:make-framebuffer (* dw dens) (* dh dens)))))
     (declare (ignorable _))
     (setf *kiln-desk* desk)
+    (when hidpi
+      ;; the window manager's chrome and units in points at this density; a screen this many
+      ;; pixels across is not an RFB client's to refuse (*SCREEN-MAX*)
+      (%wm-call "WM-SET-DENSITY" desk dens)
+      (setf (symbol-value (%wm-sym "*WM-SCALE*")) (* *kiln-wm-scale* dens))
+      (let ((mx (%wm-sym "*SCREEN-MAX*"))) (when mx (setf (symbol-value mx) 8192))))
     ;; a window's copy box puts its text on the host's clipboard (the iPhone's pasteboard)
     (when (fboundp '%kiln-copy-text)
       (setf glass.desk:*desk-copy* (symbol-function '%kiln-copy-text)))
@@ -1034,11 +1048,11 @@
               (when changed
                 (if (eq (glass:fb-format (%kiln-desk-fb desk)) :xrgb)
                     (progn
-                      (if (= k 1)
+                      (if (= mag 1)
                           (%kiln-blit-region (%kiln-desk-fb desk) 1 x0 y0 x y w h)
                           (progn
-                            (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) k x y w h)
-                            (%kiln-blit-region big k x0 y0 x y w h)))
+                            (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) mag x y w h)
+                            (%kiln-blit-region big mag x0 y0 x y w h)))
                       (%kiln-sys 1003 0 0 0))
                     (%kiln-sys 1007 (%kiln-desk-fb desk) 0 0))))))
     ;; A tap or a repaint that signals is logged and dropped: one bad gesture
@@ -1070,9 +1084,9 @@
                     (setq full want)
                     (let ((lay (%kiln-layout sw sh k top full)))
                       (setq y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
-                            big (if (= k 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
+                            big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
                       (%wm-call "WM-SET-FULLSCREEN" desk full)
-                      (%kiln-apply-desk-size desk sw sh dw dh)))))
+                      (%kiln-apply-desk-size desk sw sh (* dw dens) (* dh dens))))))
               (setf *kiln-phase* :audio)
               (when mixer (%kiln-pump-audio mixer sink))
               (setf *kiln-phase* :tick)
@@ -1086,11 +1100,11 @@
                       (progn
                         ;; at 1x the magnified copy IS the desk: show it straight from there
                         ;; (the copy was a tenth of a Pi Zero's drag frame)
-                        (if (= k 1)
+                        (if (= mag 1)
                             (%kiln-timed (:blit) (%kiln-blit-region (%kiln-desk-fb desk) 1 x0 y0 x y w h))
                             (progn
-                              (%kiln-timed (:scale) (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) k x y w h))
-                              (%kiln-timed (:blit) (%kiln-blit-region big k x0 y0 x y w h))))
+                              (%kiln-timed (:scale) (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) mag x y w h))
+                              (%kiln-timed (:blit) (%kiln-blit-region big mag x0 y0 x y w h))))
                         (%kiln-timed (:blit) (%kiln-sys 1003 0 0 0)))
                       ;; A Y'CbCr desk (glass :I420) is shown as it is: the platform scans
                       ;; the planes out (pseudo-syscall 1007, the Zero's HVS)
@@ -1123,7 +1137,7 @@
                 ;; lays the rack out in what is left (glass.wm WM-SET-OBSCURED).
                 ((= type 7)
                  (let* ((desk-bottom (+ y0 (* dh k)))
-                        (hidden (max 0 (ceiling (- desk-bottom (- sh x)) k))))
+                        (hidden (max 0 (ceiling (- desk-bottom (- sh x)) mag))))
                    (when (and (%wm-desk-p desk) (%wm-sym "WM-SET-OBSCURED"))
                      (%wm-call "WM-SET-OBSCURED" desk hidden))))
                 ;; THE PHONE TURNED (type 6): the screen is now X by Y pixels.  Lay the desk out
@@ -1133,11 +1147,11 @@
                  (let ((lay (%kiln-layout x y k top)))
                    (setq sw x sh y full nil
                          y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
-                         big (if (= k 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
+                         big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
                    (format t "~&kiln: turned: ~Dx~D screen, desk ~Dx~D~%" sw sh dw dh)
                    (when (and (%wm-desk-p desk) (%wm-sym "WM-SET-FULLSCREEN"))
                      (%wm-call "WM-SET-FULLSCREEN" desk nil))
-                   (%kiln-apply-desk-size desk sw sh dw dh)))
+                   (%kiln-apply-desk-size desk sw sh (* dw dens) (* dh dens))))
                 (t
               (if (= type 4)
                   ;; a key: the keysym is the low 40 bits; a press and its release
@@ -1155,7 +1169,7 @@
                     (%kiln-stats-add :events 1)
                     (%kiln-timed (:input)
                       (%kiln-desk-pointer desk (if (or (= type 3) (= type 5)) 0 1)
-                                          (floor (- x x0) k) (floor (- y y0) k))))))))))
+                                          (floor (- x x0) mag) (floor (- y y0) mag))))))))))
        ;; SERIOUS-CONDITION, not ERROR: a condition that is not an ERROR (a STORAGE-CONDITION, say) escaped
        ;; this loop, KILN-APP-MAIN returned, and the app ended with exit code 0 and nothing said
        (serious-condition (c) (format t "~&kiln: [~A] ~A: ~A~%" *kiln-phase* (type-of c)
