@@ -6,6 +6,7 @@
 ;;;;   W A S D  move   Q E (or Shift Space)  down and up   the arrows  turn
 ;;;;   click     look around with the mouse (the pointer is held)     Esc  let the pointer go
 ;;;;   a game controller: the left stick moves, the right looks, the triggers lift and lower, A turns spin on and off
+;;;;   on a phone (MAIN :TOUCH T): the left thumb a stick where it lands, the right thumb drags the view
 ;;;;   and every cube hums its own note, placed where it is: in 3D through the platform's binaural renderer (with
 ;;;;   AirPods, still in the world as your head turns), or else panned left and right
 ;;;;   the native controls: the frame rate, spin on or off, and how fast
@@ -194,7 +195,10 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   ;; a game controller: its state, read each frame (gamepad.lisp); A as it was, to see it pressed; the HUD's line
   (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1)
   ;; sound (sound.lisp): a humming voice per cube, the ring's then the middle one's; a blip; on or off
-  (hums '()) blip (sound t) (spatial nil))
+  (hums '()) blip (sound t) (spatial nil)
+  ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
+  ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
+  (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
 
 ;;; WHERE THE CUBES ARE, for the picture and the sound alike: the ring's Ith at ANGLE, and the middle one
 (defun ring-position (i angle)
@@ -229,6 +233,10 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     (when (key-down-p g #xff53) (decf (game-yaw g) turn))                      ; right
     (when (key-down-p g #xff52) (incf (game-pitch g) turn))                    ; up
     (when (key-down-p g #xff54) (decf (game-pitch g) turn))                    ; down
+    ;; THE TOUCH STICK: as WASD, by how far the left thumb is from where it landed
+    (when (game-touch g)
+      (incf dx (+ (* (game-stick-x g) rx) (* (- (game-stick-y g)) fx)))
+      (incf dz (+ (* (game-stick-x g) rz) (* (- (game-stick-y g)) fz))))
     ;; A GAME CONTROLLER, the first one: the left stick moves (as WASD, and by how far it is pushed), the right
     ;; looks, the triggers lift and lower
     (when (kiln-pad:pad-read 0 (game-pad g))
@@ -252,10 +260,41 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
 
 (defun %signed20 (v) (if (logbitp 19 v) (- v #x100000) v))
 
+(defun touch-event (g e)
+  "A finger's own touch (type 14): on the left half of the screen a stick, centred where it lands; on the right,
+   dragged, the view turned."
+  (let* ((x (logand e #xFFFFF)) (y (logand (ash e -20) #xFFFFF))
+         (slot (logand (ash e -48) #xF)) (phase (logand (ash e -52) 3))
+         (fingers (game-fingers g)) (scale (game-scale g))
+         (radius (* 60 scale)))                            ; full deflection 60 points out
+    (case phase
+      (0 (setf (gethash slot fingers)
+               (if (< x (floor (%sys 1001 0 0 0) 2)) (list :move x y x y) (list :look x y))))
+      (1 (let ((f (gethash slot fingers)))
+           (when f
+             (if (eq (first f) :move)
+                 (destructuring-bind (role cx cy &rest r) f
+                   (declare (ignore role r))
+                   (setf (game-stick-x g) (max -1.0 (min 1.0 (/ (- x cx) radius)))
+                         (game-stick-y g) (max -1.0 (min 1.0 (/ (- y cy) radius)))))
+                 (destructuring-bind (role lx ly) f
+                   (declare (ignore role))
+                   (decf (game-yaw g) (/ (* 0.005 (- x lx)) scale))
+                   (setf (game-pitch g) (max -1.45 (min 1.45 (- (game-pitch g) (/ (* 0.005 (- y ly)) scale)))))
+                   (setf (gethash slot fingers) (list :look x y)))))))
+      (2 (let ((f (gethash slot fingers)))
+           (when (and f (eq (first f) :move)) (setf (game-stick-x g) 0.0 (game-stick-y g) 0.0))
+           (remhash slot fingers))))))
+
 (defun handle-event (g e)
   "One event from the window: keys held and let go, the pointer locked by a click and let go by Esc, the mouse's
    motion turning the eye while it is locked."
   (let ((type (logand (ash e -40) #xFF)))
+    (when (game-touch g)                    ; a phone: fingers are its input, and there is no pointer to hold
+      (case type
+        (14 (touch-event g e))
+        ((8 9) nil)
+        (t (return-from handle-event nil))))
     (case type
       (8 (let ((ks (logand e #xFFFFFFFFFF)))
            (setf (gethash ks (game-held g)) t)
@@ -330,31 +369,43 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                       (floats 1.0 0.85 0.55 1)))))))
 
 (defun make-hud (g)
-  "The platform's own controls over the picture."
-  (kiln-swift:ui-label "Hello, world" 20 16 300 30)
-  (setf (game-fps-label g) (kiln-swift:ui-label "" 20 46 300 22))
-  (kiln-swift:ui-label "click: look around   Esc: let go   WASD, QE: move   arrows: turn" 20 70 600 22)
-  (setf (game-pad-label g) (kiln-swift:ui-label "" 20 140 600 22))
-  (let ((sound (kiln-swift:ui-button "sound: on" 360 100 110 32)))
+  "The platform's own controls over the picture, inside the safe area (a phone's notch, turned)."
+  (let* ((scale (game-scale g))
+         (x (+ 20 (floor (%sys 1001 4 0 0) scale))) (y (+ 8 (floor (max 0 (%sys 1001 3 0 0)) scale)))
+         ;; the width there is, in points: a phone held upright has under 400, so lines are shorter and the
+         ;; sound button goes under spin rather than beside it
+         (w (- (floor (%sys 1001 0 0 0) scale) x 20 (floor (max 0 (%sys 1001 6 0 0)) scale)))
+         (narrow (< w 480))
+         (below (if narrow 40 0)))
+  (kiln-swift:ui-label "Hello, world" x (+ y 8) (min w 300) 30)
+  (setf (game-fps-label g) (kiln-swift:ui-label "" x (+ y 38) (min w 300) 22))
+  (kiln-swift:ui-label (cond ((not (game-touch g)) "click: look around   Esc: let go   WASD, QE: move   arrows: turn")
+                             (narrow "left thumb: move   right thumb: look")
+                             (t "left thumb: move   right thumb: look   or a game controller"))
+                       x (+ y 62) (min w 600) 22)
+  (setf (game-pad-label g) (kiln-swift:ui-label "" x (+ y 132 below) (min w 600) 22))
+  (let ((sound (if narrow
+                   (kiln-swift:ui-button "sound: on" x (+ y 92 below) 110 32)
+                   (kiln-swift:ui-button "sound: on" (+ x 340) (+ y 92) 110 32))))
     (kiln-swift:on-tap sound (lambda (value h)
                                (declare (ignore value h))
                                (setf (game-sound g) (not (game-sound g))
                                      kiln-sound:*master* (if (game-sound g) 1.0 0.0))
                                (when (game-spatial g) (kiln-sound:spatial-volume (if (game-sound g) 1.0 0.0)))
                                (kiln-swift:ui-set-text sound (if (game-sound g) "sound: on" "sound: off")))))
-  (let ((spin (kiln-swift:ui-button "spin: on" 20 100 110 32))
-        (speed (kiln-swift:ui-slider 50 140 104 200 24)))     ; mid-way: 0.4
+  (let ((spin (kiln-swift:ui-button "spin: on" x (+ y 92) 110 32))
+        (speed (kiln-swift:ui-slider 50 (+ x 120) (+ y 96) 200 24)))     ; mid-way: 0.4
     (kiln-swift:on-tap spin (lambda (value h)
                               (declare (ignore value h))
                               (setf (game-spin g) (not (game-spin g)))
                               (kiln-swift:ui-set-text spin (if (game-spin g) "spin: on" "spin: off"))))
     (kiln-swift:on-event :slider speed (lambda (value h)
                                          (declare (ignore h))
-                                         (setf (game-speed g) (/ value 125.0))))))
+                                         (setf (game-speed g) (/ value 125.0)))))))
 
-(defun start ()
+(defun start (&key touch)
   "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
-  (let ((g (make-game)))
+  (let ((g (make-game :touch touch :scale (max 1 (%sys 1001 2 0 0)))))
     (setf (game-view g) (kiln-gpu:gpu-view 0 0 0 0))
     (let ((shader (kiln-gpu:gpu-shader *shader*)))
       (setf (game-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "world_vertex" "world_fragment"))))
@@ -380,11 +431,11 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     (setf (game-fps-at g) (get-internal-real-time))
     g))
 
-(defun main ()
-  "Hello, world in 3D: start, then a frame each time the screen refreshes."
+(defun main (&key touch)
+  "Hello, world in 3D: start, then a frame each time the screen refreshes.  TOUCH: a phone's two thumbs."
   (%sys 1002 0 (+ (%sys 1001 0 0 0) (* (%sys 1001 1 0 0) 65536)) *dusk*)   ; under the view, until it draws
   (%sys 1003 0 0 0)
-  (let ((g (start)) (last (get-internal-real-time)))
+  (let ((g (start :touch touch)) (last (get-internal-real-time)))
     (format t "~&hello3d: running~%")
     (loop
       (%sys 1008 34 0 0)                                ; the screen's next refresh
@@ -411,8 +462,8 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                 (setf (game-pad-seen g) n)
                 (kiln-swift:ui-set-text (game-pad-label g)
                                         (if (plusp n)
-                                            (format nil "controller: ~A -- sticks move and look, triggers lift, A spins"
-                                                    (kiln-pad:pad-name 0))
+                                            (format nil "controller: ~A~:[ -- sticks move and look, triggers lift, A spins~;~]"
+                                                    (kiln-pad:pad-name 0) (game-touch g))
                                             "no controller (pair one in Bluetooth settings)"))
                 (when (plusp n) (kiln-pad:pad-light 0 #xffd98c))))
             (setf (game-frames g) 0 (game-fps-at g) now)))))))

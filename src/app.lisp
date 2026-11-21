@@ -1225,6 +1225,10 @@
                    (when (and (%wm-desk-p desk) (%wm-sym "WM-SET-FULLSCREEN"))
                      (%wm-call "WM-SET-FULLSCREEN" desk nil))
                    (%kiln-apply-desk-size desk sw sh (* dw dens) (* dh dens))))
+                ;; WHAT THE DESK DOES NOT TAKE (types 13 and up): a held pointer's motion (13, a Mac game's
+                ;; mouse-look), a finger's own touch (14, a phone game's sticks, sent beside the 1/2/3 the
+                ;; desk reads)
+                ((>= type 13) nil)
                 ;; A POINTER WITH ITS BUTTONS (type 12, a Mac's): X11's mask in bits 48 up -- 1 left, 2
                 ;; middle, 4 right, 8 and 16 the wheel up and down, 32 and 64 left and right
                 ((= type 12)
