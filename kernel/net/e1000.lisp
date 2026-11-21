@@ -13,39 +13,69 @@
 
 (in-package :modus.net.e1000)
 
-;; Scan PCI bus 0 for E1000 (vendor=8086 device=100E).
-;; Store MMIO base at state-base+0. Returns MMIO base or 0.
+;; Two seams, identity where the CPU's addresses are the device's (x86-64,
+;; QEMU virt).  The bare i386 PC overrides both (arch-i386-cl.lisp): its
+;; registers sit far above what a fixnum address can name, so a BAR is mapped
+;; into a window, and its RAM is paged, so a buffer's DMA address is not the
+;; address the CPU writes it at.
+(declaim (overridable e1000-map-bar))
+(defun e1000-map-bar (phys) phys)
+(declaim (overridable e1000-dma-addr))
+(defun e1000-dma-addr (addr) addr)
+
+;; The device kind at state+0x20: 0 the classic E1000 (82540EM, QEMU's e1000),
+;; 1 a PCH LAN (82579LM/V, the ThinkPad T420's), whose firmware has already set
+;; it up and whose management engine shares it.  state+0x24: its PCI slot.
+(defun e1000-pch-p () (eql (mem-ref (+ (e1000-state-base) #x20) :u32) 1))
+
+;; Scan PCI bus 0 for an E1000 (8086:100E) or a PCH LAN (8086:1502 / 1503).
+;; Store the register base at state-base+0. Returns it or 0.  EQL, not EQ:
+;; on a 30-bit tower #x100E8086 is a bignum.
 (defun pci-find-e1000 ()
   (let ((found 0))
     (dotimes (dev 32)
-      (let ((id (pci-config-read 0 dev 0 0)))
-        (when (eq id #x100E8086)
+      (let* ((id (pci-config-read 0 dev 0 0))
+             (kind (cond ((eql id #x100E8086) 0)
+                         ((or (eql id #x15028086) (eql id #x15038086)) 1))))
+        (when (and kind (zerop found))
           ;; Enable PCI Bus Mastering + Memory Space + I/O Space
           (let ((cmd (pci-config-read 0 dev 0 4)))
             (pci-config-write 0 dev 0 4 (logior cmd 7)))
           ;; Read BAR0 (register 0x10)
           (let ((bar0 (pci-config-read 0 dev 0 #x10)))
-            (setq found (logand bar0 #xFFFFFFF0))
-            (setf (mem-ref (e1000-state-base) :u64) found)))))
+            (setq found (e1000-map-bar (logand bar0 #xFFFFFFF0)))
+            (setf (mem-ref (e1000-state-base) :u64) found)
+            (setf (mem-ref (+ (e1000-state-base) #x20) :u32) kind)
+            (setf (mem-ref (+ (e1000-state-base) #x24) :u32) dev)))))
     found))
+
+;; A device register is one 32-bit access.  MEM-REF :U32 is that where a 32-bit
+;; value is a fixnum; on a 30-bit tower it is two 16-bit halves (fine in RAM,
+;; wrong for a register -- QEMU's e1000 answers each half with the whole
+;; register), so the i386 PC overrides these with its native single-access
+;; traps (arch-i386-cl.lisp).
+(declaim (overridable %mmio-read32))
+(defun %mmio-read32 (addr) (mem-ref addr :u32))
+(declaim (overridable %mmio-write32))
+(defun %mmio-write32 (addr val) (setf (mem-ref addr :u32) val))
 
 ;; Write to E1000 MMIO register
 (defun e1000-write-reg (reg val)
-  (setf (mem-ref (+ (mem-ref (e1000-state-base) :u64) reg) :u32) val))
+  (%mmio-write32 (+ (mem-ref (e1000-state-base) :u64) reg) val))
 
 ;; Read E1000 MMIO register
 (defun e1000-read-reg (reg)
-  (mem-ref (+ (mem-ref (e1000-state-base) :u64) reg) :u32))
+  (%mmio-read32 (+ (mem-ref (e1000-state-base) :u64) reg)))
 
 ;; Read 16-bit word from E1000 EEPROM
 (defun e1000-read-eeprom (addr)
   (let ((mmio (mem-ref (e1000-state-base) :u64)))
     ;; Write EERD: start bit | (addr << 8)
-    (setf (mem-ref (+ mmio #x14) :u32) (logior 1 (ash addr 8)))
+    (%mmio-write32 (+ mmio #x14) (logior 1 (ash addr 8)))
     ;; Poll for done (bit 4)
     (let ((result 0))
       (dotimes (try 10000)
-        (let ((val (mem-ref (+ mmio #x14) :u32)))
+        (let ((val (%mmio-read32 (+ mmio #x14))))
           (when (not (zerop (logand val 16)))
             (setq result (logand (ash val -16) #xFFFF))
             (setq try 10001))))
@@ -74,15 +104,15 @@
     (dotimes (i (e1000-rx-ring-count))
       (let ((desc-addr (+ rx-desc (* i 16)))
             (buf-addr (+ rx-buf (* i 2048))))
-        ;; Buffer address low 32 bits
-        (setf (mem-ref desc-addr :u32) buf-addr)
+        ;; Buffer address low 32 bits (the device's view of it)
+        (setf (mem-ref desc-addr :u32) (e1000-dma-addr buf-addr))
         ;; Buffer address high 32 bits = 0
         (setf (mem-ref (+ desc-addr 4) :u32) 0)
         ;; Clear status/length fields
         (setf (mem-ref (+ desc-addr 8) :u32) 0)
         (setf (mem-ref (+ desc-addr 12) :u32) 0)))
     ;; Set RX descriptor ring registers
-    (e1000-write-reg #x2800 rx-desc)   ; RDBAL
+    (e1000-write-reg #x2800 (e1000-dma-addr rx-desc))   ; RDBAL
     (e1000-write-reg #x2804 0)         ; RDBAH
     (e1000-write-reg #x2808 (* (e1000-rx-ring-count) 16))  ; RDLEN
     (e1000-write-reg #x2810 0)         ; RDH (head)
@@ -98,15 +128,15 @@
     (dotimes (i 64)
       (let ((desc-addr (+ tx-desc (* i 16)))
             (buf-addr (+ tx-buf (* i 1536))))
-        ;; Buffer address low 32 bits
-        (setf (mem-ref desc-addr :u32) buf-addr)
+        ;; Buffer address low 32 bits (the device's view of it)
+        (setf (mem-ref desc-addr :u32) (e1000-dma-addr buf-addr))
         ;; Buffer address high 32 bits = 0
         (setf (mem-ref (+ desc-addr 4) :u32) 0)
         ;; Clear cmd/status fields
         (setf (mem-ref (+ desc-addr 8) :u32) 0)
         (setf (mem-ref (+ desc-addr 12) :u32) 0)))
     ;; Set TX descriptor ring registers
-    (e1000-write-reg #x3800 tx-desc)   ; TDBAL
+    (e1000-write-reg #x3800 (e1000-dma-addr tx-desc))   ; TDBAL
     (e1000-write-reg #x3804 0)         ; TDBAH
     (e1000-write-reg #x3808 1024)      ; TDLEN (64 * 16)
     (e1000-write-reg #x3810 0)         ; TDH (head)
@@ -116,6 +146,9 @@
 
 ;; Full E1000 initialization
 (defun e1000-init ()
+  (if (e1000-pch-p) (e1000-init-pch) (e1000-init-classic)))
+
+(defun e1000-init-classic ()
   (let ((mmio (mem-ref (e1000-state-base) :u64))
         (state (e1000-state-base)))
     (when (zerop mmio)
@@ -219,6 +252,89 @@
     (%serial-byte 48) (%serial-byte 58) (%serial-byte 79) (%serial-byte 75)
     (%serial-byte 10)
     1))
+
+;;; ---------------------------------------------------------------------------
+;;; PCH LAN (82579LM / 82579V): the ThinkPad T420's.  BIOS-PRESERVING: the
+;;; firmware has configured the MAC and the PHY, and the management engine
+;;; (ME/AMT) shares the device, so there is no CTRL.RST (a reset loses the
+;;; firmware's setup -- how this NIC was first brought up on a T420, in the
+;;; mini-Lisp image, 2026-04).  Linux e1000e's order otherwise: tell the ME a
+;;; driver is loaded, the ICH/PCH bits, the rings, link by read-modify-write
+;;; (never a blind CTRL write), RX, then TX with its PCH thresholds, TCTL last.
+
+(defun e1000-me-wait ()
+  "Until the management engine releases the bus (FWSM bit 24): a register
+   write made while it is accessing the device is dropped."
+  (dotimes (i 2000)
+    (when (zerop (logand (e1000-read-reg #x5B54) #x1000000)) (return t))
+    (io-delay)))
+
+(defun e1000-rmw (reg set)
+  (e1000-me-wait)
+  (e1000-write-reg reg (logior (e1000-read-reg reg) set)))
+
+(defun e1000-init-pch ()
+  (let ((state (e1000-state-base)))
+    ;; the ME: a host driver is loaded (SWSM.DRV_LOAD, CTRL_EXT.DRV_LOAD)
+    (e1000-rmw #x5B50 1)
+    ;; CTRL_EXT: bit 22 (required on ICH/PCH), 28 DRV_LOAD, 17 RO_DIS
+    (e1000-rmw #x18 #x10420000)
+    ;; GCR: no NO_SNOOP bits, so the NIC's DMA snoops the CPU's caches
+    (e1000-me-wait)
+    (e1000-write-reg #x5B00 (logand (e1000-read-reg #x5B00) (lognot #x3F)))
+    ;; errata: RFCTL descriptor corruption bits, KABGTXD TX arbitration
+    (e1000-rmw #x5008 #x3C0)
+    (e1000-rmw #x3004 #x50000)
+    ;; the MAC the firmware left in RAL0/RAH0
+    (let ((ral (e1000-read-reg #x5400)) (rah (e1000-read-reg #x5404)))
+      (dotimes (i 4) (setf (mem-ref (+ state #x08 i) :u8) (logand (ash ral (* -8 i)) #xFF)))
+      (setf (mem-ref (+ state #x0C) :u8) (logand rah #xFF))
+      (setf (mem-ref (+ state #x0D) :u8) (logand (ash rah -8) #xFF))
+      (%serial-byte 77) (%serial-byte 65) (%serial-byte 67) (%serial-byte 58)
+      (dotimes (i 6)
+        (when (> i 0) (%serial-byte 58))
+        (print-hex-byte (mem-ref (+ state #x08 i) :u8)))
+      (%serial-byte 10))
+    (dotimes (i 128) (e1000-write-reg (+ #x5200 (* i 4)) 0))
+    (e1000-init-rx)
+    (e1000-init-tx)
+    ;; link: set SLU, keep everything the firmware chose
+    (e1000-rmw 0 #x40)
+    ;; RX: EN | BAM | BSIZE 2048 | SECRC
+    (e1000-me-wait)
+    (e1000-write-reg #x100 #x4008002)
+    ;; TX, Linux's order: TIPG, TXDCTL (PTHRESH 31, WTHRESH 1, no GRAN), TARC0, delays, TCTL last
+    (e1000-me-wait)
+    (e1000-write-reg #x410 #x602008)
+    (e1000-me-wait)
+    (e1000-write-reg #x3828 #x0101001F)
+    (e1000-rmw #x3840 #xD800081)
+    (e1000-write-reg #x3820 8)
+    (e1000-write-reg #x382C 32)
+    ;; TCTL: EN | PSP | CT 15 | COLD 63 | RTLC | MULR (bit 28: a second DMA
+    ;; request, without which a descriptor's data is never fetched) | bit 29
+    (e1000-me-wait)
+    (e1000-write-reg #x400 #x3103F0FA)
+    ;; STATUS.PHYRA, and interrupts as the classic path has them
+    (e1000-write-reg 8 #x400)
+    (e1000-write-reg #xD8 #xFFFFFFFF)
+    (e1000-read-reg #xC0)
+    (e1000-write-reg #xD0 #x80)
+    ;; with AMT running, let the ME pass the host its traffic (MANC.EN_MNG2HOST)
+    (when (logtest (e1000-read-reg #x5B54) #x8000)
+      (e1000-rmw #x5820 #x1000))
+    (setf (mem-ref (+ state #x18) :u32) 0)
+    (setf (mem-ref (+ state #x1C) :u32) 0)
+    ;; "E1000:PCH" + newline
+    (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
+    (%serial-byte 48) (%serial-byte 58) (%serial-byte 80) (%serial-byte 67)
+    (%serial-byte 72) (%serial-byte 10)
+    1))
+
+(defun e1000-status ()
+  "What the NIC says, for a person at the REPL: (STATUS CTRL RDH RDT TDH TDT
+   FWSM), raw.  STATUS bit 1 is link up."
+  (mapcar (function e1000-read-reg) (list 8 0 #x2810 #x2818 #x3810 #x3818 #x5B54)))
 
 ;; Send raw ethernet frame from byte array
 (defun e1000-hw-send (buf len)
