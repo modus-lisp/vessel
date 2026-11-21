@@ -65,6 +65,59 @@
                (loop for xx from (max 0 x) below x1
                      do (setf (mem-ref a :u32) rgb) (setq a (+ a 4)))))))
 
+;;; --- the native copy ---------------------------------------------------------------------------
+;;; A pixel a time in Lisp was ~360 ns under QEMU (an AREF and a MEM-REF store, each a call):
+;;; a 1280x780 screen most of a second.  This routine is a few instructions a pixel: ROWS x COLS
+;;; tagged pixel words (glass's pixel vectors hold fixnums, value << 1) to raw 32-bit pixels,
+;;; reading its arguments from a block at #x58000 (just above the mutex arena) --
+;;;   +0 source address  +4 destination  +8 cols  +12 rows  +16 source stride  +20 dest pitch
+;;; It is written into the native tier's code area (jit-i386-native.lisp, #x12000000) and called
+;;; as the function at that address: a leaf that saves every register and answers fixnum 0.
+;;; Measured under QEMU: 1M pixels in under 10 ms (one tick of the clock), from 360 ms.
+;;;   pushal; movl $0x58000,%ebx; movl (%ebx),%esi; movl 4(%ebx),%edi; movl 12(%ebx),%ebp
+;;;   row: testl %ebp,%ebp; jz done; pushl %esi; pushl %edi; movl 8(%ebx),%ecx
+;;;   col: testl %ecx,%ecx; jz rowend; movl (%esi),%eax; shrl $1,%eax; movl %eax,(%edi)
+;;;        addl $4,%esi; addl $4,%edi; decl %ecx; jmp col
+;;;   rowend: popl %edi; popl %esi; addl 16(%ebx),%esi; addl 20(%ebx),%edi; decl %ebp; jmp row
+;;;   done: popal; xorl %eax,%eax; ret
+(defparameter *t4-blit-code*
+  '(96 187 0 128 5 0 139 51 139 123 4 139 107 12 133 237 116 35 86 87 139 75 8 133 201 116 15
+    139 6 209 232 137 7 131 198 4 131 199 4 73 235 237 95 94 3 115 16 3 123 20 77 235 217 97 49
+    192 195))
+(defvar *t4-blit* nil)          ; the routine, as a function; :LISP where there is no code area
+
+(defun %t4-blit-fn ()
+  (or *t4-blit*
+      (setf *t4-blit*
+            (let ((ptr (and (boundp 'modus-int::*n386-ptr*) modus-int::*n386-ptr*))
+                  (end (and (boundp 'modus-int::*n386-end*) modus-int::*n386-end*)))
+              (if (and (integerp ptr) (integerp end) (< (+ ptr 80) end))
+                  (let ((a (logand (+ ptr 15) (lognot 15))) (i 0))
+                    (dolist (b *t4-blit-code*) (setf (mem-ref (+ a i) :u8) b) (setq i (+ i 1)))
+                    (setf modus-int::*n386-ptr* (+ a 64))
+                    (modus-int::%word->val (logior a 3)))
+                  :lisp)))))
+
+(defun %t4-copy (px pw sx sy cols rows dx dy)
+  "Pixels (SX,SY)..+COLS,ROWS of pixel vector PX (row length PW) to the screen at (DX,DY).
+   Nothing between taking PX's address and the copy allocates, so it cannot move."
+  (let ((f (%t4-blit-fn)))
+    (if (eq f :lisp)
+        (dotimes (r rows)
+          (let ((src (+ (* (+ sy r) pw) sx)) (dst (%t4-px-addr dx (+ dy r))))
+            (dotimes (c cols)
+              (setf (mem-ref dst :u32) (aref px src))
+              (setq src (+ src 1) dst (+ dst 4)))))
+        (progn
+          (setf (mem-ref #x58000 :u32) (+ (- (modus-int::%val->word px) 5) (* 4 (+ (* sy pw) sx)))
+                (mem-ref #x58004 :u32) (%t4-px-addr dx dy)
+                (mem-ref #x58008 :u32) cols
+                (mem-ref #x5800C :u32) rows
+                (mem-ref #x58010 :u32) (* 4 pw)
+                (mem-ref #x58014 :u32) *t4-pitch*)
+          (funcall f)))
+    nil))
+
 ;;; --- the pointer -----------------------------------------------------------------------------
 ;;; Drawn over the screen, with the pixels under it kept and put back when it moves.  The
 ;;; framebuffer is uncached, so the pixels under it are not read back from it: they are kept
@@ -89,13 +142,24 @@
         #x1E2530)))
 
 (defun %t4-pointer-hide ()
+  "Put back what the desk drew under the pointer: its 11 x 16 patch, copied from the desk's
+   framebuffer (the screen's own pixels are never read back)."
   (when *t4-under*
-    (let ((x *t4-under-x*) (y *t4-under-y*))
-      (dotimes (r 16)
-        (dotimes (c 11)
-          (let ((sx (+ x c)) (sy (+ y r)))
-            (when (and (< -1 sx *t4-w*) (< -1 sy *t4-h*))
-              (setf (mem-ref (%t4-px-addr sx sy) :u32) (%t4-desk-pixel sx sy)))))))
+    (let* ((d (and (boundp '*kiln-desk*) (symbol-value '*kiln-desk*)))
+           (fb (and d (glass.desk:desk-fb d))))
+      (if fb
+          (let* ((fw (glass:fb-width fb)) (fh (glass:fb-height fb))
+                 (x (max 0 *t4-under-x*)) (y (max 0 *t4-under-y*))
+                 (cols (- (min (+ *t4-under-x* 11) fw *t4-w*) x))
+                 (rows (- (min (+ *t4-under-y* 16) fh *t4-h*) y)))
+            (when (and (> cols 0) (> rows 0))
+              (%t4-copy (glass:fb-pixels fb) fw x y cols rows x y)))
+          (let ((x *t4-under-x*) (y *t4-under-y*))
+            (dotimes (r 16)
+              (dotimes (c 11)
+                (let ((sx (+ x c)) (sy (+ y r)))
+                  (when (and (< -1 sx *t4-w*) (< -1 sy *t4-h*))
+                    (setf (mem-ref (%t4-px-addr sx sy) :u32) (%t4-desk-pixel sx sy)))))))))
     (setf *t4-under* nil)))
 
 (defun %t4-pointer-show ()

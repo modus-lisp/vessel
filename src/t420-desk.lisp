@@ -2,8 +2,8 @@
 ;;;;
 ;;;; app.lisp's %KILN-BLIT-REGION passes the platform the address of the pixel vector's first
 ;;;; element as a 64-bit heap lays it out (%GC-WORD-OF + 7, 8 bytes a pixel).  On 32-bit x86 a
-;;;; word is 4 bytes and the payload is elsewhere, so this replaces it with a copy that reads
-;;;; the pixels through AREF and writes the framebuffer through MEM-REF.  The framebuffer is
+;;;; word is 4 bytes and the payload is elsewhere, so this replaces it with t420.lisp's
+;;;; %T4-COPY: the native row copier (or, with no code area, AREF and MEM-REF).  The framebuffer is
 ;;;; uncached write-combining memory: written, never read (the pointer's background comes from
 ;;;; the desk's own framebuffer, t420.lisp).
 
@@ -15,12 +15,7 @@
          (sx0 (+ x0 (* x k))) (sy0 (+ y0 (* y k)))
          (cols (min (* w k) (- *t4-w* sx0))) (rows (min (* h k) (- *t4-h* sy0))))
     (when (and (> cols 0) (> rows 0))
-      (dotimes (r rows)
-        (let ((src (+ (* (+ (* y k) r) bw) (* x k)))
-              (dst (%t4-px-addr sx0 (+ sy0 r))))
-          (dotimes (c cols)
-            (setf (mem-ref dst :u32) (aref px src))
-            (setq src (+ src 1) dst (+ dst 4)))))
+      (%t4-copy px bw (* x k) (* y k) cols rows sx0 sy0)
       ;; the pointer, if the copy went over it
       (when (and *t4-under*
                  (< (- sx0 11) *t4-under-x* (+ sx0 cols)) (< (- sy0 16) *t4-under-y* (+ sy0 rows)))
