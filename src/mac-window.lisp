@@ -7,7 +7,9 @@
 ;;;;   (window-chrome :standard)       a title bar with the title and the three buttons
 ;;;;   (window-chrome :hidden-title)   the bar and its buttons, no title
 ;;;;   (window-chrome :transparent)    the content runs under the bar; the buttons float over it
-;;;;   (window-chrome :none)           as :transparent, without the buttons: nothing but the content
+;;;;   (window-chrome :none)           as :transparent, without the buttons (the bar's strip still drags it)
+;;;;   (window-chrome :full-bleed)     no title bar at all: the content to every edge, the corners rounded;
+;;;;                                   Command-drag anywhere moves the window
 ;;;;   (window-size 1280 800)          the content's size, in points
 ;;;;   (window-min-size 640 400)
 ;;;;   (window-fullscreen t)
@@ -31,8 +33,10 @@
   (%text-call "window_title" title))
 
 (defun window-chrome (style)
-  "STYLE is :standard, :hidden-title, :transparent (the content under the bar) or :none (no title and no buttons)."
-  (kiln-swift:swift-call "window_chrome" (ecase style (:standard 0) (:hidden-title 1) (:transparent 2) (:none 3))))
+  "STYLE is :standard, :hidden-title, :transparent (the content under the bar), :none (no title and no buttons)
+   or :full-bleed (no title bar at all: the content to every edge)."
+  (kiln-swift:swift-call "window_chrome"
+                         (ecase style (:standard 0) (:hidden-title 1) (:transparent 2) (:none 3) (:full-bleed 4))))
 
 (defun window-size (w h)
   "The content's size, W x H points."
