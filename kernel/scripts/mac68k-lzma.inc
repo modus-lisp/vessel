@@ -1,6 +1,8 @@
 | mac68k-lzma.inc -- a raw LZMA1 decoder in 68020 assembly (LzmaSpec.cpp's
-| algorithm, as mvm/unlzma-core.lisp has it), shared by the Mac boot loader
-| (scripts/mac68k-unlzma.s) and its hosted test (test/mac68k-unlzma/).
+| algorithm), shared by the Mac boot loader (kernel/scripts/mac68k-unlzma.s), the
+| cold-code driver (mac68k-lzdisk.s) and their hosted test (test/mac68k-unlzma/).
+| A local copy of cram's LZMA-DECOMPRESS -- it runs before any Lisp does -- so the
+| test holds it to xz's encoder and to cram's preset-dictionary streams.
 |
 | The stream is what scripts/mac68k-floppy.lisp writes: lc=2 lp=1 pb=2, no
 | header, no end marker, the unpacked size known.  Those three parameters are
