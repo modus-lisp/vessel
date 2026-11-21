@@ -602,6 +602,8 @@
   (let ((lines (list "Lisp.  Enter evaluates; (detach FORM :name \"x\") runs it in the background."
                      "(ssh \"user@host:port\") connects this window to a remote shell."))
         (input "") (pending "") (history '()) (hpos -1) (dirty t)
+        ;; Control and Command (Super) held: a keyboard that sends its modifiers as keys (a Mac's) has them
+        (ctrl nil) (super nil)
         ;; an SSH session in this window: (conn chan host), its reader's inbox (strings, newest
         ;; first, :EOF at the end), and the unfinished last line of what it printed
         (remote nil) (inbox (list nil)) (partial "")
@@ -685,7 +687,14 @@
                      (setf pending (concatenate 'string all (string #\Newline)) input ""))))
              (key (ks)
                (let ((ch (%kiln-keysym-char ks)))
-                 (cond ((= ks #xff08)                       ; BackSpace
+                 (cond (super nil)                          ; a Command key: the host's or an app's, not text
+                       ((and ctrl (member ks '(#x63 #x43)))  ; C-c: the line is abandoned
+                        (add (concatenate 'string (prompt) input "^C"))
+                        (setf input "" pending "" hpos -1))
+                       ((and ctrl (member ks '(#x75 #x55))) (setf input ""))    ; C-u: the line is cleared
+                       ((and ctrl (member ks '(#x6c #x4c))) (setf lines '()))   ; C-l: the screen is
+                       (ctrl nil)
+                       ((= ks #xff08)                       ; BackSpace
                         (when (plusp (length input)) (setf input (subseq input 0 (1- (length input))))))
                        ((= ks #xff52)                       ; Up: the previous entry
                         (when (< (1+ hpos) (length history))
@@ -697,7 +706,10 @@
                        ((eql ch #\Newline) (enter))
                        (ch (setf input (concatenate 'string input (string ch))))))
                (setf dirty t)))
-      (values (lambda (down ks) (when down (key ks)))
+      (values (lambda (down ks)
+                (cond ((member ks '(#xffe3 #xffe4)) (setf ctrl down))        ; Control L/R
+                      ((member ks '(#xffeb #xffec)) (setf super down))       ; Super L/R: a Mac's Command
+                      (down (key ks))))
               nil
               (lambda () (when remote (take-remote)) (when dirty (setf dirty nil) (redraw) t))
               (lambda () (format nil "~{~a~%~}" (append lines (list input))))
@@ -1128,7 +1140,7 @@
                   (let ((left (- 16 (floor (- (get-internal-real-time) t0) 1000))))
                     (when (> left 1)
                       (if (fboundp '%kiln-frame-wait) (funcall '%kiln-frame-wait left) (modus-int::%sleep-ms left))))))
-            (let ((type (floor e 1099511627776))
+            (let ((type (logand (floor e 1099511627776) #xFF))
                   (y (logand (floor e 1048576) #xFFFFF))
                   (x (logand e #xFFFFF)))
               (cond
@@ -1152,19 +1164,30 @@
                    (when (and (%wm-desk-p desk) (%wm-sym "WM-SET-FULLSCREEN"))
                      (%wm-call "WM-SET-FULLSCREEN" desk nil))
                    (%kiln-apply-desk-size desk sw sh (* dw dens) (* dh dens))))
+                ;; A POINTER WITH ITS BUTTONS (type 12, a Mac's): X11's mask in bits 48 up -- 1 left, 2
+                ;; middle, 4 right, 8 and 16 the wheel up and down, 32 and 64 left and right
+                ((= type 12)
+                 (%kiln-stats-add :events 1)
+                 (%kiln-timed (:input)
+                   (%kiln-desk-pointer desk (logand (ash e -48) #xFF)
+                                       (floor (- x x0) mag) (floor (- y y0) mag))))
                 (t
-              (if (= type 4)
-                  ;; a key: the keysym is the low 40 bits; a press and its release
+              (if (or (= type 4) (= type 8) (= type 9))
+                  ;; a key: the keysym is the low 40 bits.  4 is a press and its release (the phone's
+                  ;; keyboard, text typed in); 8 a press alone and 9 a release (a Mac's keys, the
+                  ;; modifiers among them)
                   (let ((ks (logand e #xFFFFFFFFFF)))
                     ;; ~ or / with no text window focused opens a Terminal (typed into one,
                     ;; they are just characters)
-                    (if (and (or (= ks #x7e) (= ks #x2f))
-                             (not (%kiln-desk-focus-text-p desk)))
-                        (%kiln-desk-open desk "Terminal")
-                        (progn (when (and (= ks #xff0d) *kiln-present-changes*)
-                                 (funcall *kiln-present-changes*))   ; the line is drawn before it runs
-                               (%kiln-desk-key desk t ks)
-                               (%kiln-desk-key desk nil ks))))
+                    (cond ((and (or (= ks #x7e) (= ks #x2f))
+                                (/= type 9)
+                                (not (%kiln-desk-focus-text-p desk)))
+                           (%kiln-desk-open desk "Terminal"))
+                          ((= type 9) (%kiln-desk-key desk nil ks))
+                          (t (when (and (= ks #xff0d) *kiln-present-changes*)
+                               (funcall *kiln-present-changes*))   ; the line is drawn before it runs
+                             (%kiln-desk-key desk t ks)
+                             (when (= type 4) (%kiln-desk-key desk nil ks)))))
                   (progn
                     (%kiln-stats-add :events 1)
                     (%kiln-timed (:input)
