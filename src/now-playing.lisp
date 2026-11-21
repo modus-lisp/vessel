@@ -48,31 +48,61 @@
 ;;; drive it.  Nothing is claimed until it first plays: on the phone, taking the commands makes the audio session
 ;;; the unmixed playback kind, which stops another app's sound -- right when Media plays, wrong when the desk opens.
 
+;;; MEDIA'S RADIO TOO: a station playing (glass's tuner, Media's Stations) is what plays -- Media pauses its files
+;;; when a station starts, so one or the other.  A station is live: its title is what the stream says is on (or the
+;;; station), its artist the station, and the system shows it as a live stream, with no length.
+
 (defvar *followed* nil "The warp-media player shown as Now Playing.")
-(defvar *claimed* nil "True once the commands are taken (the player has played).")
+(defvar *radio* nil "Glass's radio tuner (Media's Stations), shown when a station plays.")
+(defvar *claimed* nil "True once the commands are taken (something has played).")
 (defvar *shown* nil "What was last told to the system: (title playing duration), the position, and when.")
 (defvar *follow-tick* 0)
 
 (defun %wm (name &rest args)
   (apply (symbol-function (find-symbol name "WARP-MEDIA")) args))
 
+(defun %gd (name &rest args)
+  (apply (symbol-function (find-symbol name "GLASS.DESK")) args))
+
 (defun follow-player (player)
-  "Show warp-media's PLAYER as Now Playing, and drive it with the media keys, from when it first plays."
-  (setf *followed* player *shown* nil)
+  "Show warp-media's PLAYER as Now Playing, and drive it with the media keys, from when it first plays; and Media's
+   radio, when a station plays, where the image has it."
+  (setf *followed* player *shown* nil
+        *radio* (let ((tu (and (find-package "GLASS.DESK") (find-symbol "*RADIO-TUNER*" "GLASS.DESK"))))
+                  (and tu (boundp tu) (symbol-value tu))))
   (pushnew '%follow-tick cl-user::*kiln-frame-hooks*)
   player)
 
+(defun %radio-state ()
+  (and *radio* (ignore-errors (%gd "%RA-STATE" *radio*))))
+
+(defun %radio-on-p ()
+  "Is a station what plays (playing, connecting, or paused)?"
+  (member (%radio-state) '(:playing :buffering :paused)))
+
 (defun %player-command (c)
-  (let ((p *followed*))
-    (when p
-      (case (if (consp c) (car c) c)
-        (:play (if (eq (%wm "PLAYER-STATE" p) :paused) (%wm "RESUME" p) (%wm "TOGGLE" p)))
-        ((:pause :stop) (%wm "PAUSE" p))        ; STOP would forget the track: the system's stop is a pause
-        (:toggle (%wm "TOGGLE" p))
-        (:next (%wm "PLAY-NEXT" p))
-        (:previous (%wm "PLAY-PREV" p))
-        (:seek (%wm "SEEK" p (second c))))
-      (%follow-tick t))))
+  (format t "~&kiln: media command ~S, ~:[the player ~(~A~)~;the radio ~(~A~)~]~%" c (%radio-on-p)
+          (if (%radio-on-p) (%radio-state) (and *followed* (%wm "PLAYER-STATE" *followed*))))
+  (if (%radio-on-p)
+      (let ((st (%radio-state)) (mixer (symbol-value (find-symbol "*MEDIA-MIXER*" "GLASS.DESK"))))
+        (case (if (consp c) (car c) c)
+          ;; a pause to a paused station is a resume, as a file's is (a headphone click)
+          ((:play :pause :toggle) (when (or (member c '(:toggle :pause)) (eq st :paused))
+                                    (%gd "RADIO-TOGGLE" *radio* mixer)))
+          (:stop (when (eq st :playing) (%gd "RADIO-TOGGLE" *radio* mixer)))))
+      (let ((p *followed*))
+        (when p
+          (case (if (consp c) (car c) c)
+            (:play (if (eq (%wm "PLAYER-STATE" p) :paused) (%wm "RESUME" p) (%wm "TOGGLE" p)))
+            ;; A PAUSE TO A PAUSED PLAYER IS A RESUME: no pause button is shown for what is paused, so it is a
+            ;; headphone click, which the system sends as pause while it believes the app is playing
+            (:pause (if (eq (%wm "PLAYER-STATE" p) :paused) (%wm "RESUME" p) (%wm "PAUSE" p)))
+            (:stop (%wm "PAUSE" p))             ; STOP would forget the track: the system's stop is a pause
+            (:toggle (%wm "TOGGLE" p))
+            (:next (%wm "PLAY-NEXT" p))
+            (:previous (%wm "PLAY-PREV" p))
+            (:seek (%wm "SEEK" p (second c)))))))
+  (%follow-tick t))
 
 (defun %artwork (track)
   "A cover beside TRACK (cover, folder or front, .jpg or .png), or NIL."
@@ -89,36 +119,51 @@
            (slash (position #\/ dir :from-end t)))
       (if slash (subseq dir (1+ slash)) dir))))
 
+(defun %what-plays ()
+  "What to show: (values state title artist album artwork duration position), STATE :playing, :paused, :loading
+   (between tracks: keep what is shown) or NIL (nothing).  DURATION 0 is a live stream."
+  (if (%radio-on-p)
+      (let* ((st (%radio-state))
+             (station (or (ignore-errors (%gd "%RA-GET" *radio* "PLAYER-STATION")) (car (%gd "TUNER-STATION" *radio*))))
+             (said (ignore-errors (%gd "%RA-GET" *radio* "PLAYER-STREAM-TITLE")))
+             (said (and (stringp said) (plusp (length said)) said)))
+        (values (case st (:playing :playing) (:paused :paused) (t :loading))
+                (or said station "Radio") (and said station) "Stations" nil 0 0))
+      (let ((p *followed*))
+        (when p
+          (let ((state (%wm "PLAYER-STATE" p)) (title (%wm "PLAYER-TITLE" p)))
+            (cond ((eq state :loading) (values :loading))
+                  ((or (null title) (member state '(:stopped :error))) (values nil))
+                  (t (let ((track (%wm "PLAYER-TRACK" p)))
+                       (values (if (eq state :playing) :playing :paused) title nil (%album track) (%artwork track)
+                               (or (%wm "PLAYER-DURATION" p) 0)
+                               (or (ignore-errors (%wm "PLAYER-POSITION" p)) 0))))))))))
+
 (defun %follow-tick (&optional now)
-  "A frame hook: twice a second (or NOW), what the player is doing, told to the system when it changes -- another
-   track, playing or paused, or a jump the system's own clock would not have made (a seek)."
-  (let ((p *followed*))
-    (when (and p (or now (zerop (mod (incf *follow-tick*) 30))))
-      (let* ((state (%wm "PLAYER-STATE" p))
-             (title (%wm "PLAYER-TITLE" p))
-             (playing (eq state :playing))
-             (position (or (ignore-errors (%wm "PLAYER-POSITION" p)) 0))
-             (duration (or (%wm "PLAYER-DURATION" p) 0))
-             (key (list title playing duration)))
-        (cond ((member state '(:loading)))           ; between tracks: keep what is shown
-              ((or (null title) (member state '(:stopped :error)))
+  "A frame hook: twice a second (or NOW), what plays -- Media's file player or its radio -- told to the system when
+   it changes (another track or station, what a station says is on, playing or paused), or a jump the system's own
+   clock would not have made (a seek)."
+  (when (and (or *followed* *radio*) (or now (zerop (mod (incf *follow-tick*) 30))))
+    (multiple-value-bind (state title artist album artwork duration position) (%what-plays)
+      (let ((playing (eq state :playing)))
+        (cond ((eq state :loading))                ; between tracks, or a station connecting: keep what is shown
+              ((null state)
                (when *shown* (now-playing-clear) (setf *shown* nil)))
-              ((or (not (equal key (first *shown*)))
-                   (> (abs (- position (%expected-position))) 2))
+              ((or (not (equal (list title artist playing duration) (first *shown*)))
+                   (and (plusp duration) (> (abs (- position (%expected-position))) 2)))
                (unless *claimed*
                  (when playing (on-media #'%player-command) (setf *claimed* t)))
                (when *claimed*
-                 (let ((track (%wm "PLAYER-TRACK" p)))
-                   (now-playing :title title :album (%album track) :artwork (%artwork track)
-                                :duration duration :position position :playing playing))
-                 (setf *shown* (list key position (get-internal-real-time))))))))))
+                 (now-playing :title title :artist artist :album album :artwork artwork
+                              :duration duration :position position :playing playing)
+                 (setf *shown* (list (list title artist playing duration) position (get-internal-real-time))))))))))
 
 (defun %expected-position ()
   "Where the system has the track now: where it was told, moved on by the time since if playing."
   (if (null *shown*)
       0
-      (destructuring-bind ((title playing duration) at when) *shown*
-        (declare (ignore title duration))
+      (destructuring-bind ((title artist playing duration) at when) *shown*
+        (declare (ignore title artist duration))
         (if playing (+ at (/ (- (get-internal-real-time) when) internal-time-units-per-second)) at))))
 
 (defun on-media (fn)
