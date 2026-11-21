@@ -20,6 +20,12 @@
 ;;;;
 ;;;; State, for whoever draws (kiln's 1001/1005, the console): #x1B060 base VA, #x1B064 pitch in
 ;;;; bytes, #x1B068 width, #x1B06C height, #x1B070 bpp, #x1B074 the mode, #x1B078 1 when on.
+;;;;
+;;;; THE CONSOLE on it (%FB-CONSOLE-CHAR, pc-console.lisp's seam): the video BIOS's own 8x16
+;;;; font (INT 10h AX=1130h, BH=6), copied to 0:24800 while the BIOS can still be asked; a
+;;;; character grid in RAM at 0:25800 (#x1B080 columns, #x1B084 rows, #x1B088/#x1B08C the
+;;;; cursor); the screen redrawn from the grid, never read -- a scroll jumps a third of the
+;;;; screen, so a full redraw is rare.
 
 (defun %pcbios-present-p ()
   (= (mem-ref #x580 :u32) #x54424350))          ; "PCBT", the shim's boot record
@@ -123,8 +129,9 @@
           (%vbe-map base (* pitch h))
           (setf (mem-ref #x1B060 :u32) #x0C000000 (mem-ref #x1B064 :u32) pitch
                 (mem-ref #x1B068 :u32) w (mem-ref #x1B06C :u32) h
-                (mem-ref #x1B070 :u32) bpp (mem-ref #x1B074 :u32) mode
-                (mem-ref #x1B078 :u32) 1)
+                (mem-ref #x1B070 :u32) bpp (mem-ref #x1B074 :u32) mode)
+          (%fbc-init)
+          (setf (mem-ref #x1B078 :u32) 1)          ; the console draws here from now on
           (list w h))))))
 
 (defun vbe-fill (x y w h rgb)
@@ -149,3 +156,89 @@
       (vbe-fill 0 0 w 4 #xFFFFFF) (vbe-fill 0 (- h 4) w 4 #xFFFFFF)
       (vbe-fill 0 0 4 h #xFFFFFF) (vbe-fill (- w 4) 0 4 h #xFFFFFF)
       (list w h))))
+
+;;; ---------------------------------------------------------------------------
+;;; The console
+
+(defun %fbc-cols () (mem-ref #x1B080 :u32))
+(defun %fbc-rows () (mem-ref #x1B084 :u32))
+(defun %fbc-x () (mem-ref #x1B088 :u32))
+(defun %fbc-y () (mem-ref #x1B08C :u32))
+(defun %fbc-set-xy (x y) (setf (mem-ref #x1B088 :u32) x (mem-ref #x1B08C :u32) y))
+
+(defun %fbc-init ()
+  "The BIOS font, an empty grid, a black screen."
+  (when (%pcbios-int #x10 #x1130 #x0600 0 0 0 0 0)
+    (let ((src (+ (* (logand (%pcbios-out 36) #xFFFF) 16) (logand (%pcbios-out 28) #xFFFF)))
+          (i 0))
+      (loop (when (>= i 4096) (return nil))
+        (setf (mem-ref (+ #x24800 i) :u8) (mem-ref (+ src i) :u8))
+        (setq i (+ i 1)))))
+  (let ((cols (min 240 (floor (vbe-width) 8))) (rows (min 75 (floor (vbe-height) 16))) (i 0))
+    (setf (mem-ref #x1B080 :u32) cols (mem-ref #x1B084 :u32) rows)
+    (loop (when (>= i (* cols rows)) (return nil))
+      (setf (mem-ref (+ #x25800 i) :u8) 32)
+      (setq i (+ i 1)))
+    (%fbc-set-xy 0 0)
+    (vbe-fill 0 0 (vbe-width) (vbe-height) 0)
+    (%fbc-cursor t)))
+
+(defun %fbc-glyph (col row code)
+  "Cell (COL, ROW) drawn as CODE, light grey on black, 8 x 16."
+  (let* ((pitch (vbe-pitch)) (font (+ #x24800 (* (logand code #xFF) 16)))
+         (line (+ (vbe-base) (* row 16 pitch) (* col 32))) (r 0))
+    (loop (when (>= r 16) (return nil))
+      (let ((bits (mem-ref (+ font r) :u8)) (p line) (m 128))
+        (loop (when (zerop m) (return nil))
+          (setf (mem-ref p :u32) (if (zerop (logand bits m)) 0 #xC0C0C0))
+          (setq p (+ p 4) m (ash m -1))))
+      (setq line (+ line pitch) r (+ r 1)))))
+
+(defun %fbc-cursor (on)
+  "The cursor: a bar under the cell at the cursor (ON), or the cell as it is."
+  (let ((x (%fbc-x)) (y (%fbc-y)))
+    (when (and (< x (%fbc-cols)) (< y (%fbc-rows)))
+      (%fbc-glyph x y (mem-ref (+ #x25800 (* y (%fbc-cols)) x) :u8))
+      (when on (vbe-fill (* x 8) (+ (* y 16) 14) 8 2 #xC0C0C0)))))
+
+(defun %fbc-redraw ()
+  (let ((cols (%fbc-cols)) (rows (%fbc-rows)) (y 0))
+    (loop (when (>= y rows) (return nil))
+      (let ((x 0))
+        (loop (when (>= x cols) (return nil))
+          (%fbc-glyph x y (mem-ref (+ #x25800 (* y cols) x) :u8))
+          (setq x (+ x 1))))
+      (setq y (+ y 1)))))
+
+(defun %fbc-scroll (n)
+  "The grid up N rows, the screen redrawn from it."
+  (let* ((cols (%fbc-cols)) (rows (%fbc-rows)) (keep (* (- rows n) cols)) (i 0))
+    (loop (when (>= i keep) (return nil))
+      (setf (mem-ref (+ #x25800 i) :u8) (mem-ref (+ #x25800 i (* n cols)) :u8))
+      (setq i (+ i 1)))
+    (loop (when (>= i (* rows cols)) (return nil))
+      (setf (mem-ref (+ #x25800 i) :u8) 32)
+      (setq i (+ i 1)))
+    (%fbc-redraw)))
+
+(defun %fbc-newline ()
+  (let ((y (+ (%fbc-y) 1)) (rows (%fbc-rows)))
+    (when (>= y rows)
+      (let ((n (max 1 (floor rows 3))))
+        (%fbc-scroll n)
+        (setq y (- y n))))
+    (%fbc-set-xy 0 y)))
+
+(defun %fb-console-char (code)
+  "pc-console's seam: CODE on the framebuffer console."
+  (%fbc-cursor nil)
+  (cond ((= code 10) (%fbc-newline))
+        ((= code 13) (%fbc-set-xy 0 (%fbc-y)))
+        ((= code 8) (when (> (%fbc-x) 0) (%fbc-set-xy (- (%fbc-x) 1) (%fbc-y))))
+        ((>= code 32)
+         (let ((x (%fbc-x)) (y (%fbc-y)))
+           (setf (mem-ref (+ #x25800 (* y (%fbc-cols)) x) :u8) (if (< code 256) code 63))
+           (%fbc-glyph x y code)
+           (if (>= (+ x 1) (%fbc-cols)) (%fbc-newline) (%fbc-set-xy (+ x 1) y)))))
+  (%fbc-cursor t)
+  code)

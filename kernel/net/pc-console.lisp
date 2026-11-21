@@ -211,11 +211,16 @@
         (setq j (+ j 8))))
     (fb-set-cursor-x 0) (fb-set-cursor-y 0)))
 
+;; A seam: the character on a graphics framebuffer the image set up itself
+;; (net/pc-vbe.lisp, bare i386); nothing where there is none.
+(declaim (overridable %fb-console-char))
+(defun %fb-console-char (code) code nil)
+
 (defun %console-write-char (code)
   ;; The write-char-serial hook: COM1 always, then the screens.
   (write-char-serial code)
   ;; not once a VBE graphics mode is set (pc-vbe.lisp's #x1B078): text memory is no longer the screen
-  (unless (= (mem-ref #x1B078 :u32) 1) (vga-write-char code))
+  (if (= (mem-ref #x1B078 :u32) 1) (%fb-console-char code) (vga-write-char code))
   (when (fb-on-p) (fb-write-char code)))
 
 (defun %console-read-char ()
