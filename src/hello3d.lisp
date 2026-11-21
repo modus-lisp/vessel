@@ -5,6 +5,7 @@
 ;;;;   a ring of turning cubes round a bobbing one, on a checkered floor, lit from one side, fading into the dusk
 ;;;;   W A S D  move   Q E (or Shift Space)  down and up   the arrows  turn
 ;;;;   click     look around with the mouse (the pointer is held)     Esc  let the pointer go
+;;;;   a game controller: the left stick moves, the right looks, the triggers lift and lower, A turns spin on and off
 ;;;;   the native controls: the frame rate, spin on or off, and how fast
 ;;;;
 ;;;; Its own app, not the desk's: kiln's boot/hello3d-world.lisp loads it and `kiln mac --app=hello3d' builds it.
@@ -187,7 +188,9 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (eye (list 0.0 1.6 9.0)) (yaw 0.0) (pitch -0.08)
   (held (make-hash-table)) (locked nil)
   (spin t) (speed 1.0) (angle 0.0)
-  fps-label (frames 0) (fps-at 0))
+  fps-label (frames 0) (fps-at 0)
+  ;; a game controller: its state, read each frame (gamepad.lisp); A as it was, to see it pressed; the HUD's line
+  (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1))
 
 (defun hue (h)
   "A bright colour at hue H (0..1), as a tint."
@@ -213,6 +216,22 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     (when (key-down-p g #xff53) (decf (game-yaw g) turn))                      ; right
     (when (key-down-p g #xff52) (incf (game-pitch g) turn))                    ; up
     (when (key-down-p g #xff54) (decf (game-pitch g) turn))                    ; down
+    ;; A GAME CONTROLLER, the first one: the left stick moves (as WASD, and by how far it is pushed), the right
+    ;; looks, the triggers lift and lower
+    (when (kiln-pad:pad-read 0 (game-pad g))
+      (let* ((p (game-pad g))
+             (mx (kiln-pad:pad-axis p :left-x)) (my (kiln-pad:pad-axis p :left-y)))
+        (incf dx (+ (* mx rx) (* my fx)))
+        (incf dz (+ (* mx rz) (* my fz)))
+        (incf dy (- (kiln-pad:pad-axis p :right-trigger) (kiln-pad:pad-axis p :left-trigger)))
+        (decf (game-yaw g) (* 2.2 dt (kiln-pad:pad-axis p :right-x)))
+        (incf (game-pitch g) (* 1.6 dt (kiln-pad:pad-axis p :right-y)))
+        ;; A, pressed (not held): spin on or off, and a short buzz to say so
+        (let ((a (kiln-pad:pad-button p :a)))
+          (when (and a (not (game-pad-a g)))
+            (setf (game-spin g) (not (game-spin g)))
+            (kiln-pad:pad-rumble 0 0.5 80))
+          (setf (game-pad-a g) a))))
     (setf (game-pitch g) (max -1.45 (min 1.45 (game-pitch g))))
     (destructuring-bind (x y z) (game-eye g)
       (setf (game-eye g) (list (+ x (* step dx)) (max 0.3 (+ y (* step dy))) (+ z (* step dz)))))))
@@ -282,6 +301,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (kiln-swift:ui-label "Hello, world" 20 16 300 30)
   (setf (game-fps-label g) (kiln-swift:ui-label "" 20 46 300 22))
   (kiln-swift:ui-label "click: look around   Esc: let go   WASD, QE: move   arrows: turn" 20 70 600 22)
+  (setf (game-pad-label g) (kiln-swift:ui-label "" 20 140 600 22))
   (let ((spin (kiln-swift:ui-button "spin: on" 20 100 110 32))
         (speed (kiln-swift:ui-slider 50 140 104 200 24)))
     (kiln-swift:on-tap spin (lambda (value h)
@@ -332,4 +352,14 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
           (when (>= since 0.5)
             (kiln-swift:ui-set-text (game-fps-label g)
                                     (format nil "~D frames a second" (round (game-frames g) since)))
+            ;; the controller: said when one comes or goes, and its light the middle cube's colour
+            (let ((n (kiln-pad:pad-count)))
+              (unless (= n (game-pad-seen g))
+                (setf (game-pad-seen g) n)
+                (kiln-swift:ui-set-text (game-pad-label g)
+                                        (if (plusp n)
+                                            (format nil "controller: ~A -- sticks move and look, triggers lift, A spins"
+                                                    (kiln-pad:pad-name 0))
+                                            "no controller (pair one in Bluetooth settings)"))
+                (when (plusp n) (kiln-pad:pad-light 0 #xffd98c))))
             (setf (game-frames g) 0 (game-fps-at g) now)))))))
