@@ -900,6 +900,11 @@
                                   :root mdir :mixer mixer)))
          (desk (%kiln-make-desk (glass:make-framebuffer (* dw dens) (* dh dens)))))
     (declare (ignorable _))
+    ;; NOW PLAYING: Media's player shown where the system shows what plays, and driven by the media keys
+    ;; (vessel's now-playing.lisp, where the world has it)
+    (let ((follow (and (find-package "KILN-MEDIA") (find-symbol "FOLLOW-PLAYER" "KILN-MEDIA"))))
+      (when (and lib follow (fboundp follow))
+        (funcall follow (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib))))
     (setf *kiln-desk* desk)
     (when hidpi
       ;; the window manager's chrome and units in points at this density; a screen this many
