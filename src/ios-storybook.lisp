@@ -655,7 +655,127 @@
         (cons "fonts" '%story-fonts)
         (cons "keys" '%story-keys)
         (cons "gpu" '%story-gpu)
-        (cons "speech" '%story-speech)))
+        (cons "speech" '%story-speech)
+        (cons "camera" '%story-camera)))
+
+;; the ninth page: sound
+(defparameter *stories-9*
+  (list (cons "mic" '%story-microphone)))
+
+;;; ---- the microphone -----------------------------------------------------------------------------------------
+
+(defvar *mic-on* nil "True while the microphone story is capturing.")
+(defvar *mic-labels* nil "The story's state label, its level bar, and what Lisp made of the samples.")
+(defvar *mic-total* 0)
+
+(defun %mic-tick ()
+  "A frame hook: the microphone story drains the samples each frame -- they reach Lisp -- and shows its own measure of
+   them (their RMS and peak, computed here) beside the host's level.  Off the story, the microphone goes off."
+  (when *mic-on*
+    (if (not (equal *story-name* "mic"))
+        (progn (kiln-mic:mic-stop) (setf *mic-on* nil))
+        (destructuring-bind (status bar heard) *mic-labels*
+          (multiple-value-bind (buf n) (kiln-mic:mic-read)
+            (when (plusp n)
+              (incf *mic-total* n)
+              (let ((sum 0) (peak 0))
+                (dotimes (i n)
+                  (let ((s (aref buf i)))
+                    (incf sum (* s s))
+                    (setf peak (max peak (abs s)))))
+                (let ((rms (/ (sqrt (/ sum n)) 32768.0)))
+                  (kiln-swift:ui-set-value bar (min 100 (round (* 400 rms))))   ; speech is a quarter of full scale
+                  (kiln-swift:ui-set-text heard (format nil "~D samples read; RMS ~,3F, peak ~D, dropped ~D"
+                                                        *mic-total* rms peak (kiln-mic:mic-dropped)))))))
+          (kiln-swift:ui-set-text status (format nil "microphone: ~(~A~)" (kiln-mic:mic-state)))))))
+
+(defun %story-microphone ()
+  "The microphone's own samples, 48 kHz mono 16-bit, read by Lisp each frame: a level, measured in Lisp."
+  (let* ((status (kiln-swift:ui-label "microphone: off" 24 200 350 30))
+         (bar (kiln-swift:ui-progress 0 24 240 350 20))
+         (heard (kiln-swift:ui-label "nothing read yet" 24 272 560 30))
+         (button (kiln-swift:ui-button "start" 24 312 100 36)))
+    (setf *mic-labels* (list status bar heard) *mic-total* 0)
+    (pushnew '%mic-tick cl-user::*kiln-frame-hooks*)
+    (kiln-swift:on-tap button
+                       (lambda (value h)
+                         (declare (ignore value h))
+                         (if *mic-on*
+                             (progn (kiln-mic:mic-stop) (setf *mic-on* nil)
+                                    (kiln-swift:ui-set-text status "microphone: off")
+                                    (kiln-swift:ui-set-text button "start"))
+                             (progn (kiln-mic:mic-start 48000) (setf *mic-on* t)
+                                    (kiln-swift:ui-set-text button "stop")))))
+    (list status bar heard button)))
+
+;;; ---- the camera ---------------------------------------------------------------------------------------------
+
+(defvar *camera* nil "The camera story's camera, while the story is on show.")
+(defvar *camera-frames-label* nil)
+(defvar *camera-frames* 0)
+(defvar *camera-tick* 0)
+
+(defun %camera-tick ()
+  "A frame hook: every fifteenth frame, the camera story reads the latest camera frame -- the frames reach Lisp --
+   and says how many, how big, and the colour of its middle pixel.  Off the story, the camera goes off."
+  (when *camera*
+    (if (not (equal *story-name* "camera"))
+        (progn (kiln-camera:camera-close *camera*) (setf *camera* nil))
+        (when (zerop (mod (incf *camera-tick*) 15))
+          (multiple-value-bind (bytes w h) (kiln-camera:camera-frame *camera*)
+            (when bytes
+              (let ((at (* 4 (+ (* (floor h 2) w) (floor w 2)))))
+                (kiln-swift:ui-set-text *camera-frames-label*
+                                        (format nil "frames read: ~D, ~Dx~D, middle #~2,'0X~2,'0X~2,'0X"
+                                                (incf *camera-frames*) w h
+                                                (aref bytes (+ at 2)) (aref bytes (+ at 1)) (aref bytes at))))))))))
+
+(defun %story-camera ()
+  "The camera: a live preview; its frames, read by Lisp; a photo and a video, into the app's own folder."
+  (when *camera* (kiln-camera:camera-close *camera*))
+  (let* ((cam (kiln-camera:camera-open 0))
+         (status (kiln-swift:ui-label (if cam "camera: asking" "no camera") 24 200 350 30))
+         (preview (and cam (kiln-camera:camera-preview cam 24 236 320 180)))
+         (frames (kiln-swift:ui-label "frames read: none yet" 24 424 560 30))
+         (photo (kiln-swift:ui-button "photo" 24 462 100 36))
+         (record (kiln-swift:ui-button "record" 134 462 100 36))
+         (saved (kiln-swift:ui-label "" 24 506 350 60))
+         (folder (kiln-camera:camera-folder))
+         (recording nil))
+    (setf *camera* cam *camera-frames-label* frames *camera-frames* 0)
+    (pushnew '%camera-tick cl-user::*kiln-frame-hooks*)
+    (when cam
+      (kiln-swift:on-event :camera cam
+                           (lambda (value h)
+                             (declare (ignore h))
+                             (kiln-swift:ui-set-text status (if (eql value 1) "camera: on" "camera: not allowed"))))
+      (kiln-swift:on-tap photo
+                         (lambda (value h)
+                           (declare (ignore value h))
+                           (kiln-camera:camera-photo cam (concatenate 'string folder "/storybook-photo.jpg"))))
+      (kiln-swift:on-event :photo cam
+                           (lambda (value h)
+                             (declare (ignore h))
+                             (kiln-swift:ui-set-text saved (if (equal value "") "photo: failed"
+                                                               (format nil "photo: ~A" value)))))
+      (kiln-swift:on-tap record
+                         (lambda (value h)
+                           (declare (ignore value h))
+                           (if recording
+                               (progn (kiln-camera:camera-stop cam) (kiln-swift:ui-set-text record "record"))
+                               (progn (kiln-camera:camera-record cam (concatenate 'string folder "/storybook-video.mov"))
+                                      (kiln-swift:ui-set-text record "stop")))
+                           (setf recording (not recording))))
+      (kiln-swift:on-event :recording cam
+                           (lambda (value h)
+                             (declare (ignore value h))
+                             (kiln-swift:ui-set-text saved "video: recording")))
+      (kiln-swift:on-event :recorded cam
+                           (lambda (value h)
+                             (declare (ignore h))
+                             (kiln-swift:ui-set-text saved (if (equal value "") "video: failed"
+                                                               (format nil "video: ~A" value))))))
+    (remove nil (list status preview frames photo record saved))))
 
 (defun %story-speech ()
   "The phone's own voice and ear, end to end and without a microphone: say a sentence into a file
@@ -1017,7 +1137,8 @@ fragment float4 spin_fragment(V in [[stage_in]]) { return in.colour; }
         (cons "tabctl" #'%story-tabctl)
         (cons "navctl" #'%story-navctl)))
 
-(defparameter *pages* (list *stories* *stories-2* *stories-3* *stories-4* *stories-5* *stories-6* *stories-7* *stories-8*))
+(defparameter *pages* (list *stories* *stories-2* *stories-3* *stories-4* *stories-5* *stories-6* *stories-7* *stories-8*
+                            *stories-9*))
 
 ;;; ---- the storybook ------------------------------------------------------------------------------
 
@@ -1055,8 +1176,9 @@ fragment float4 spin_fragment(V in [[stage_in]]) { return in.colour; }
   (setf *story-buttons* (%shelf-stories (%page-stories page)))
   (%show (car (first (%page-stories page)))))
 
-(defun storybook ()
-  "Open the storybook (closing any open one first)."
+(defun storybook (&optional story)
+  "Open the storybook (closing any open one first): at the first page, or at the page of the story named STORY,
+   showing it."
   (close-storybook)
   ;; the storybook covers the desk, whose Terminal (the Actions grid opens one) keeps the keyboard up
   (kiln-swift:ui-resign)
@@ -1072,7 +1194,11 @@ fragment float4 spin_fragment(V in [[stage_in]]) { return in.colour; }
     (let ((closer (kiln-swift:ui-button "close" 290 60 90 36)))
       (push closer *shelf*)
       (kiln-swift:on-tap closer (lambda (value h) (declare (ignore value h)) (close-storybook))))
-    (%show-page 1)
+    (let ((page (or (and story (position-if (lambda (stories) (assoc story stories :test #'string=)) *pages*))
+                    0)))
+      (%show-page (1+ page))
+      (when (and story (assoc story (%page-stories (1+ page)) :test #'string=))
+        (%show story)))
     :storybook))
 
 (defun close-storybook ()
