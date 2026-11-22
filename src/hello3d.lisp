@@ -187,8 +187,8 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
 
 (defun nose-lines ()
   "A nose, and two eyes: which way the head faces."
-  (floats 0 -0.05 -0.84  0 -0.3 -1.55
-          0 -0.3 -1.55   0 -0.42 -0.8
+  (floats 0 0.0 -0.84    0 -0.15 -1.6
+          0 -0.15 -1.6   0 -0.35 -0.8
           -0.3 0.18 -0.78  -0.18 0.18 -0.82
           0.3 0.18 -0.78   0.18 0.18 -0.82))
 
@@ -416,11 +416,12 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
       (kiln-sound:spatial-head-attitude)))
 
 (defun draw-head (pass g w h)
-  "The listener's head, turned as the headphones say, seen from behind and above it, in the view's lower right."
+  "The listener's head, turned as the headphones say, seen as from just behind and above it -- its nose points into
+   the screen while you face the screen -- in the view's lower right."
   (multiple-value-bind (yaw pitch roll) (head-attitude g)
     (when (and yaw (game-line-pipeline g))
       (let* ((model (mat* (rotation-y yaw) (mat* (rotation-x pitch) (rotation-z (- roll)))))
-             (view (mat* (translation 0 0 -4.4) (mat* (rotation-x 0.3) (rotation-y -1.0))))
+             (view (mat* (translation 0 -0.2 -4.6) (rotation-x 0.5)))     ; from behind and above: your own head
              (transform (mat* (corner 0.3 0.72 -0.6) (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view model))))
              ;; 2.5 points wide: the half-width in pixels, then half the view
              (params (list (* 1.25 (game-scale g)) (/ w 2.0) (/ h 2.0) 0)))
@@ -628,6 +629,8 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
       (kiln-mac:menu-check bg (game-background-sound g)))
     (when (game-spatial g)
       (push (kiln-mac:menu-item m "Follow Your Head" (lambda () (toggle-head g))) (game-head-items g)))
+    (when (game-spatial g)
+      (kiln-mac:menu-item m "Recenter Head" (lambda () (kiln-sound:spatial-head-recenter)) :key "r"))
     (kiln-mac:menu-separator m)
     (kiln-mac:menu-item m "Faster" (lambda () (set-speed g (* (game-speed g) 1.25))) :key "=")
     (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-")

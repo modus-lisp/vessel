@@ -32,7 +32,7 @@
   (:export #:sound-open #:tone #:pluck #:play #:voice-set #:voice-stop #:sound-pump #:place #:*rate* #:*cushion*
            #:*master*
            #:spatial-open #:spatial-voice #:spatial-place #:spatial-listener #:spatial-stop #:spatial-volume
-           #:spatial-head #:spatial-head-permission #:spatial-head-attitude))
+           #:spatial-head #:spatial-head-permission #:spatial-head-attitude #:spatial-head-recenter))
 
 (in-package #:kiln-sound)
 
@@ -214,3 +214,7 @@
    following began, positive turning left; pitch positive looking up -- or NIL when nothing is following it."
   (when (eql 1 (%call "spatial_head_attitude" (%addr *attitude*)))
     (values (aref *attitude* 0) (aref *attitude* 1) (aref *attitude* 2))))
+
+(defun spatial-head-recenter ()
+  "Where the head faces now is ahead."
+  (%call "spatial_head_recenter"))
