@@ -302,6 +302,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   map-window map-view map-arrow (map-shown nil)
   ;; the field of view, which a trackpad's pinch narrows and widens (radians)
   (fov (/ pi 3))
+  ;; THE LIGHT, the way it travels (toward the ground): a fixed afternoon, or the real sun's from where you are
+  (light (list -0.5 -1.0 -0.35)) sun-label
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -501,7 +503,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   "The map window: made the first time, shown after."
   (if (game-map-window g)
       (kiln-mac:window-show (game-map-window g))
-      (let ((win (kiln-mac:new-window "Map" 360 360)))
+      (let ((win (kiln-mac:new-window "Map" 300 300 :palette t)))
         (setf (game-map-window g) win
               (game-map-view g) (kiln-gpu:gpu-view 0 0 0 0)
               (game-map-arrow g) (kiln-gpu:gpu-buffer (* 4 18)))
@@ -659,7 +661,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
       (let* ((projection (perspective (game-fov g) (/ w h) 0.1 120.0))
              (view (look (game-eye g) (game-yaw g) (game-pitch g)))
              (frame (floats (mat* projection view)
-                            -0.5 -1.0 -0.35 0.0
+                            (first (game-light g)) (second (game-light g)) (third (game-light g)) 0.0
                             (first (game-eye g)) (second (game-eye g)) (third (game-eye g)) 1.0
                             18.0 60.0 0.0 0.0
                             (/ (ldb (byte 8 16) *dusk*) 255.0) (/ (ldb (byte 8 8) *dusk*) 255.0)
@@ -840,6 +842,53 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (setf kiln-sound:*master* (if heard 1.0 0.0))
     (when (game-spatial g) (kiln-sound:spatial-volume (if heard 1.0 0.0)))))
 
+(defun compass (azimuth)
+  (aref #("north" "north-east" "east" "south-east" "south" "south-west" "west" "north-west")
+        (mod (round azimuth 45) 8)))
+
+(defun light-from-sun (g)
+  "The light from where the sun is now, seen from where you are: asked for once, said first what for."
+  (flet ((go-on ()
+           (kiln-location:location-start)
+           ;; the first fix comes a moment later: looked for each frame until it does (SUN-TICK)
+           (setf (game-sun-label g) (or (game-sun-label g) :waiting))))
+    (case (kiln-location:location-permission)
+      (:allowed (go-on))
+      (:refused (let ((alert (kiln-swift:ui-alert "Location is off"
+                                                  "To light the scene from your sun, allow Hello 3D in System Settings > Privacy & Security > Location Services.")))
+                  (kiln-swift:ui-alert-action alert "OK")
+                  (kiln-swift:ui-alert-present alert)))
+      (t (let ((alert (kiln-swift:ui-alert "Light from your sun?"
+                                           "Hello 3D can light the scene from where the sun is in your sky right now. Next, you'll be asked to share your location.")))
+           (kiln-swift:ui-alert-action alert "Not Now")
+           (kiln-swift:ui-alert-action alert "Continue")
+           (kiln-swift:on-event :alert alert
+                                (lambda (index h)
+                                  (declare (ignore h))
+                                  (when (eql index 1)
+                                    (kiln-location:location-ask (lambda (ok) (when ok (go-on)))))))
+           (kiln-swift:ui-alert-present alert))))))
+
+(defun sun-tick (g)
+  "Waiting for a fix: when it comes, the light from the sun, and the fixes stopped (one is enough)."
+  (when (eq (game-sun-label g) :waiting)
+    (multiple-value-bind (lat lon) (kiln-location:location)
+      (when lat
+        (kiln-location:location-stop)
+        (multiple-value-bind (el az) (kiln-location:sun-position lat lon)
+          ;; toward the sun: north -Z, east +X, up +Y; the light travels the other way.  Below the horizon, a
+          ;; low light from where it will rise or set, so the cubes still show
+          (let* ((e (* (max el 4.0) (/ pi 180))) (a (* az (/ pi 180)))
+                 (to-sun (list (* (cos e) (sin a)) (sin e) (- (* (cos e) (cos a))))))
+            (setf (game-light g) (mapcar #'- to-sun))
+            (setf (game-sun-label g) t)
+            (format t "~&hello3d: the sun from ~,2F ~,2F: ~,1F degrees up, ~,0F (~A)~%" lat lon el az (compass az))
+            (finish-output)
+            (kiln-swift:ui-set-text (game-pad-label g)
+                                    (if (> el 0)
+                                        (format nil "the sun: ~D degrees up, ~A" (round el) (compass az))
+                                        (format nil "the sun is down (~D degrees), ~A" (round el) (compass az))))))))))
+
 (defun make-menus (g)
   "A Mac's menus: Game in the menu bar -- spin, sound, following the head, faster, slower -- and a status item with
    the frame rate, whose menu has spin and sound.  The check marks follow the toggles wherever they are changed."
@@ -866,7 +915,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (kiln-mac:menu-item m "Remind Me in 10 Seconds" (lambda () (remind g)))
     (kiln-mac:menu-item m "Flip the Cubes" (lambda () (flip g)) :key "f")
     (kiln-mac:menu-separator m)
-    (kiln-mac:menu-item m "Show Map" (lambda () (open-map g))))
+    (kiln-mac:menu-item m "Show Map" (lambda () (open-map g)))
+    (kiln-mac:menu-item m "Light from the Sun" (lambda () (light-from-sun g))))
   (let ((sm (kiln-mac:menu "Hello 3D" :in-bar nil)))
     (push (kiln-mac:menu-item sm "Spin" (lambda () (set-spin g (not (game-spin g))))) (game-spin-items g))
     (push (kiln-mac:menu-item sm "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
@@ -943,6 +993,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
         (steer g dt)
         (when (game-spin g) (incf (game-angle g) (* dt (game-speed g))))
         (flip-tick g)
+        (sun-tick g)
         (handler-case (hear g)
           (serious-condition (c) (format t "~&hello3d: sound: ~A~%" c)))
         (handler-case (render g)

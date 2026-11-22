@@ -35,7 +35,7 @@
 ;;;;                                   :swipe (:left :right :up :down); PHASE :began :changed :ended
 ;;;;
 ;;;; MORE WINDOWS than the one the desk (or app) is in:
-;;;;   (new-window "Map" 360 360)      a window, shown, centred: a UI handle -- KILN-SWIFT:UI-ADD puts views in it,
+;;;;   (new-window "Map" 360 360 &key palette)   a window (a floating palette), shown, centred: a UI handle -- KILN-SWIFT:UI-ADD puts views in it,
 ;;;;                                   placed from its top left; a GPU view made to fill (GPU-VIEW 0 0 0 0) fills it
 ;;;;   (window-show win)  (window-hide win)  (window-retitle win "Map: 3 cubes")
 ;;;;   (on-window-close win fn)        FN, of no arguments, when its close button is clicked (it is hidden, and can
@@ -203,10 +203,12 @@
 
 ;;; ---- more windows ---------------------------------------------------------------------------------------------------
 
-(defun new-window (title width height)
-  "A window titled TITLE, WIDTH x HEIGHT points, centred and shown: a UI handle that views are added to."
+(defun new-window (title width height &key palette)
+  "A window titled TITLE, WIDTH x HEIGHT points, centred and shown: a UI handle that views are added to.  PALETTE: a
+   floating palette -- a small-titled panel over the app's windows, hidden while another app is in front, leaving
+   the keys with the main window."
   (let ((b (%bytes title)))
-    (kiln-swift:swift-call "window_new" (kiln-swift::%addr b) (length b) width height)))
+    (kiln-swift:swift-call "window_new" (kiln-swift::%addr b) (length b) width height (if palette 1 0))))
 
 (defun window-show (win) (kiln-swift:swift-call "window_show" win))
 (defun window-hide (win) (kiln-swift:swift-call "window_hide" win))
