@@ -26,6 +26,15 @@
 ;;;;                                   it opens MENU when clicked, or calls FN
 ;;;;   (status-title item "120 fps")
 ;;;;
+;;;; THE APP'S OWN EVENTS AND THE DOCK:
+;;;;   (on-open fn)                    FN gets each file's path or link opened with the app: Finder's Open With
+;;;;                                   (kiln mac --opens=UTIS), `open', the app's URL scheme (--url-scheme=NAME)
+;;;;   (on-drop fn)                    FN gets each file's path dropped on the window
+;;;;   (on-app-state fn)               FN gets :active :inactive :hidden or :shown as the app becomes so
+;;;;   (on-quit fn)                    FN is called when the app is about to quit; the app waits for it to return
+;;;;                                   (five seconds at most), then quits
+;;;;   (dock-badge "3")  (dock-badge nil)   (dock-bounce &optional critical)
+;;;;
 ;;;; With :transparent and :none the bar covers the top of the content.  The window host reports how much as the top
 ;;;; of the safe area and sends a resize, so the desk (which lays itself out in the safe area) keeps clear of it.
 
@@ -34,7 +43,8 @@
   (:export #:window-title #:window-chrome #:window-size #:window-min-size #:window-fullscreen #:window-remember
            #:window-pointer-lock
            #:glass-panel #:glass-button #:menu #:menu-item #:menu-separator #:menu-check #:menu-enable
-           #:status-item #:status-title))
+           #:status-item #:status-title
+           #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce))
 
 (in-package #:kiln-mac)
 
@@ -129,3 +139,38 @@
 (defun status-title (item title)
   (let ((b (%bytes title)))
     (kiln-swift:swift-call "status_item_title" item (kiln-swift::%addr b) (length b))))
+
+;;; ---- the app's own events, and the Dock ---------------------------------------------------------------------------
+
+(defun on-open (fn)
+  "FN, of one argument, gets each file's path, or link, opened with the app."
+  (kiln-swift:on-event :opened 0 (lambda (what h) (declare (ignore h)) (funcall fn what))))
+
+(defun on-drop (fn)
+  "FN, of one argument, gets each file's path dropped on the window."
+  (kiln-swift:on-event :dropped 0 (lambda (what h) (declare (ignore h)) (funcall fn what))))
+
+(defun on-app-state (fn)
+  "FN, of one argument, gets :ACTIVE :INACTIVE :HIDDEN or :SHOWN as the app becomes so."
+  (kiln-swift:on-event :appstate 0
+                       (lambda (state h)
+                         (declare (ignore h))
+                         (funcall fn (cond ((equal state "active") :active) ((equal state "inactive") :inactive)
+                                           ((equal state "hidden") :hidden) (t :shown))))))
+
+(defun on-quit (fn)
+  "FN, of no arguments, is called when the app is about to quit; the app quits when it returns (or five seconds on)."
+  (kiln-swift:swift-call "mac_on_quit" 1)
+  (kiln-swift:on-event :quit 0 (lambda (value h)
+                                 (declare (ignore value h))
+                                 (unwind-protect (ignore-errors (funcall fn))
+                                   (kiln-swift:swift-call "mac_quit_reply")))))
+
+(defun dock-badge (text)
+  "TEXT on the Dock icon's badge; NIL clears it."
+  (let ((b (%bytes (if text (princ-to-string text) ""))))
+    (kiln-swift:swift-call "dock_badge" (kiln-swift::%addr b) (length b))))
+
+(defun dock-bounce (&optional critical)
+  "The Dock icon bounces once -- until the app is active, if CRITICAL."
+  (kiln-swift:swift-call "dock_bounce" (if critical 1 0)))

@@ -470,7 +470,14 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     (setf (game-status g) (kiln-mac:status-item :symbol "cube.fill" :title "" :menu sm)))
   (set-spin g (game-spin g))
   (set-sound g (game-sound g))
-  (dolist (i (game-head-items g)) (kiln-mac:menu-check i (game-head g))))
+  (dolist (i (game-head-items g)) (kiln-mac:menu-check i (game-head g)))
+  ;; THE HUMS GO QUIET while the app is in the background, and come back with it (as sound is set, not forced on)
+  (kiln-mac:on-app-state (lambda (state)
+                           (let ((heard (and (game-sound g) (member state '(:active :shown)))))
+                             (format t "~&hello3d: ~(~A~)~%" state) (finish-output)
+                             (setf kiln-sound:*master* (if heard 1.0 0.0))
+                             (when (game-spatial g) (kiln-sound:spatial-volume (if heard 1.0 0.0))))))
+  (kiln-mac:on-quit (lambda () (format t "~&hello3d: quitting~%") (finish-output))))
 
 (defun start (&key touch)
   "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
