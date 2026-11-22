@@ -167,4 +167,7 @@
                 (glass-term:terminal-take-dirty tm))
               nil
               (lambda () (when remote (ignore-errors (funcall (%kiln-c "DISCONNECT") (first remote)))))
+              ;; the RESIZE-FN: re-grid to the new size.  (This slot held the T meant for TEXT-P, one
+              ;; on: every resize called T and failed, and the window kept its first size.)
+              (lambda (w h) (glass-term:resize-terminal-px tm w h))
               t))))

@@ -38,6 +38,24 @@ modus and not in kiln.
 | `src/zero-rfb.lisp`, `src/zero-rfbs.lisp` | the desk as an RFB server, over the gateway link or the board's sockets |
 | `src/zero-gateway.lisp` | the nostr gateway on the board |
 
+**A 68k Macintosh** (68020 and up, 8 MB), bare metal, booting modus from two floppies:
+
+| file | what it is |
+|---|---|
+| `kernel/mvm/mac68k-files.lisp` | the `FLOPPY` package: mount, dir, read, write, load files on a FAT12 floppy (over fs-fat) |
+| `kernel/mvm/mac68k-disk-io.lisp` | the image's side of the Mac disk service (read or write a drive, select one) |
+| `kernel/scripts/mac68k-bootblocks.s` | the boot blocks: the memory check, then the launch record's read |
+| `kernel/scripts/mac68k-unlzma.s`, `mac68k-lzma.inc` | the floppy loader and its raw LZMA1 decoder (`test/mac68k-unlzma/run.sh` checks it against xz and cram) |
+| `kernel/scripts/mac68k-lzdisk.s` | the driver that serves the core disk's cold code from 64 KB LZMA blocks on disk 2 |
+| `kernel/scripts/mac68k-disk2.s` | "insert disk 2", for a Mac with one drive |
+| `kernel/scripts/mac68k-scsi.s`, `mac68k-chain.s` | the hard-disk boot, and the relocating loader of modus as a Mac OS application |
+| `tools/mac68k/` | the workbench: `period-lisps/` boots MCL 2.0, Pearl Lisp and Modus on MAME's Macs and types forms at them (System 6 / 7.5.3 volumes built with fs-apple's HFS); `prof/` reads MAME's profiles; `mame-run.sh` drives the REPL by its screen.  Its README says how the emulators were set up |
+
+`kernel/` is at the paths modus's builds name them by (`kernel/mvm/mac68k-files.lisp` is
+modus's `"mvm/mac68k-files.lisp"`); modus's Mac disk scripts assemble the `.s` files from
+here.  The image itself -- `boot/boot-mac68k.lisp`, the 68k translator's cold code,
+`mvm/mac68k-cold.lisp` -- stays in modus: it changes with the compiler.
+
 kiln assembles images from these and never carries what goes into one: the container clones
 vessel at its `repos.lock` pin and loads `src/one.lisp`; `kiln ios` / `kiln android` load
 `src/app.lisp` and the platform file into the world they snapshot; `kiln zero` builds a card from these at the commit `repos.lock` pins (or from a workspace

@@ -1,0 +1,899 @@
+;;;; hello3d.lisp -- hello, world, in 3D: a small scene the GPU draws every frame, flown through with the keyboard and
+;;;; the mouse, with the platform's own controls over it.  Everything is Lisp: the geometry, the textures (made
+;;;; here, pixel by pixel), the matrices, the frame loop; Metal draws it (gpu.lisp, through modus's GPU.swift).
+;;;;
+;;;;   a ring of turning cubes round a bobbing one, on a checkered floor, lit from one side, fading into the dusk
+;;;;   W A S D  move   Q E (or Shift Space)  down and up   the arrows  turn
+;;;;   click     look around with the mouse (the pointer is held)     Esc  let the pointer go
+;;;;   a game controller: the left stick moves, the right looks, the triggers lift and lower, A turns spin on and off
+;;;;   on a phone (MAIN :TOUCH T): the left thumb a stick where it lands, the right thumb drags the view
+;;;;   and every cube hums its own note, placed where it is: in 3D through the platform's binaural renderer (with
+;;;;   AirPods, still in the world as your head turns), or else panned left and right
+;;;;   the native controls: the frame rate, spin on or off, and how fast
+;;;;
+;;;; Its own app, not the desk's: kiln's boot/hello3d-world.lisp loads it and `kiln mac --app=hello3d' builds it.
+;;;; MAIN is the whole program: the window's events and the frame clock are read here, as the desk reads them.
+
+(defpackage #:hello3d
+  (:use #:cl)
+  (:export #:main))
+
+(in-package #:hello3d)
+
+(defun %sys (n a b c) (cl-user::%kiln-sys n a b c))
+
+;;; ---- the shader ---------------------------------------------------------------------------------------------
+
+(defparameter *shader* "
+#include <metal_stdlib>
+using namespace metal;
+
+struct Vertex { packed_float3 position; packed_float3 normal; packed_float2 uv; };
+struct Frame  { float4x4 view_projection; float4 light; float4 eye; float4 fog; float4 fog_colour; };
+struct Object { float4x4 model; float4 tint; };
+struct Out    { float4 position [[position]]; float3 normal; float2 uv; float3 world; };
+
+vertex Out world_vertex(uint id [[vertex_id]], device const Vertex *vertices [[buffer(0)]],
+                        constant Frame &frame [[buffer(1)]], constant Object &object [[buffer(2)]]) {
+    Vertex v = vertices[id];
+    float4 world = object.model * float4(float3(v.position), 1.0);
+    Out out;
+    out.position = frame.view_projection * world;
+    out.world = world.xyz;
+    out.normal = (object.model * float4(float3(v.normal), 0.0)).xyz;
+    out.uv = float2(v.uv);
+    return out;
+}
+
+fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buffer(1)]],
+                               constant Object &object [[buffer(2)]],
+                               texture2d<float> picture [[texture(0)]], sampler s [[sampler(0)]]) {
+    float3 n = normalize(in.normal);
+    float sun = max(dot(n, -normalize(frame.light.xyz)), 0.0);
+    float sky = 0.5 + 0.5 * n.y;                                   // light from above, a little from everywhere
+    float3 base = picture.sample(s, in.uv).rgb * object.tint.rgb;
+    float3 colour = base * (0.18 + 0.22 * sky + 0.75 * sun);
+    float d = distance(in.world, frame.eye.xyz);
+    float fog = clamp((d - frame.fog.x) / (frame.fog.y - frame.fog.x), 0.0, 1.0);
+    return float4(mix(colour, frame.fog_colour.rgb, fog), 1.0);
+}
+
+// lines, unlit and THICK: a wireframe in one colour (the head).  A GPU's lines are one pixel wide, so each segment
+// (a pair of points) is drawn as a quad, six vertices, widened on the screen to WIDTH pixels whatever its distance.
+// params: x the half-width in pixels, y and z half the view's size in pixels.
+// THE FAR SIDE IS FAINTER: a wireframe has no depth of its own, and a nose pointing away looks the same as one
+// pointing near.  So each point's distance, against the object's centre, dims what is behind it.
+struct Lines { float4x4 transform; float4 colour; float4 params; };
+struct LineOut { float4 position [[position]]; float near; };
+vertex LineOut line_vertex(uint id [[vertex_id]], device const packed_float3 *points [[buffer(0)]],
+                           constant Lines &lines [[buffer(2)]]) {
+    uint seg = id / 6, corner = id % 6;
+    float4 a = lines.transform * float4(float3(points[seg * 2]), 1.0);
+    float4 b = lines.transform * float4(float3(points[seg * 2 + 1]), 1.0);
+    float2 half_view = lines.params.yz;
+    float2 d = normalize(b.xy / b.w * half_view - a.xy / a.w * half_view);
+    float2 normal = float2(-d.y, d.x) * lines.params.x;
+    bool at_b = corner == 2 || corner == 4 || corner == 5;
+    float side = (corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0;
+    float4 q = at_b ? b : a;
+    float centre = (lines.transform * float4(0, 0, 0, 1)).w;
+    LineOut out;
+    out.position = float4(q.xy + normal * side / half_view * q.w, q.z, q.w);
+    out.near = clamp(0.5 + (centre - q.w) * 0.8, 0.0, 1.0);   // 1 in front of the centre, falling to 0 behind
+    return out;
+}
+fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[buffer(2)]]) {
+    return float4(lines.colour.rgb * mix(0.3, 1.0, in.near), lines.colour.a);
+}
+")
+
+;;; ---- vectors and matrices: single-floats, the matrices column-major as Metal reads them ---------------------------
+
+(deftype mat () '(simple-array single-float (16)))
+
+(defun mat () (make-array 16 :element-type 'single-float :initial-element 0.0))
+
+(defun identity-mat ()
+  (let ((m (mat))) (setf (aref m 0) 1.0 (aref m 5) 1.0 (aref m 10) 1.0 (aref m 15) 1.0) m))
+
+(defun mat* (a b)
+  "A times B: B is applied first."
+  (let ((c (mat)))
+    (dotimes (col 4 c)
+      (dotimes (row 4)
+        (let ((s 0.0))
+          (dotimes (k 4) (incf s (* (aref a (+ (* k 4) row)) (aref b (+ (* col 4) k)))))
+          (setf (aref c (+ (* col 4) row)) s))))))
+
+(defun translation (x y z)
+  (let ((m (identity-mat))) (setf (aref m 12) (float x 1.0) (aref m 13) (float y 1.0) (aref m 14) (float z 1.0)) m))
+
+(defun scaling (s)
+  (let ((m (mat)) (s (float s 1.0))) (setf (aref m 0) s (aref m 5) s (aref m 10) s (aref m 15) 1.0) m))
+
+(defun rotation-y (a)
+  (let ((m (identity-mat)) (c (float (cos a) 1.0)) (s (float (sin a) 1.0)))
+    (setf (aref m 0) c (aref m 8) s (aref m 2) (- s) (aref m 10) c) m))
+
+(defun rotation-x (a)
+  (let ((m (identity-mat)) (c (float (cos a) 1.0)) (s (float (sin a) 1.0)))
+    (setf (aref m 5) c (aref m 9) (- s) (aref m 6) s (aref m 10) c) m))
+
+(defun rotation-z (a)
+  (let ((m (identity-mat)) (c (float (cos a) 1.0)) (s (float (sin a) 1.0)))
+    (setf (aref m 0) c (aref m 4) (- s) (aref m 1) s (aref m 5) c) m))
+
+(defun perspective (fovy aspect near far)
+  "Right-handed, looking down -Z, depth 0 at NEAR to 1 at FAR (Metal's)."
+  (let ((m (mat)) (f (/ 1.0 (tan (/ fovy 2.0)))))
+    (setf (aref m 0) (float (/ f aspect) 1.0)
+          (aref m 5) (float f 1.0)
+          (aref m 10) (float (/ far (- near far)) 1.0)
+          (aref m 11) -1.0
+          (aref m 14) (float (/ (* near far) (- near far)) 1.0))
+    m))
+
+(defun look (eye yaw pitch)
+  "The view from EYE (x y z) facing YAW (about the vertical, 0 down -Z) and PITCH (up positive)."
+  (destructuring-bind (ex ey ez) eye
+    (let* ((cp (cos pitch))
+           (fx (* -1 (sin yaw) cp)) (fy (sin pitch)) (fz (* -1 (cos yaw) cp))
+           ;; right = forward x up(0 1 0), normalised; up = right x forward
+           (rx (- fz)) (rz fx) (rl (sqrt (+ (* rx rx) (* rz rz))))
+           (rx (/ rx rl)) (ry 0.0) (rz (/ rz rl))
+           (ux (- (* ry fz) (* rz fy))) (uy (- (* rz fx) (* rx fz))) (uz (- (* rx fy) (* ry fx)))
+           (m (mat)))
+      (flet ((put (i v) (setf (aref m i) (float v 1.0))))
+        (put 0 rx) (put 4 ry) (put 8 rz) (put 12 (- (+ (* rx ex) (* ry ey) (* rz ez))))
+        (put 1 ux) (put 5 uy) (put 9 uz) (put 13 (- (+ (* ux ex) (* uy ey) (* uz ez))))
+        (put 2 (- fx)) (put 6 (- fy)) (put 10 (- fz)) (put 14 (+ (* fx ex) (* fy ey) (* fz ez)))
+        (put 15 1.0))
+      m)))
+
+(defun floats (&rest parts)
+  "One single-float vector of PARTS, each a number or a vector of them."
+  (let ((out (make-array (loop for p in parts sum (if (numberp p) 1 (length p))) :element-type 'single-float))
+        (i 0))
+    (dolist (p parts out)
+      (if (numberp p)
+          (progn (setf (aref out i) (float p 1.0)) (incf i))
+          (loop for x across p do (setf (aref out i) (float x 1.0)) (incf i))))))
+
+;;; ---- geometry: position, normal, uv -- eight floats a vertex -----------------------------------------------------
+
+(defun cube-mesh ()
+  "A unit cube's 24 vertices (four a face, each face its own normal) and 36 indices, counter-clockwise outside."
+  (let ((verts '()) (indices '()) (n 0))
+    ;; each face: its normal and two axes U V with U x V = normal
+    (dolist (face '(((1 0 0) (0 0 -1) (0 1 0)) ((-1 0 0) (0 0 1) (0 1 0))
+                    ((0 1 0) (1 0 0) (0 0 -1)) ((0 -1 0) (1 0 0) (0 0 1))
+                    ((0 0 1) (1 0 0) (0 1 0)) ((0 0 -1) (-1 0 0) (0 1 0))))
+      (destructuring-bind (nrm u v) face
+        (loop for (su sv tu tv) in '((-1 -1 0 1) (1 -1 1 1) (1 1 1 0) (-1 1 0 0))
+              do (dotimes (k 3)
+                   (push (* 0.5 (+ (nth k nrm) (* su (nth k u)) (* sv (nth k v)))) verts))
+                 (dolist (x nrm) (push x verts))
+                 (push tu verts) (push tv verts))
+        (dolist (i '(0 1 2 0 2 3)) (push (+ n i) indices))
+        (incf n 4)))
+    (values (apply #'floats (nreverse verts)) (nreverse indices))))
+
+(defun egg-lines (&key (rx 0.75) (ry 1.0) (rz 0.85) (steps 48))
+  "The head as three ovals, a gizmo's: round the vertical (level), round the left-right axis (front to back, over
+   the top), round the front-back axis (side to side, over the top) -- each STEPS segments, one after another, as
+   pairs of points.  Radii RX RY RZ; it faces -Z."
+  (let ((pts '()))
+    (flet ((ring (fn)
+             (dotimes (k steps)
+               (let ((a (* 2 pi (/ k steps))) (b (* 2 pi (/ (1+ k) steps))))
+                 (setf pts (append (reverse (funcall fn b)) (reverse (funcall fn a)) pts))))))
+      (ring (lambda (t0) (list (* rx (sin t0)) 0 (- (* rz (cos t0))))))       ; level
+      (ring (lambda (t0) (list 0 (* ry (sin t0)) (- (* rz (cos t0))))))       ; front to back
+      (ring (lambda (t0) (list (* rx (sin t0)) (* ry (cos t0)) 0))))          ; side to side
+    (values (apply #'floats (nreverse pts)) steps)))
+
+(defun nose-lines ()
+  "Which way the head faces: a pointer from the front of the head well out ahead of it, with a small arrowhead -- no
+   face, whose features, seen through a wireframe from behind, read as a face looking back."
+  (floats 0 0 -0.86   0 0 -2.3
+          0 0 -2.3    0.14 0 -2.0
+          0 0 -2.3   -0.14 0 -2.0))
+
+(defun phone-lines ()
+  "The phone as it is held: a slab in the device's own axes -- x to the right of its screen, y to its top, z out of
+   the screen -- its screen's face, its back, the four edges between, and a bar across the top of the screen (the
+   earpiece), so which end is up can be told."
+  (let ((w 0.42) (h 0.86) (d 0.06) (out '()))
+    (flet ((seg (a b) (setf out (append out a b))))
+      (dolist (z (list d (- d)))
+        (seg (list (- w) (- h) z) (list w (- h) z)) (seg (list w (- h) z) (list w h z))
+        (seg (list w h z) (list (- w) h z)) (seg (list (- w) h z) (list (- w) (- h) z)))
+      (dolist (x (list (- w) w))
+        (dolist (y (list (- h) h)) (seg (list x y d) (list x y (- d)))))
+      (seg (list -0.12 (- h 0.1) d) (list 0.12 (- h 0.1) d)))
+    (apply #'floats out)))
+
+(defun watch-lines ()
+  "The watch as it is worn, in its own axes (x to the right of its screen, y to twelve o'clock, z out of the screen):
+   its case, the band above and below it, and the crown on its right side (the last segment)."
+  (let ((w 0.3) (h 0.36) (d 0.09) (band 0.2) (out '()))
+    (flet ((seg (a b) (setf out (append out a b))))
+      (dolist (z (list d (- d)))
+        (seg (list (- w) (- h) z) (list w (- h) z)) (seg (list w (- h) z) (list w h z))
+        (seg (list w h z) (list (- w) h z)) (seg (list (- w) h z) (list (- w) (- h) z)))
+      (dolist (x (list (- w) w))
+        (dolist (y (list (- h) h)) (seg (list x y d) (list x y (- d)))))
+      ;; the band: two straps going on past the case, narrower than it, from its back half
+      (dolist (sy '(1 -1))
+        (dolist (x (list (- band) band))
+          (seg (list x (* sy h) 0) (list x (* sy (+ h 0.5)) (- (* 0.25 d)))))
+        (seg (list (- band) (* sy (+ h 0.5)) (- (* 0.25 d))) (list band (* sy (+ h 0.5)) (- (* 0.25 d)))))
+      (seg (list w 0.1 0) (list (+ w 0.1) 0.1 0)))
+    (apply #'floats out)))
+
+(defun floor-mesh (size tiles)
+  "A square of SIZE on y = 0, facing up, its texture repeated TILES times across."
+  (let ((h (/ size 2.0)) (tl (float tiles 1.0)))
+    (values (floats (- h) 0 h    0 1 0  0 tl
+                    h 0 h        0 1 0  tl tl
+                    h 0 (- h)    0 1 0  tl 0
+                    (- h) 0 (- h) 0 1 0  0 0)
+            '(0 1 2 0 2 3))))
+
+;;; ---- textures, made here -------------------------------------------------------------------------------------------
+
+(defun texture-pixels (size fn)
+  "SIZE x SIZE RGBA pixels, (FN x y) giving each one's (values r g b) in 0..255."
+  (let ((px (make-array (* size size 4) :element-type '(unsigned-byte 8))))
+    (dotimes (y size px)
+      (dotimes (x size)
+        (multiple-value-bind (r g b) (funcall fn x y)
+          (let ((i (* 4 (+ x (* y size)))))
+            (setf (aref px i) r (aref px (+ i 1)) g (aref px (+ i 2)) b (aref px (+ i 3)) 255)))))))
+
+(defun checker (x y)
+  "The floor: a two-tone check with a fine line between."
+  (let ((line (or (< (mod x 128) 3) (< (mod y 128) 3)))
+        (dark (oddp (+ (floor x 128) (floor y 128)))))
+    (cond (line (values 210 200 170))
+          (dark (values 70 92 78))
+          (t (values 104 128 106)))))
+
+(defun crate (x y)
+  "A cube's face: a light border, and within it a soft gradient and a diagonal."
+  (let* ((edge (min x y (- 127 x) (- 127 y)))
+         (diag (< (abs (- x y)) 4)))
+    (cond ((< edge 8) (values 235 235 228))
+          (diag (values 210 210 205))
+          (t (let ((v (+ 120 (floor (* 80 (+ x y)) 254)))) (values v v v))))))
+
+;;; ---- the game ------------------------------------------------------------------------------------------------------
+
+(defstruct game
+  view pipeline
+  cube-vertices cube-indices floor-vertices floor-indices
+  crate-texture floor-texture
+  (eye (list 0.0 1.6 9.0)) (yaw 0.0) (pitch -0.08)
+  (held (make-hash-table)) (locked nil)
+  (spin t) (speed 0.4) (angle 0.0)
+  fps-label (frames 0) (fps-at 0)
+  ;; a game controller: its state, read each frame (gamepad.lisp); A as it was, to see it pressed; the HUD's line
+  (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1)
+  ;; sound (sound.lisp): a humming voice per cube, the ring's then the middle one's; a blip; on or off
+  (hums '()) blip (sound t) (spatial nil) (head nil)
+  ;; where each toggle is shown, to keep them in step: the HUD's buttons, and the menus' items (a Mac's)
+  spin-button sound-button head-button speed-slider (spin-items '()) (sound-items '()) (head-items '()) status
+  ;; the HUD's pane, (x y w h) in points, and the pointer's shape as last set: the arrow over the pane, a crosshair
+  ;; over the scene, where a click looks around
+  hud-rect (shape nil)
+  ;; heard while another app is in front (a Mac's Game menu says); hidden or minimized, never
+  (background-sound t) (app-state :active)
+  ;; THE HEAD, as the headphones report it, drawn as a wireframe in a corner: its pipeline and lines
+  line-pipeline egg egg-count nose nose-count
+  ;; THE PHONE, as it is held, beside the head: its lines (13 segments, the last its earpiece)
+  phone phone-count
+  ;; THE WATCH, as its app on the wrist reports it over the link (hello3d-watch.lisp): its lines, its rotation (nine
+  ;; floats, or NIL), the heart rate, and when it last spoke (internal real time)
+  watch watch-count (watch-turn nil) (watch-bpm 0) (watch-at 0)
+  ;; A FLIP: when it began (internal real time), or NIL -- each cube turns head over heels once, in turn
+  (flip-at nil) (flip-plucked 0)
+  ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
+  ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
+  (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
+
+;;; WHERE THE CUBES ARE, for the picture and the sound alike: the ring's Ith at ANGLE, and the middle one
+(defun ring-position (i angle)
+  (let ((around (+ (* i (/ pi 4)) (* 0.25 angle))))
+    (values (* 6 (sin around)) 1.0 (* 6 (cos around)))))
+
+(defun middle-height (angle) (+ 2.2 (* 0.35 (sin (* 1.3 angle)))))
+
+(defparameter *ring-notes* '(220 247 294 330 370 440 494 587) "A pentatonic of A, a note a ring cube.")
+
+(defun hue (h)
+  "A bright colour at hue H (0..1), as a tint."
+  (flet ((c (o) (let ((x (abs (- (mod (+ h o) 1.0) 0.5)))) (min 1.0 (max 0.25 (- (* 3 x) 0.25))))))
+    (floats (c 0.0) (c (/ 1 3.0)) (c (/ 2 3.0)) 1.0)))
+
+(defun key-down-p (g &rest keysyms)
+  (some (lambda (k) (gethash k (game-held g))) keysyms))
+
+(defun steer (g dt)
+  "Move the eye by the keys held: forward and back along where it faces (level), sideways, up and down, and turn."
+  (let* ((yaw (game-yaw g)) (step (* 4.0 dt)) (turn (* 1.6 dt))
+         (fx (- (sin yaw))) (fz (- (cos yaw)))          ; forward, level
+         (rx (cos yaw)) (rz (- (sin yaw)))              ; right
+         (dx 0.0) (dy 0.0) (dz 0.0))
+    (when (key-down-p g #x77 #x57) (incf dx fx) (incf dz fz))                  ; w
+    (when (key-down-p g #x73 #x53) (decf dx fx) (decf dz fz))                  ; s
+    (when (key-down-p g #x64 #x44) (incf dx rx) (incf dz rz))                  ; d
+    (when (key-down-p g #x61 #x41) (decf dx rx) (decf dz rz))                  ; a
+    (when (key-down-p g #x65 #x45 #x20) (incf dy 1.0))                         ; e, space
+    (when (key-down-p g #x71 #x51 #xffe1 #xffe2) (decf dy 1.0))                ; q, shift
+    (when (key-down-p g #xff51) (incf (game-yaw g) turn))                      ; left
+    (when (key-down-p g #xff53) (decf (game-yaw g) turn))                      ; right
+    (when (key-down-p g #xff52) (incf (game-pitch g) turn))                    ; up
+    (when (key-down-p g #xff54) (decf (game-pitch g) turn))                    ; down
+    ;; THE TOUCH STICK: as WASD, by how far the left thumb is from where it landed
+    (when (game-touch g)
+      (incf dx (+ (* (game-stick-x g) rx) (* (- (game-stick-y g)) fx)))
+      (incf dz (+ (* (game-stick-x g) rz) (* (- (game-stick-y g)) fz))))
+    ;; A GAME CONTROLLER, the first one: the left stick moves (as WASD, and by how far it is pushed), the right
+    ;; looks, the triggers lift and lower
+    (when (kiln-pad:pad-read 0 (game-pad g))
+      (let* ((p (game-pad g))
+             (mx (kiln-pad:pad-axis p :left-x)) (my (kiln-pad:pad-axis p :left-y)))
+        (incf dx (+ (* mx rx) (* my fx)))
+        (incf dz (+ (* mx rz) (* my fz)))
+        (incf dy (- (kiln-pad:pad-axis p :right-trigger) (kiln-pad:pad-axis p :left-trigger)))
+        (decf (game-yaw g) (* 2.2 dt (kiln-pad:pad-axis p :right-x)))
+        (incf (game-pitch g) (* 1.6 dt (kiln-pad:pad-axis p :right-y)))
+        ;; A, pressed (not held): spin on or off, and a short buzz to say so
+        (let ((a (kiln-pad:pad-button p :a)))
+          (when (and a (not (game-pad-a g)))
+            (set-spin g (not (game-spin g)))
+            (blip g)
+            (kiln-pad:pad-rumble 0 0.5 80))
+          (setf (game-pad-a g) a))))
+    (setf (game-pitch g) (max -1.45 (min 1.45 (game-pitch g))))
+    (destructuring-bind (x y z) (game-eye g)
+      (setf (game-eye g) (list (+ x (* step dx)) (max 0.3 (+ y (* step dy))) (+ z (* step dz)))))))
+
+(defun %signed20 (v) (if (logbitp 19 v) (- v #x100000) v))
+
+(defun touch-event (g e)
+  "A finger's own touch (type 14): on the left half of the screen a stick, centred where it lands; on the right,
+   dragged, the view turned."
+  (let* ((x (logand e #xFFFFF)) (y (logand (ash e -20) #xFFFFF))
+         (slot (logand (ash e -48) #xF)) (phase (logand (ash e -52) 3))
+         (fingers (game-fingers g)) (scale (game-scale g))
+         (radius (* 60 scale)))                            ; full deflection 60 points out
+    (case phase
+      (0 (setf (gethash slot fingers)
+               (if (< x (floor (%sys 1001 0 0 0) 2)) (list :move x y x y) (list :look x y))))
+      (1 (let ((f (gethash slot fingers)))
+           (when f
+             (if (eq (first f) :move)
+                 (destructuring-bind (role cx cy &rest r) f
+                   (declare (ignore role r))
+                   (setf (game-stick-x g) (max -1.0 (min 1.0 (/ (- x cx) radius)))
+                         (game-stick-y g) (max -1.0 (min 1.0 (/ (- y cy) radius)))))
+                 (destructuring-bind (role lx ly) f
+                   (declare (ignore role))
+                   (decf (game-yaw g) (/ (* 0.005 (- x lx)) scale))
+                   (setf (game-pitch g) (max -1.45 (min 1.45 (- (game-pitch g) (/ (* 0.005 (- y ly)) scale)))))
+                   (setf (gethash slot fingers) (list :look x y)))))))
+      (2 (let ((f (gethash slot fingers)))
+           (when (and f (eq (first f) :move)) (setf (game-stick-x g) 0.0 (game-stick-y g) 0.0))
+           (remhash slot fingers))))))
+
+(defun handle-event (g e)
+  "One event from the window: keys held and let go, the pointer locked by a click and let go by Esc, the mouse's
+   motion turning the eye while it is locked."
+  (let ((type (logand (ash e -40) #xFF)))
+    (when (game-touch g)                    ; a phone: fingers are its input, and there is no pointer to hold
+      (case type
+        (14 (touch-event g e))
+        ((8 9) nil)
+        (t (return-from handle-event nil))))
+    (case type
+      (8 (let ((ks (logand e #xFFFFFFFFFF)))
+           (setf (gethash ks (game-held g)) t)
+           (when (and (= ks #xff1b) (game-locked g))
+             (kiln-mac:window-pointer-lock nil) (setf (game-locked g) nil))))
+      (9 (remhash (logand e #xFFFFFFFFFF) (game-held g)))
+      (5 (let* ((k (game-scale g)) (px (floor (logand e #xFFFFF) k)) (py (floor (logand (ash e -20) #xFFFFF) k))
+                (shape (if (and (game-hud-rect g)
+                                (destructuring-bind (x y w h) (game-hud-rect g)
+                                  (and (<= x px (+ x w)) (<= y py (+ y h)))))
+                           :arrow :crosshair)))
+           (unless (eq shape (game-shape g))
+             (setf (game-shape g) shape)
+             (kiln-mac:window-pointer-shape shape))))
+      (1 (unless (game-locked g)
+           (kiln-mac:window-pointer-lock t) (setf (game-locked g) t) (blip g)))
+      (13 (when (game-locked g)
+            (let ((dx (%signed20 (logand e #xFFFFF))) (dy (%signed20 (logand (ash e -20) #xFFFFF))))
+              (decf (game-yaw g) (* 0.0025 dx))
+              (setf (game-pitch g) (max -1.45 (min 1.45 (- (game-pitch g) (* 0.0025 dy)))))))))))
+
+(defun blip (g)
+  (when (game-blip g) (kiln-sound:play (game-blip g) :gain 0.35)))
+
+(defun hear (g)
+  "Each cube's hum placed where it is now, heard from the eye -- in 3D by the platform, or panned here -- then the
+   speaker fed (the blip's)."
+  (when (game-hums g)
+    (destructuring-bind (ex ey ez) (game-eye g)
+      (let ((a (game-angle g)) (yaw (game-yaw g)))
+        (when (game-spatial g) (kiln-sound:spatial-listener ex ey ez yaw (game-pitch g)))
+        (loop for v in (game-hums g) for i from 0
+              do (multiple-value-bind (x y z) (if (< i 8) (ring-position i a) (values 0 (middle-height a) 0))
+                   (if (game-spatial g)
+                       (kiln-sound:spatial-place v x y z :gain (if (< i 8) 0.35 0.5))
+                       (multiple-value-bind (gain pan)
+                           (kiln-sound:place ex ez yaw x y z :loudness (if (< i 8) 0.14 0.22))
+                         (kiln-sound:voice-set v :gain gain :pan pan)))))))
+    (kiln-sound:sound-pump)))
+
+(defparameter *flip-seconds* 0.9 "How long a cube takes to go head over heels.")
+(defparameter *flip-stagger* 0.12 "The next cube begins this much later.")
+
+(defun flip-turn (g i)
+  "How far cube I (0-7 the ring, 8 the middle) has turned in the flip, 0 to 2 pi, eased in and out."
+  (let ((at (game-flip-at g)))
+    (if (null at)
+        0.0
+        (let* ((since (/ (- (get-internal-real-time) at) internal-time-units-per-second))
+               (u (max 0.0 (min 1.0 (/ (- since (* i *flip-stagger*)) *flip-seconds*)))))
+          (* 2 pi (- (* 3 u u) (* 2 u u u)))))))
+
+(defun flip (g)
+  "Every cube head over heels, one after another, each with a pluck as it goes."
+  (setf (game-flip-at g) (get-internal-real-time) (game-flip-plucked g) 0)
+  (format t "~&hello3d: flip!~%") (finish-output))
+
+(defun flip-tick (g)
+  "Plucks as each cube starts its flip (rising notes), and the flip forgotten once the last has landed."
+  (let ((at (game-flip-at g)))
+    (when at
+      (let ((since (/ (- (get-internal-real-time) at) internal-time-units-per-second)))
+        (loop while (and (< (game-flip-plucked g) 9) (<= (* (game-flip-plucked g) *flip-stagger*) since))
+              do (let ((i (game-flip-plucked g)))
+                   (when (game-blip g)
+                     (kiln-sound:play (kiln-sound:pluck (* 440 (expt 2 (/ (* 2 i) 12)))) :gain 0.25))
+                   (incf (game-flip-plucked g))))
+        (when (> since (+ (* 8 *flip-stagger*) *flip-seconds*)) (setf (game-flip-at g) nil))))))
+
+(defun draw-thing (pass vertices indices count texture model tint)
+  "One object: its vertices, texture, model matrix and tint, drawn."
+  (kiln-gpu:gpu-bind pass vertices 0)
+  (kiln-gpu:gpu-bind-texture pass texture 0)
+  (kiln-gpu:gpu-constants pass (floats model tint) 2)
+  (kiln-gpu:gpu-draw-indexed pass indices count))
+
+(defparameter *dusk* #x1d2a3c "The sky, and the fog the far things fade into.")
+
+(defun corner (scale ox oy)
+  "Clip space shrunk by SCALE and moved to OX OY (in -1..1): a small picture drawn in a corner of the view.  Its
+   depth is squeezed into the nearest thousandth, so it is in front of the scene and still sorted within itself."
+  (let ((m (identity-mat)))
+    (setf (aref m 0) (float scale 1.0) (aref m 5) (float scale 1.0) (aref m 10) 0.001
+          (aref m 12) (float ox 1.0) (aref m 13) (float oy 1.0))
+    m))
+
+(defvar *head-log* nil "HELLO3D_HEAD_LOG set: the head's angles, logged twice a second.")
+(defvar *head-demo* nil "HELLO3D_HEAD_DEMO set: a head that sways by itself, with no headphones to follow.")
+
+(defun head-attitude (g)
+  "(values yaw pitch roll): the headphones', or the demo's sway, or NIL."
+  (if *head-demo*
+      (let ((a (game-angle g)))
+        (values (* 0.8 (sin (* 1.7 a))) (* 0.3 (sin (* 2.3 a))) (* 0.25 (sin (* 1.1 a)))))
+      (kiln-sound:spatial-head-attitude)))
+
+(defun draw-head (pass g w h)
+  "The listener's head, turned as the headphones say, seen from straight behind it at eye level -- an overlay of
+   your own head, its pointer into the screen while you face the screen -- in the view's lower right."
+  (multiple-value-bind (yaw pitch roll) (head-attitude g)
+    (when (and yaw (game-line-pipeline g))
+      (let* ((model (mat* (rotation-y yaw) (mat* (rotation-x pitch) (rotation-z (- roll)))))
+             (view (translation 0 0 -5.2))   ; from straight behind, at eye level: your own head, not a model in the scene
+             (transform (mat* (corner 0.3 0.72 -0.6) (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view model))))
+             ;; 2.5 points wide: the half-width in pixels, then half the view
+             (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0)))
+        ;; depth tested: over the scene (the corner's depth is the nearest thousandth), and the head's own lines in
+        ;; front of one another as they are -- the nose behind the head is hidden where the head's lines cross it
+        (kiln-gpu:gpu-depth pass :test-and-write)
+        (kiln-gpu:gpu-cull pass :none)
+        (kiln-gpu:gpu-use pass (game-line-pipeline g))
+        (kiln-gpu:gpu-bind pass (game-egg g) 0)
+        ;; the three ovals in a gizmo's colours: level blue, front-to-back red, side-to-side green
+        (loop for colour in '((0.35 0.55 1.0) (1.0 0.35 0.35) (0.45 0.9 0.45))
+              for i from 0
+              do (kiln-gpu:gpu-constants pass (apply #'floats transform (append colour (list 1.0) params)) 2)
+                 (kiln-gpu:gpu-draw pass (* 6 (game-egg-count g)) :start (* i 6 (game-egg-count g))))
+        (kiln-gpu:gpu-bind pass (game-nose g) 0)
+        (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
+        (kiln-gpu:gpu-draw pass (* 3 (game-nose-count g)))))))
+
+(defun rotation-3x3 (r)
+  "The 4x4 (column-major) of the 3x3 rotation R, nine floats row-major."
+  (let ((m (identity-mat)))
+    (dotimes (row 3 m)
+      (dotimes (col 3)
+        (setf (aref m (+ (* col 4) row)) (aref r (+ (* row 3) col)))))))
+
+(defun draw-phone (pass g w h)
+  "The phone, turned as it is held against how it was when following began, seen as you see it in your hand -- its
+   screen towards you -- beside the head."
+  (let ((r (kiln-motion:device-attitude)))
+    (when (and r (game-line-pipeline g) (game-phone g))
+      (let* ((view (translation 0 0 -5.2))
+             (transform (mat* (corner 0.3 0.4 -0.6)
+                              (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view (rotation-3x3 r)))))
+             (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0))
+             (n (game-phone-count g)))
+        (kiln-gpu:gpu-depth pass :test-and-write)
+        (kiln-gpu:gpu-cull pass :none)
+        (kiln-gpu:gpu-use pass (game-line-pipeline g))
+        (kiln-gpu:gpu-bind pass (game-phone g) 0)
+        ;; the slab pale, its earpiece (the last segment) the nose's orange
+        (kiln-gpu:gpu-constants pass (apply #'floats transform 0.85 0.88 0.95 1.0 params) 2)
+        (kiln-gpu:gpu-draw pass (* 6 (1- n)))
+        (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
+        (kiln-gpu:gpu-draw pass 6 :start (* 6 (1- n)))))))
+
+(defun watch-fresh-p (g)
+  "Whether the watch has spoken in the last second."
+  (and (game-watch-turn g)
+       (< (- (get-internal-real-time) (game-watch-at g)) internal-time-units-per-second)))
+
+(defun hear-watch (g term)
+  "A message from the watch app: its turn and heart rate, the crown (the speed), a tap (a flip)."
+  (case (first term)
+    (:m (let ((r (or (game-watch-turn g) (make-array 9 :element-type 'single-float :initial-element 0.0))))
+          (loop for v in (rest term) for i below 9 do (setf (aref r i) (/ v 10000.0)))
+          (setf (game-watch-turn g) r
+                (game-watch-bpm g) (or (nth 10 term) 0)
+                (game-watch-at g) (get-internal-real-time))))
+    (:crown (set-speed g (* 0.8 (/ (second term) 100.0))))
+    (:tap (flip g))))
+
+(defun draw-watch (pass g w h)
+  "The watch, turned as it is worn against how it was when it began to report (or was recentered), beside the phone."
+  (when (and (watch-fresh-p g) (game-line-pipeline g) (game-watch g))
+    (let* ((view (translation 0 0 -5.2))
+           (transform (mat* (corner 0.3 0.08 -0.6)
+                            (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view (rotation-3x3 (game-watch-turn g))))))
+           (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0))
+           (n (game-watch-count g)))
+      (kiln-gpu:gpu-depth pass :test-and-write)
+      (kiln-gpu:gpu-cull pass :none)
+      (kiln-gpu:gpu-use pass (game-line-pipeline g))
+      (kiln-gpu:gpu-bind pass (game-watch g) 0)
+      ;; the case and band a pale green, the crown the nose's orange
+      (kiln-gpu:gpu-constants pass (apply #'floats transform 0.6 0.95 0.7 1.0 params) 2)
+      (kiln-gpu:gpu-draw pass (* 6 (1- n)))
+      (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
+      (kiln-gpu:gpu-draw pass 6 :start (* 6 (1- n))))))
+
+(defun render (g)
+  (multiple-value-bind (w h) (kiln-gpu:gpu-view-size (game-view g))
+    (when (and (plusp w) (plusp h))
+      (let* ((projection (perspective (/ pi 3) (/ w h) 0.1 120.0))
+             (view (look (game-eye g) (game-yaw g) (game-pitch g)))
+             (frame (floats (mat* projection view)
+                            -0.5 -1.0 -0.35 0.0
+                            (first (game-eye g)) (second (game-eye g)) (third (game-eye g)) 1.0
+                            18.0 60.0 0.0 0.0
+                            (/ (ldb (byte 8 16) *dusk*) 255.0) (/ (ldb (byte 8 8) *dusk*) 255.0)
+                            (/ (ldb (byte 8 0) *dusk*) 255.0) 1.0))
+             (a (game-angle g)))
+        (kiln-gpu:with-gpu-pass (pass (game-view g) :clear *dusk*)
+          (kiln-gpu:gpu-use pass (game-pipeline g))
+          (kiln-gpu:gpu-cull pass :back)
+          (kiln-gpu:gpu-constants pass frame 1)
+          ;; the floor
+          (draw-thing pass (game-floor-vertices g) (game-floor-indices g) 6 (game-floor-texture g)
+                      (identity-mat) (floats 1 1 1 1))
+          ;; the ring: eight cubes, each its own colour, turning as it goes round
+          (dotimes (i 8)
+            (multiple-value-bind (x y z) (ring-position i a)
+              (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
+                          (mat* (translation x y z)
+                                (mat* (rotation-x (flip-turn g i))
+                                      (mat* (rotation-y (+ a (* i 0.7))) (rotation-x (* 0.6 a)))))
+                          (hue (/ i 8.0)))))
+          ;; and in the middle, a bigger one, bobbing
+          (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
+                      (mat* (translation 0 (middle-height a) 0)
+                            (mat* (rotation-x (flip-turn g 8)) (mat* (rotation-y (* -0.5 a)) (scaling 1.8))))
+                      (floats 1.0 0.85 0.55 1))
+          ;; over everything, while the head is followed: the head
+          (when (or (game-head g) *head-demo*) (draw-head pass g w h))
+          ;; and beside it, on a phone, the phone
+          (when (game-head g) (draw-phone pass g w h))
+          ;; and the watch, while its app is sending
+          (draw-watch pass g w h))))))
+
+(defun set-spin (g on)
+  "Spin on or off, shown wherever it is: the HUD's button, the menus' check marks."
+  (setf (game-spin g) on)
+  (when (game-spin-button g) (kiln-swift:ui-set-text (game-spin-button g) (if on "spin: on" "spin: off")))
+  (dolist (i (game-spin-items g)) (kiln-mac:menu-check i on)))
+
+(defun set-sound (g on)
+  (setf (game-sound g) on)
+  (hear-state g)
+  (when (game-sound-button g) (kiln-swift:ui-set-text (game-sound-button g) (if on "sound: on" "sound: off")))
+  (dolist (i (game-sound-items g)) (kiln-mac:menu-check i on)))
+
+(defun set-speed (g speed)
+  (setf (game-speed g) (max 0.05 (min 0.8 speed)))
+  (when (game-speed-slider g) (kiln-swift:ui-set-value (game-speed-slider g) (round (* 125 (game-speed g))))))
+
+(defun set-head (g on)
+  "Follow the head (AirPods) or not."
+  (setf (game-head g) on)
+  (format t "~&hello3d: following the head ~:[off~;on~]~%" on)
+  (kiln-sound:spatial-head on)
+  ;; the phone's own turn too, drawn beside the head: neutral from now, as the head's is
+  (when (kiln-motion:device-motion on) (when on (kiln-motion:device-recenter)))
+  ;; and the watch's, if its app is listening
+  (when on (kiln-link:link-send (list :recenter)))
+  (when (game-head-button g) (kiln-swift:ui-symbol-button-set (game-head-button g) on))
+  (dolist (i (game-head-items g)) (kiln-mac:menu-check i on)))
+
+(defun toggle-head (g)
+  "FOLLOW THE HEAD, off until asked for: where the system will ask for Motion & Fitness, the person is told first what
+   it is for, and may say not now; refused before, where in Settings to allow it."
+  (cond ((game-head g) (set-head g nil))
+        ((eq (kiln-sound:spatial-head-permission) :not-asked)
+         (let ((alert (kiln-swift:ui-alert
+                       "Follow your head?"
+                       "With AirPods, each sound stays in place as you turn your head. Next, you'll be asked to allow Motion & Fitness.")))
+           (kiln-swift:ui-alert-action alert "Not Now")
+           (kiln-swift:ui-alert-action alert "Continue")
+           (kiln-swift:on-event :alert alert (lambda (index h) (declare (ignore h)) (when (eql index 1) (set-head g t))))
+           (kiln-swift:ui-alert-present alert)))
+        ((eq (kiln-sound:spatial-head-permission) :refused)
+         (let ((alert (kiln-swift:ui-alert
+                       "Motion & Fitness is off"
+                       "To follow your head, allow Hello 3D in Settings > Privacy & Security > Motion & Fitness.")))
+           (kiln-swift:ui-alert-action alert "OK")
+           (kiln-swift:ui-alert-present alert)))
+        (t (set-head g t))))
+
+(defun make-hud (g)
+  "The platform's own controls over the picture, inside the safe area (a phone's notch, turned) -- on a Mac on a pane
+   of Liquid Glass, its buttons glass too."
+  (let* ((scale (game-scale g))
+         (x (+ 20 (floor (%sys 1001 4 0 0) scale))) (y (+ 8 (floor (max 0 (%sys 1001 3 0 0)) scale)))
+         ;; the width there is, in points: a phone held upright has under 400, so lines are shorter and the
+         ;; sound button goes under spin rather than beside it
+         (w (- (floor (%sys 1001 0 0 0) scale) x 20 (floor (max 0 (%sys 1001 6 0 0)) scale)))
+         (narrow (< w 480))
+         (below (if narrow 40 0))
+         ;; ON A MAC, A PANE OF GLASS: what goes on it is placed from its top left
+         (panel (and (not (game-touch g)) (kiln-mac:glass-panel (- x 12) y 560 160 :radius 20)))
+         (_ (when panel (setf (game-hud-rect g) (list (- x 12) y 560 160))))
+         (x (if panel 14 x))
+         (y (if panel -2 y)))
+    (declare (ignorable _))
+    (flet ((put (h) (when panel (kiln-swift:ui-add panel h)) h)
+           (glassy (h) (when panel (kiln-mac:glass-button h)) h))
+      (put (kiln-swift:ui-label "Hello, world" x (+ y 8) (min w 300) 30))
+      (setf (game-fps-label g) (put (kiln-swift:ui-label "" x (+ y 38) (min w 300) 22)))
+      (put (kiln-swift:ui-label (cond ((not (game-touch g)) "click: look around   Esc: let go   WASD, QE: move   arrows: turn")
+                                      (narrow "left thumb: move   right thumb: look")
+                                      (t "left thumb: move   right thumb: look   or a game controller"))
+                                x (+ y 62) (min w 600) 22))
+      (setf (game-pad-label g) (put (kiln-swift:ui-label "" x (+ y 132 below) (min w 600) 22)))
+      (let ((spin (put (glassy (kiln-swift:ui-button "spin: on" x (+ y 92) 110 32))))
+            (speed (put (kiln-swift:ui-slider 50 (+ x 120) (+ y 96) 200 24)))     ; mid-way: 0.4
+            (sound (put (glassy (if narrow
+                                    (kiln-swift:ui-button "sound: on" x (+ y 92 below) 110 32)
+                                    (kiln-swift:ui-button "sound: on" (+ x 340) (+ y 92) 110 32))))))
+        (setf (game-spin-button g) spin (game-speed-slider g) speed (game-sound-button g) sound)
+        (kiln-swift:on-tap spin (lambda (v h) (declare (ignore v h)) (set-spin g (not (game-spin g)))))
+        (kiln-swift:on-tap sound (lambda (v h) (declare (ignore v h)) (set-sound g (not (game-sound g)))))
+        (kiln-swift:on-event :slider speed (lambda (value h) (declare (ignore h)) (setf (game-speed g) (/ value 125.0)))))
+      (when (game-spatial g)
+        (let ((head (put (if narrow
+                             (kiln-swift:ui-symbol-button "headphones" (+ x 120) (+ y 92 below) 48 32)
+                             (kiln-swift:ui-symbol-button "headphones" (+ x 460) (+ y 92) 48 32)))))
+          (setf (game-head-button g) head)
+          (kiln-swift:on-tap head (lambda (v h) (declare (ignore v h)) (toggle-head g))))))))
+
+(defun picture-texture (path &key (largest 512))
+  "The image at PATH (a JPEG, PNG, WebP ...) as a texture, scaled down to at most LARGEST pixels across (nearest);
+   NIL if it does not decode."
+  (let* ((bytes (with-open-file (in path :element-type '(unsigned-byte 8))
+                  (let ((b (make-array (file-length in) :element-type '(unsigned-byte 8)))) (read-sequence b in) b)))
+         (img (ignore-errors (pigment:decode-image-bytes bytes))))
+    (when (and img (plusp (pigment:img-w img)) (plusp (pigment:img-h img)))
+      (let* ((w (pigment:img-w img)) (h (pigment:img-h img)) (src (pigment:img-rgba img))
+             (k (max 1 (ceiling (max w h) largest)))
+             (tw (max 1 (floor w k))) (th (max 1 (floor h k)))
+             (px (make-array (* tw th 4) :element-type '(unsigned-byte 8))))
+        (dotimes (y th)
+          (dotimes (x tw)
+            (let ((s (* 4 (+ (* y k w) (* x k)))) (d (* 4 (+ (* y tw) x))))
+              (setf (aref px d) (aref src s) (aref px (+ d 1)) (aref src (+ s 1))
+                    (aref px (+ d 2)) (aref src (+ s 2)) (aref px (+ d 3)) 255))))
+        (kiln-gpu:gpu-texture px tw th)))))
+
+(defun on-picture (g path)
+  "A file dropped on the window (or opened with the app): an image becomes the cubes' faces."
+  (format t "~&hello3d: dropped ~A~%" path) (finish-output)
+  (let ((tex (ignore-errors (picture-texture path))))
+    (if tex
+        (setf (game-crate-texture g) tex)
+        (format t "~&hello3d: not a picture this can read~%"))))
+
+(defun remind (g)
+  "A notification ten seconds on.  The first time, the person is told what it is for before the system asks."
+  (flet ((post ()
+           (kiln-notify:notify "Hello 3D" "The cubes are still turning." :after 10
+                               :on-click (lambda () (flip g)))
+           (format t "~&hello3d: a reminder in 10 seconds~%") (finish-output)))
+    (case (kiln-notify:notify-permission)
+      (:allowed (post))
+      (:refused (let ((alert (kiln-swift:ui-alert "Notifications are off"
+                                                  "To be reminded, allow Hello 3D in System Settings > Notifications.")))
+                  (kiln-swift:ui-alert-action alert "OK")
+                  (kiln-swift:ui-alert-present alert)))
+      (t (let ((alert (kiln-swift:ui-alert "Remind you?"
+                                           "Hello 3D can send a notification in 10 seconds. Next, you'll be asked to allow notifications.")))
+           (kiln-swift:ui-alert-action alert "Not Now")
+           (kiln-swift:ui-alert-action alert "Continue")
+           (kiln-swift:on-event :alert alert
+                                (lambda (index h)
+                                  (declare (ignore h))
+                                  (when (eql index 1) (kiln-notify:notify-ask (lambda (ok) (when ok (post)))))))
+           (kiln-swift:ui-alert-present alert))))))
+
+(defun hear-state (g)
+  "Sound on or off as the app is: always while in front; behind another app only with Sound in Background; never
+   hidden."
+  (let ((heard (and (game-sound g)
+                    (case (game-app-state g)
+                      ((:active :shown) t)
+                      (:inactive (game-background-sound g))
+                      (t nil)))))
+    (setf kiln-sound:*master* (if heard 1.0 0.0))
+    (when (game-spatial g) (kiln-sound:spatial-volume (if heard 1.0 0.0)))))
+
+(defun make-menus (g)
+  "A Mac's menus: Game in the menu bar -- spin, sound, following the head, faster, slower -- and a status item with
+   the frame rate, whose menu has spin and sound.  The check marks follow the toggles wherever they are changed."
+  (let ((m (kiln-mac:menu "Game")))
+    (push (kiln-mac:menu-item m "Spin" (lambda () (set-spin g (not (game-spin g)))) :key "s") (game-spin-items g))
+    (push (kiln-mac:menu-item m "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
+    (let ((bg nil))
+      (setf bg (kiln-mac:menu-item m "Sound in Background"
+                                   (lambda ()
+                                     (setf (game-background-sound g) (not (game-background-sound g)))
+                                     (kiln-mac:menu-check bg (game-background-sound g))
+                                     (hear-state g))))
+      (kiln-mac:menu-check bg (game-background-sound g)))
+    (when (game-spatial g)
+      (push (kiln-mac:menu-item m "Follow Your Head" (lambda () (toggle-head g))) (game-head-items g)))
+    (when (game-spatial g)
+      (kiln-mac:menu-item m "Recenter Head" (lambda () (kiln-sound:spatial-head-recenter) (kiln-motion:device-recenter)
+                                                (kiln-link:link-send (list :recenter)))
+                         :key "r"))
+    (kiln-mac:menu-separator m)
+    (kiln-mac:menu-item m "Faster" (lambda () (set-speed g (* (game-speed g) 1.25))) :key "=")
+    (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-")
+    (kiln-mac:menu-separator m)
+    (kiln-mac:menu-item m "Remind Me in 10 Seconds" (lambda () (remind g)))
+    (kiln-mac:menu-item m "Flip the Cubes" (lambda () (flip g)) :key "f"))
+  (let ((sm (kiln-mac:menu "Hello 3D" :in-bar nil)))
+    (push (kiln-mac:menu-item sm "Spin" (lambda () (set-spin g (not (game-spin g))))) (game-spin-items g))
+    (push (kiln-mac:menu-item sm "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
+    (setf (game-status g) (kiln-mac:status-item :symbol "cube.fill" :title "" :menu sm)))
+  (set-spin g (game-spin g))
+  (set-sound g (game-sound g))
+  (dolist (i (game-head-items g)) (kiln-mac:menu-check i (game-head g)))
+  ;; THE HUMS GO QUIET while the app is in the background, and come back with it (as sound is set, not forced on)
+  (kiln-mac:on-app-state (lambda (state)
+                           (format t "~&hello3d: ~(~A~)~%" state) (finish-output)
+                           (setf (game-app-state g) state)
+                           (hear-state g)))
+  (kiln-mac:on-quit (lambda () (format t "~&hello3d: quitting~%") (finish-output)))
+  ;; A PICTURE dropped on the window, or opened with the app, becomes the cubes' faces
+  (kiln-mac:on-drop (lambda (path) (on-picture g path)))
+  (kiln-mac:on-open (lambda (path) (on-picture g path))))
+
+(defun start (&key touch)
+  "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
+  (let ((g (make-game :touch touch :scale (max 1 (%sys 1001 2 0 0)))))
+    (setf (game-view g) (kiln-gpu:gpu-view 0 0 0 0))
+    (let ((shader (kiln-gpu:gpu-shader *shader*)))
+      (setf (game-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "world_vertex" "world_fragment"))))
+    (unless (game-pipeline g) (error "hello3d: the shader or its pipeline did not build (see the log)"))
+    (let ((shader (kiln-gpu:gpu-shader *shader*)))
+      (setf (game-line-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "line_vertex" "line_fragment"))))
+    (multiple-value-bind (egg steps) (egg-lines)
+     (let ((nose (nose-lines)))
+      (setf (game-egg g) (kiln-gpu:gpu-buffer egg) (game-egg-count g) steps
+            (game-nose g) (kiln-gpu:gpu-buffer nose) (game-nose-count g) (floor (length nose) 3))))
+    (let ((phone (phone-lines)) (watch (watch-lines)))
+      (setf (game-phone g) (kiln-gpu:gpu-buffer phone) (game-phone-count g) (floor (length phone) 6)
+            (game-watch g) (kiln-gpu:gpu-buffer watch) (game-watch-count g) (floor (length watch) 6)))
+    ;; THE WATCH APP, if there is one on the wrist: what it sends (hear-watch)
+    (when (kiln-link:link-open)
+      (kiln-link:on-link (lambda (term) (when (consp term) (hear-watch g term)))))
+    (multiple-value-bind (v i) (cube-mesh)
+      (setf (game-cube-vertices g) (kiln-gpu:gpu-buffer v) (game-cube-indices g) (kiln-gpu:gpu-indices i)))
+    (multiple-value-bind (v i) (floor-mesh 120 60)
+      (setf (game-floor-vertices g) (kiln-gpu:gpu-buffer v) (game-floor-indices g) (kiln-gpu:gpu-indices i)))
+    (setf (game-crate-texture g) (kiln-gpu:gpu-texture (texture-pixels 128 #'crate) 128 128)
+          (game-floor-texture g) (kiln-gpu:gpu-texture (texture-pixels 256 #'checker) 256 256))
+    ;; SOUND: a hum a cube, looping and placed each frame (HEAR); a blip for a press
+    ;; in 3D where the platform renders it (Spatial.swift), else panned in Lisp's own mix
+    (when (kiln-sound:sound-open)
+      (let ((tones (append (loop for f in *ring-notes* collect (kiln-sound:tone f))
+                           (list (kiln-sound:tone 110 :timbre '(0.5 0.3 0.15 0.08))))))
+        (setf (game-spatial g) (kiln-sound:spatial-open)
+              (game-hums g) (if (game-spatial g)
+                                (loop for tone in tones collect (kiln-sound:spatial-voice tone :loop t))
+                                (loop for tone in tones collect (kiln-sound:play tone :gain 0.0 :loop t)))
+              (game-blip g) (kiln-sound:pluck 880))
+        (format t "~&hello3d: sound ~:[panned left and right~;in 3D (the platform's renderer)~]~%" (game-spatial g))))
+    (make-hud g)
+    (unless touch (make-menus g))
+    (setf (game-fps-at g) (get-internal-real-time))
+    g))
+
+(defun main (&key touch)
+  "Hello, world in 3D: start, then a frame each time the screen refreshes.  TOUCH: a phone's two thumbs."
+  (%sys 1002 0 (+ (%sys 1001 0 0 0) (* (%sys 1001 1 0 0) 65536)) *dusk*)   ; under the view, until it draws
+  (%sys 1003 0 0 0)
+  (setf *head-demo* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_DEMO"))) (and v (plusp (length v)))))
+  (setf *head-log* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_LOG"))) (and v (plusp (length v)))))
+  (let ((g (start :touch touch)) (last (get-internal-real-time)))
+    (format t "~&hello3d: running~%")
+    (loop
+      (%sys 1008 34 0 0)                                ; the screen's next refresh
+      (loop for e = (%sys 1004 0 0 0) until (zerop e) do (handle-event g e))
+      (kiln-swift:swift-pump)                           ; the native controls' events
+      (let* ((now (get-internal-real-time))
+             (dt (min 0.1 (/ (- now last) internal-time-units-per-second))))
+        (setf last now)
+        (steer g dt)
+        (when (game-spin g) (incf (game-angle g) (* dt (game-speed g))))
+        (flip-tick g)
+        (handler-case (hear g)
+          (serious-condition (c) (format t "~&hello3d: sound: ~A~%" c)))
+        (handler-case (render g)
+          (serious-condition (c) (format t "~&hello3d: ~A~%" c)))
+        ;; the frame rate, twice a second
+        (incf (game-frames g))
+        (let ((since (/ (- now (game-fps-at g)) internal-time-units-per-second)))
+          (when (>= since 0.5)
+            (kiln-swift:ui-set-text (game-fps-label g)
+                                    (format nil "~D frames a second~:[~*~;  ·  watch~@[ ♥ ~D~]~]"
+                                            (round (game-frames g) since) (watch-fresh-p g)
+                                            (and (plusp (game-watch-bpm g)) (game-watch-bpm g))))
+            (when *head-log*
+              (multiple-value-bind (yaw pitch roll) (kiln-sound:spatial-head-attitude)
+                (when yaw
+                  (format t "~&hello3d: head yaw ~,2F pitch ~,2F roll ~,2F (degrees ~D ~D ~D)~%" yaw pitch roll
+                          (round (* yaw 57.3)) (round (* pitch 57.3)) (round (* roll 57.3)))
+                  (finish-output))))
+            (when (game-status g)
+              (kiln-mac:status-title (game-status g) (format nil "~D fps" (round (game-frames g) since))))
+            ;; the controller: said when one comes or goes, and its light the middle cube's colour
+            (let ((n (kiln-pad:pad-count)))
+              (unless (= n (game-pad-seen g))
+                (setf (game-pad-seen g) n)
+                (kiln-swift:ui-set-text (game-pad-label g)
+                                        (if (plusp n)
+                                            (format nil "controller: ~A~:[ -- sticks move and look, triggers lift, A spins~;~]"
+                                                    (kiln-pad:pad-name 0) (game-touch g))
+                                            "no controller (pair one in Bluetooth settings)"))
+                (when (plusp n) (kiln-pad:pad-light 0 #xffd98c))))
+            (setf (game-frames g) 0 (game-fps-at g) now)))))))

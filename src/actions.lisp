@@ -36,12 +36,12 @@
   (let ((desk *kiln-desk*))
     (setf *kiln-frame-queue*
           (append *kiln-frame-queue*
-                  (list (lambda () (glass.desk:desk-open desk "Terminal"))
+                  (list (lambda () (%kiln-desk-open desk "Terminal"))
                         (lambda () (loop for c across form
-                                         do (glass.desk:desk-key desk t (char-code c))))
+                                         do (%kiln-desk-key desk t (char-code c))))
                         (lambda ()
                           (funcall *kiln-present-changes*)
-                          (glass.desk:desk-key desk t #xff0d)))))))
+                          (%kiln-desk-key desk t #xff0d)))))))
 
 (defun %kiln-actions-app (fb)
   "The Actions window's content: the buttons, and a press on one runs its form."
@@ -73,4 +73,8 @@
                            (glass:fb-rect fb x y bw bh (if (eql i pressed) #x4b6a94 #x2d4a6b))
                            (glass:fb-text fb (+ x 8) (+ y (floor bh 2) -8) (first entry)
                                           :size 16 :color #xe6ebf2)))
-                t)))))
+                t))
+            nil nil nil nil nil
+            ;; DRAG-P: no drag is the buttons' -- a drag across them scrolls the phone's rack
+            ;; (glass.wm's rack.lisp asks before the press reaches a button, which acts on a press)
+            (lambda (x y) (declare (ignore x y)) nil))))

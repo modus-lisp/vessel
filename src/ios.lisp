@@ -18,6 +18,12 @@
   (declare (ignore e))
   (modus-int::%gc-safe-block-6 n a b c d))
 
+;; the iOS shim answers 1001 3..6 with the safe area's insets (modus-ui.m), so a turned phone
+;; lays the desk out inside it (%KILN-LAYOUT).  A SETQ, not a DEFVAR: app.lisp's DEFVAR may come first.
+(setq *kiln-safe-area* t)
+;; the phone's desk is glass.wm's RACK (app.lisp, %KILN-MAKE-DESK): a SETQ for the same reason
+(setq *kiln-desk-layout* :rack)
+
 (defun %kiln-copy-text (text)
   "Put TEXT on the iPhone's pasteboard: pseudo-syscall 1007 reads the bytes in place and makes
    the UTF-8 string from them.  Characters past ASCII come out as ?, which is what a copy of a
@@ -29,6 +35,20 @@
     t))
 
 (defun kiln-ios-main (&key autoplay)
-  "The iPhone app (src/app.lisp), below the status bar.  No media for now: the desk,
-   Clock and Terminal first (warp is not in this world)."
-  (kiln-app-main :autoplay autoplay :top 60 :media nil))
+  "The iPhone app (src/app.lisp), below the status bar, with the media player: the films beside
+   the app (kiln ios copies them into its media/), and AUTOPLAY, one of them, playing at launch."
+  ;; KILN_STORYBOOK=1 (simctl launch passes it as SIMCTL_CHILD_KILN_STORYBOOK) opens the storybook at start: the UI
+  ;; suite's way in on any device, with no desk taps whose places depend on the screen
+  ;; looked up when it runs: this file is loaded before the storybook's
+  ;; the platform's voice and ear behind glass's Speak and Listen (speech.lisp)
+  (when (find-package "KILN-SPEECH")
+    (funcall (find-symbol "INSTALL-PLATFORM-SPEECH" "KILN-SPEECH")))
+  (when (modus-int::%cli-getenv "KILN_STORYBOOK")
+    (funcall (find-symbol "STORYBOOK" "KILN-STORYBOOK")))
+  (kiln-app-main :autoplay autoplay :top 60 :media t))
+
+(defun kiln-watch-main ()
+  "The watch app: the storybook of the watch's components, over the desk's frame loop (which delivers their
+   events).  The desk itself is glass at the phone's size; a watch screen shows its corner."
+  (funcall (find-symbol "WATCH-STORYBOOK" "KILN-WATCH-STORYBOOK"))
+  (kiln-app-main :top 0 :media nil))

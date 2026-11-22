@@ -927,12 +927,24 @@
                ;; 15 minutes -- for a reason not yet found.  Threaded decoding comes back when it
                ;; is: (wm "*COOPERATIVE*" nil) (wm "*READ-ON-UI*" t) (wm "*FRAME-POOL*" t).
                (wm "*COOPERATIVE*" t)))
-           (if (and media yuv)
-               ;; the screen in Y'CbCr: every framebuffer :I420, pictures stay planes
-               (let ((glass:*default-fb-format* :i420))
-                 (setf (symbol-value (find-symbol "*FRAME-FORMAT*" "WARP-MEDIA")) :i420)
-                 (kiln-app-main :top 0 :media media :autoplay autoplay))
-               (kiln-app-main :top 0 :media media :autoplay (and media autoplay))))
+           ;; THE DESK, started again whenever the Settings window changes the screen
+           ;; (zero-display.lisp: it throws to KILN-ZERO-RESTART after saving the settings, and
+           ;; DISPLAY-START sets the scanout and the density up before each start)
+           (loop
+             (let ((restart (find-symbol "*RESTART*" "KILN-ZERO-DISPLAY"))
+                   (start (find-symbol "DISPLAY-START" "KILN-ZERO-DISPLAY")))
+               (when restart (setf (symbol-value restart) nil))
+               (catch 'kiln-zero-restart
+                 (when (and start (fboundp start))
+                   (handler-case (funcall start :yuv (and media yuv))
+                     (error (e) (format t "~&display settings: ~A~%" e))))
+                 (if (and media yuv)
+                     ;; the screen in Y'CbCr: every framebuffer :I420, pictures stay planes
+                     (let ((glass:*default-fb-format* :i420))
+                       (setf (symbol-value (find-symbol "*FRAME-FORMAT*" "WARP-MEDIA")) :i420)
+                       (kiln-app-main :top 0 :media media :autoplay autoplay))
+                     (kiln-app-main :top 0 :media media :autoplay (and media autoplay))))
+               (unless (and restart (symbol-value restart)) (return)))))
       (%kz-on-screen (lambda ()
                        (setf *kz-scr-paused* t)
                        (%kz-cur-uninstall)

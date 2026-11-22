@@ -44,15 +44,180 @@
 ;;; MIXER-TICK and one sink frame at a time.  The device -- an AudioQueue in the shim,
 ;;; pseudo-syscalls 1010-1012 -- keeps the real time and plays silence if the loop is late.
 (defconstant +kiln-rate+ 48000)
-(defparameter *kiln-cushion* 7200 "Samples to keep queued: 150 ms.")
+;;; 400 ms.  The device takes its buffers 40 ms at a time and keeps up to three (modus-audio.c), so a
+;;; 150 ms ring ran dry on a main-loop pass of only ~120 ms -- stutters every few seconds in the radio.
+;;; Latency here costs little: a station holds seconds of its own (spool), and a file's pause and seek
+;;; act on the player, whose clock is the samples handed out.
+(defparameter *kiln-cushion* 19200 "Samples to keep queued: 400 ms.")
+
+;;; KILN_AUDIO_STATS=1: once a second, how the loop that feeds the speaker is keeping up -- its
+;;; longest and mean pass, the longest paint, how often the pump found the device's queue nearly
+;;; dry (under one 20 ms frame), and collections.  The sound is only as steady as this loop.
+;;;
+;;; KILN_STATS_SINK=HOST:PORT, set when the WORLD IS BUILT (kiln ios), rides in the snapshot: the app
+;;; then keeps these stats from launch and also sends every line over TCP to HOST:PORT -- a phone
+;;; installed over the air, with no cable for its console, reports to a listener on the Mac
+;;; (`nc -lk PORT').  Unset (the default), nothing is sent and the stats follow KILN_AUDIO_STATS.
+(defvar *kiln-stats-sink* (let ((s (modus-int::%cli-getenv "KILN_STATS_SINK"))) (and s (plusp (length s)) s)))
+(defvar *kiln-stats-stream* nil "The sink's connection, once made.")
+(defvar *kiln-stats-retry* 0 "When (internal real time) to try the sink again after a failed connect.")
+(defun %kiln-stats-say (fmt &rest args)
+  "A stats line to stdout, and to the sink when there is one."
+  (let ((line (apply #'format nil fmt args)))
+    (format t "~&~A~%" line)
+    ;; a failed connect is tried again 5 s later: the first one may lose to iOS's Local Network prompt
+    (when (and *kiln-stats-sink* (null *kiln-stats-stream*)
+               (>= (get-internal-real-time) *kiln-stats-retry*))
+      (setf *kiln-stats-retry* (+ (get-internal-real-time) (* 5 internal-time-units-per-second)))
+      (setf *kiln-stats-stream*
+            (or (ignore-errors
+                 (let* ((c (position #\: *kiln-stats-sink* :from-end t))
+                        (host (subseq *kiln-stats-sink* 0 c))
+                        (port (parse-integer *kiln-stats-sink* :start (1+ c))))
+                   (funcall (find-symbol "OPEN-STREAM-FOR" "WEFT.FETCH") "http" host port 3)))
+                nil)))
+    (let ((st *kiln-stats-stream*))
+      (when st
+        (unless (ignore-errors
+                 (write-sequence (map '(vector (unsigned-byte 8)) #'char-code
+                                      (concatenate 'string line (string #\Newline)))
+                                 st)
+                 (finish-output st) t)
+          (ignore-errors (close st :abort t))
+          (setf *kiln-stats-stream* nil))))))
+(defvar *kiln-stats* nil)
+(defvar *kiln-stats-player* nil "The media player whose shown frames the stats count, or NIL.")
+(defun %kiln-stats-on-p () (or (modus-int::%cli-getenv "KILN_AUDIO_STATS") *kiln-stats-sink*))
+(defun %kiln-radio-stats-reset ()
+  "A fresh count for spool's radio, when this image has spool."
+  (let ((v (find-symbol "*RADIO-STATS*" "SPOOL")) (mk (find-symbol "MAKE-RADIO-STATS" "SPOOL")))
+    (when (and v mk (fboundp mk)) (setf (symbol-value v) (funcall mk)))))
+(defun %kiln-stats-init ()
+  (when (%kiln-stats-on-p) (%kiln-radio-stats-reset))
+  (setf *kiln-stats* (and (%kiln-stats-on-p)
+                          (list :t0 (get-internal-real-time) :passes 0 :sum 0 :max 0 :paint 0 :dry 0
+                                :gc (modus-int::%gc-epoch) :frame (%kiln-stats-frame-no) :gap 0
+                                :last-change (get-internal-real-time) :last-frame (%kiln-stats-frame-no)
+                                :tick 0 :scale 0 :blit 0 :hooks 0 :px 0 :blits 0 :input 0 :events 0 :wait 0
+                                :qmin most-positive-fixnum
+                                :underruns (max 0 (%kiln-sys 1013 0 0 0))))))
+(defun %kiln-stats-add (key us)
+  "Add US microseconds (or a count) to the stats' KEY, when stats are on."
+  (when *kiln-stats* (incf (getf *kiln-stats* key) us)))
+(defmacro %kiln-timed ((key) &body body)
+  "BODY, its time added to the stats' KEY (microseconds)."
+  (let ((t0 (gensym)))
+    `(let ((,t0 (get-internal-real-time)))
+       (multiple-value-prog1 (progn ,@body)
+         (%kiln-stats-add ,key (- (get-internal-real-time) ,t0))))))
+(defun %kiln-stats-frame-no ()
+  (if *kiln-stats-player* (funcall (find-symbol "PLAYER-FRAME-NO" "WARP-MEDIA") *kiln-stats-player*) 0))
+(defun %kiln-stats-pass (pass-ms paint-ms queued)
+  (let ((s *kiln-stats*))
+    (incf (getf s :passes)) (incf (getf s :sum) pass-ms)
+    (setf (getf s :max) (max (getf s :max) pass-ms) (getf s :paint) (max (getf s :paint) paint-ms))
+    (when (and queued (< queued 960)) (incf (getf s :dry)))
+    (when queued (setf (getf s :qmin) (min (getf s :qmin) queued)))
+    ;; the longest the picture stood still: the gap between one new frame and the next
+    (let ((f (%kiln-stats-frame-no)) (now (get-internal-real-time)))
+      (when (/= f (getf s :last-frame))
+        (setf (getf s :gap) (max (getf s :gap) (floor (- now (getf s :last-change)) 1000))
+              (getf s :last-change) now (getf s :last-frame) f)))
+    (when (>= (- (get-internal-real-time) (getf s :t0)) 1000000)
+      (when *kiln-stats-player*
+        (let ((pl *kiln-stats-player*))
+          (%kiln-stats-say "kiln: player at ~,3F s, wall ~,3F s, queued audio ~D video ~D, state ~A"
+                  (funcall (find-symbol "PLAYER-POSITION" "WARP-MEDIA") pl)
+                  (/ (get-internal-real-time) (float internal-time-units-per-second 1d0))
+                  (funcall (find-symbol "%AUDIO-N" "WARP-MEDIA") pl)
+                  (funcall (find-symbol "%VIDEO-N" "WARP-MEDIA") pl)
+                  (funcall (find-symbol "PLAYER-STATE" "WARP-MEDIA") pl))))
+      (%kiln-stats-say "kiln: loop ~D passes, mean ~D ms, max ~D ms, paint max ~D ms, speaker dry ~D (queued min ~D, device underruns ~D), gc ~D, frames ~D, longest still ~D ms"
+              (getf s :passes) (floor (getf s :sum) (max 1 (getf s :passes))) (getf s :max) (getf s :paint)
+              (getf s :dry) (if (= (getf s :qmin) most-positive-fixnum) -1 (getf s :qmin))
+              (- (max 0 (%kiln-sys 1013 0 0 0)) (getf s :underruns)) (- (modus-int::%gc-epoch) (getf s :gc))
+              (- (%kiln-stats-frame-no) (getf s :frame)) (getf s :gap))
+      (%kiln-stats-say "kiln: per second: input ~D ms (~D events), tick ~D ms, scale ~D ms, blit ~D ms, hooks ~D ms, waiting ~D ms; ~D blits, ~D Kpx shown"
+              (floor (getf s :input) 1000) (getf s :events) (floor (getf s :tick) 1000) (floor (getf s :scale) 1000) (floor (getf s :blit) 1000)
+              (floor (getf s :hooks) 1000) (floor (getf s :wait) 1000) (getf s :blits) (floor (getf s :px) 1000))
+      (let ((rs (let ((v (find-symbol "*RADIO-STATS*" "SPOOL"))) (and v (symbol-value v)))))
+        (when (and rs (plusp (+ (funcall (find-symbol "RADIO-STATS-IN" "SPOOL") rs)
+                                (funcall (find-symbol "RADIO-STATS-WAITING" "SPOOL") rs)
+                                (funcall (find-symbol "RADIO-STATS-OUT" "SPOOL") rs))))
+          (%kiln-stats-say "kiln: ~A" (funcall (find-symbol "RADIO-STATS-LINE" "SPOOL") rs))))
+      (%kiln-stats-say "kiln: region 0 young: ~D MB used of ~D (live after a collection is the floor)"
+                       (%kiln-r0-used-mb) (%kiln-r0-size-mb))
+      (let ((th (%kiln-thread-slots)))
+        (unless (equal th *kiln-last-threads*)
+          (setf *kiln-last-threads* th)
+          (%kiln-stats-say "kiln: threads (slot heap-MB name) ~S" th)))
+      (%kiln-stats-init))))
+
+(defvar *kiln-last-threads* nil)
+(defun %kiln-r0-size-mb ()
+  (ignore-errors (let ((k (modus-int::%gc-meta-scale)) (r (modus-int::%gc-region-0)))
+                   (floor (modus-int::%gc-meta-read (+ r #x10) k) #x100000))))
+(defun %kiln-r0-used-mb ()
+  "How far region 0's allocation has run into its from-space: a fresh object's address."
+  (ignore-errors (let ((k (modus-int::%gc-meta-scale)) (r (modus-int::%gc-region-0)))
+                   (floor (- (logand (modus-int::%val->word (make-array 1)) -16)
+                             (modus-int::%gc-meta-read r k))
+                          #x100000))))
+(defun %kiln-thread-slots ()
+  "The live threads as (SLOT HEAP-MB NAME): which heap each worker got -- a worker that runs out
+   of its heap ends the app, and the log then says which one it was."
+  (ignore-errors
+   (let ((names (make-hash-table))
+         (reg (find-symbol "*SB-ALL-THREADS*" "MODUS-INT"))
+         (slot (find-symbol "%THREAD-SLOT" "MODUS-INT")))
+     ;; modus's sb-thread has no LIST-ALL-THREADS: its registry is the list of threads it started
+     (when (and reg slot (boundp reg))
+       (dolist (th (symbol-value reg))
+         (let ((s (ignore-errors (funcall slot th))))
+           (when s (setf (gethash s names) (ignore-errors (sb-thread:thread-name th)))))))
+     (loop for k from 1 below 16
+           unless (zerop (modus-int::%gc-read64 (+ (modus-int::%thr-rec k) 0)))
+             collect (list k (if (< k (modus-int::%ha-nregions)) (floor (modus-int::%ha-rsize k) #x100000) 0)
+                           (gethash k names))))))
+
+;;; KILN_AUDIO_TAP=SECONDS: the first SECONDS of what is written to the speaker, kept and then saved
+;;; as Documents/audio-tap.raw (signed 16-bit little-endian, mono, +KILN-RATE+) -- exactly what the
+;;; device was handed, to listen to off the phone (`devicectl device copy from').
+(defvar *kiln-tap* nil "While tapping: (octets . fill).")
+(defun %kiln-tap-start ()
+  (let ((v (modus-int::%cli-getenv "KILN_AUDIO_TAP")))
+    (when (and v (plusp (length v)))
+      (let ((secs (or (ignore-errors (parse-integer v)) 20)))
+        (setf *kiln-tap* (cons (make-array (* 2 +kiln-rate+ secs) :element-type '(unsigned-byte 8)) 0))
+        (format t "~&kiln: tapping ~D s of the speaker~%" secs)))))
+(defun %kiln-tap (frame)
+  ;; from the first sound, not from launch: the silence before a station is tapped is no use
+  (when (and (zerop (cdr *kiln-tap*)) (every #'zerop frame))
+    (return-from %kiln-tap))
+  (let* ((buf (car *kiln-tap*)) (at (cdr *kiln-tap*)) (n (min (length frame) (floor (- (length buf) at) 2))))
+    (dotimes (i n)
+      (let ((x (logand (aref frame i) #xffff)))
+        (setf (aref buf (+ at (* 2 i))) (logand x 255) (aref buf (+ at (* 2 i) 1)) (ash x -8))))
+    (setf (cdr *kiln-tap*) (+ at (* 2 n)))
+    (when (>= (cdr *kiln-tap*) (length buf))
+      (let ((dir (%kiln-documents-dir)))
+        (setf *kiln-tap* nil)
+        (when dir
+          (with-open-file (o (concatenate 'string dir "audio-tap.raw") :direction :output
+                                                                         :element-type '(unsigned-byte 8)
+                                                                         :if-exists :supersede)
+            (write-sequence buf o))
+          (format t "~&kiln: speaker tap saved to ~Aaudio-tap.raw~%" dir))))))
 
 (defun %kiln-audio-write (frame)
+  (when *kiln-tap* (%kiln-tap frame))
   (%kiln-sys 1011 (+ (modus-int::%gc-word-of frame (modus-int::%conv-addr #x100050A0)) 7) (length frame) 0))
 
+(defvar *kiln-phase* :input "Which step of the main loop is running: an error names it.")
 (defun %kiln-pump-audio (mixer sink)
   "Mix and queue until the device holds *KILN-CUSHION* samples; at most a few ticks a call,
    so a long pause costs one cushion's catching-up and not a stall of the picture."
-  (dotimes (i 12)
+  (dotimes (i 30)
     (when (>= (%kiln-sys 1012 0 0 0) *kiln-cushion*) (return))
     (glass:mixer-tick mixer)
     (let ((f (glass:sink-next-frame sink)))
@@ -345,11 +510,106 @@
 (defvar *kiln-mono-font* nil)
 (defvar *kiln-desk* nil "The running desk, so an app can be registered on it from a REPL.")
 
+;;; ---- THE DESKTOP: glass.wm where the image has it, else glass.desk -------------------------------
+;;;
+;;; The phone's desktop is GLASS.WM -- the window manager the served glass desktop runs (OPEN LOOK
+;;; chrome, a window menu, raise/lower, Full Size), so the phone and the desktop are one window manager
+;;; with one app contract.  An image without it (the Zero's bare-metal board) keeps glass.desk, the lean
+;;; one.  Both take the same apps; these say the few things the loop and the apps ask of either, and
+;;; name glass.wm by string so this file reads where glass.wm was never loaded.
+
+(defun %wm-sym (name) (and (find-package "GLASS.WM") (find-symbol name "GLASS.WM")))
+(defun %wm-call (name &rest args) (apply (symbol-function (%wm-sym name)) args))
+(defun %wm-desk-p (desk)
+  (let ((ty (%wm-sym "WM"))) (and ty (typep desk ty))))
+
+(defvar *kiln-wm-scale* 2
+  "glass.wm's density for the desk's chrome: 2, touch-sized, unless the platform says otherwise
+   before the desk is made (the Zero's Settings: zero-display.lisp).")
+
+(defvar *kiln-desk-layout* nil
+  "glass.wm's layout for the desk: NIL, floating windows, or :RACK -- set by a platform whose screen
+   is a phone's (ios.lisp) before the desk is made.")
+
+(defvar *kiln-desk-setup-hooks* nil
+  "Functions of (DESK DW DH) run once the desk's own apps are registered: a platform's own windows
+   go on the desk here (the Zero's Settings).")
+
+(defun %kiln-make-desk (fb)
+  "A window manager over FB: glass.wm, at touch density, where the image has it."
+  (if (%wm-sym "MAKE-WM")
+      (progn
+        ;; TOUCH-SIZED CHROME: 2x OPEN LOOK -- a 44-point title bar, 40-point menu rows
+        (setf (symbol-value (%wm-sym "*WM-SCALE*")) *kiln-wm-scale*)
+        (let ((wm (%wm-call "MAKE-WM" fb)))
+          ;; THE RACK where the platform asks for it (iOS: ios.lisp): windows as rack units,
+          ;; scrolled and turned with the phone (glass.wm's rack.lisp).  KILN_WM=float keeps the
+          ;; desktop's floating windows.
+          (when (and (eq *kiln-desk-layout* :rack) (%wm-sym "WM-SET-LAYOUT")
+                     (not (equal (ignore-errors (modus-int::%cli-getenv "KILN_WM")) "float")))
+            (%wm-call "WM-SET-LAYOUT" wm :rack))
+          wm))
+      (glass.desk:make-desk fb)))
+
+(defun %kiln-desk-fb (desk)
+  (if (%wm-desk-p desk) (%wm-call "WM-FB" desk) (glass.desk:desk-fb desk)))
+
+(defun %kiln-desk-register-app (desk label make-fn &key (width 400) (height 300))
+  (if (%wm-desk-p desk)
+      (%wm-call "WM-REGISTER-APP" desk label make-fn :width width :height height)
+      (glass.desk:desk-register-app desk label make-fn :width width :height height)))
+
+(defun %kiln-desk-register-action (desk label thunk)
+  (if (%wm-desk-p desk)
+      (%wm-call "WM-REGISTER-ACTION" desk label thunk)
+      (glass.desk:desk-register-action desk label thunk)))
+
+(defun %kiln-desk-open (desk label)
+  (if (%wm-desk-p desk) (%wm-call "WM-OPEN" desk label) (glass.desk:desk-open desk label)))
+
+(defun %kiln-desk-key (desk down keysym)
+  (if (%wm-desk-p desk) (%wm-call "WM-KEY" desk down keysym) (glass.desk:desk-key desk down keysym)))
+
+(defun %kiln-desk-pointer (desk mask x y)
+  (if (%wm-desk-p desk) (%wm-call "WM-POINTER" desk mask x y) (glass.desk:desk-pointer desk mask x y)))
+
+(defun %kiln-desk-keyboard (desk fn)
+  "FN (lambda (on)) raises and lowers the host's keyboard as the focus takes text or not."
+  (if (%wm-desk-p desk)
+      (funcall (fdefinition (list 'setf (%wm-sym "WM-KEYBOARD-FN"))) fn desk)
+      (setf (glass.desk:desk-keyboard-fn desk) fn)))
+
+(defun %kiln-desk-focus-text-p (desk)
+  "Does the focused window take typing?"
+  (if (%wm-desk-p desk)
+      (let ((f (%wm-call "WM-FOCUS" desk)))
+        (and f (funcall (find-symbol "SURF-TEXT-P" "GLASS.WM") f)))
+      (let ((f (glass.desk::desk-focus desk))) (and f (glass.desk::win-text-p f)))))
+
+(defun %kiln-desk-tick (desk)
+  "Poll the windows and composite; (values CHANGED X Y W H), the rectangle to show.  glass.wm
+   reports its damage on the screen framebuffer (FB-MARK-FRAME), as its RFB sender reads it."
+  (if (%wm-desk-p desk)
+      (let ((fb (%wm-call "WM-FB" desk)))
+        (%wm-call "WM-TICK" desk)
+        (let ((d (nth-value 1 (glass:fb-take-frame fb)))
+              (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))
+          (cond ((null d) nil)
+                ((eq d :full) (values t 0 0 fw fh))
+                (t (destructuring-bind (x0 y0 x1 y1) d
+                     (let ((x0 (max 0 x0)) (y0 (max 0 y0)) (x1 (min fw x1)) (y1 (min fh y1)))
+                       (if (and (< x0 x1) (< y0 y1))
+                           (values t x0 y0 (- x1 x0) (- y1 y0))
+                           nil)))))))
+      (glass.desk:desk-tick desk)))
+
 (defun %kiln-terminal-app (fb)
   "A Lisp listener: see %KILN-TERMINAL-EVAL."
   (let ((lines (list "Lisp.  Enter evaluates; (detach FORM :name \"x\") runs it in the background."
                      "(ssh \"user@host:port\") connects this window to a remote shell."))
         (input "") (pending "") (history '()) (hpos -1) (dirty t)
+        ;; Control and Command (Super) held: a keyboard that sends its modifiers as keys (a Mac's) has them
+        (ctrl nil) (super nil)
         ;; an SSH session in this window: (conn chan host), its reader's inbox (strings, newest
         ;; first, :EOF at the end), and the unfinished last line of what it printed
         (remote nil) (inbox (list nil)) (partial "")
@@ -433,7 +693,14 @@
                      (setf pending (concatenate 'string all (string #\Newline)) input ""))))
              (key (ks)
                (let ((ch (%kiln-keysym-char ks)))
-                 (cond ((= ks #xff08)                       ; BackSpace
+                 (cond (super nil)                          ; a Command key: the host's or an app's, not text
+                       ((and ctrl (member ks '(#x63 #x43)))  ; C-c: the line is abandoned
+                        (add (concatenate 'string (prompt) input "^C"))
+                        (setf input "" pending "" hpos -1))
+                       ((and ctrl (member ks '(#x75 #x55))) (setf input ""))    ; C-u: the line is cleared
+                       ((and ctrl (member ks '(#x6c #x4c))) (setf lines '()))   ; C-l: the screen is
+                       (ctrl nil)
+                       ((= ks #xff08)                       ; BackSpace
                         (when (plusp (length input)) (setf input (subseq input 0 (1- (length input))))))
                        ((= ks #xff52)                       ; Up: the previous entry
                         (when (< (1+ hpos) (length history))
@@ -445,12 +712,16 @@
                        ((eql ch #\Newline) (enter))
                        (ch (setf input (concatenate 'string input (string ch))))))
                (setf dirty t)))
-      (values (lambda (down ks) (when down (key ks)))
+      (values (lambda (down ks)
+                (cond ((member ks '(#xffe3 #xffe4)) (setf ctrl down))        ; Control L/R
+                      ((member ks '(#xffeb #xffec)) (setf super down))       ; Super L/R: a Mac's Command
+                      (down (key ks))))
               nil
               (lambda () (when remote (take-remote)) (when dirty (setf dirty nil) (redraw) t))
               (lambda () (format nil "~{~a~%~}" (append lines (list input))))
               (lambda () (when remote (ignore-errors (funcall (%kiln-c "DISCONNECT") (first remote)))))
-              nil
+              ;; RESIZABLE: the lines are laid out from the framebuffer's size on every redraw
+              (lambda (w h) (glass:fb-resize fb w h paper) (setf dirty t))
               t))))                       ; it takes typing
 
 ;; THE FRAME QUEUE: steps that run one per frame, after the frame before them has been shown.  A
@@ -484,9 +755,163 @@
     (%kiln-sys 1005 addr (+ (* w k) (* (* h k) 65536))
                (+ (+ x0 (* x k)) (* (+ y0 (* y k)) 65536)) bw bpp)))
 
+;;; ---- the phone's files: Documents, and the document picker (host/ios/swift/Files.swift) ----------
+
+(defun %kiln-swift (name &rest args)
+  "Call the Swift function NAME (kiln-swift's SWIFT-CALL), or answer NIL where the image has no Swift
+   bridge or the host no such function (the Mac's modus-mac, the Zero)."
+  (let ((call (and (find-package "KILN-SWIFT") (find-symbol "SWIFT-CALL" "KILN-SWIFT"))))
+    (and call (fboundp call) (ignore-errors (apply call name args)))))
+
+(defun %kiln-swift-text (name text &rest more)
+  "Call NAME with TEXT's UTF-8 bytes (address, length) then MORE."
+  (let ((addr (find-symbol "%ADDR" "KILN-SWIFT")) (octets (find-symbol "%OCTETS" "KILN-SWIFT")))
+    (when (and addr octets)
+      (let ((b (funcall octets text)))
+        (apply #'%kiln-swift name (funcall addr b) (length b) more)))))
+
+(defun %kiln-documents-dir ()
+  "The app's Documents folder, ending in /, which the Files app shows as On My iPhone > the app
+   (Info.plist's UIFileSharingEnabled): or NIL without the Swift side."
+  (let* ((addr (find-symbol "%ADDR" "KILN-SWIFT"))
+         (buf (make-array 1024 :element-type '(unsigned-byte 8) :initial-element 0))
+         (n (and addr (%kiln-swift "files_documents" (funcall addr buf) 1024))))
+    (when (and n (< 0 n 1024))
+      (let ((s (map 'string #'code-char (subseq buf 0 n))))
+        (if (char= (char s (1- (length s))) #\/) s (concatenate 'string s "/"))))))
+
+;;; MEDIA'S PLACES, on a computer with a person's home (the Mac; vessel's boot sets *KILN-HOME-PLACES*): at the
+;;; root of Media's folder, their Music, Movies and Downloads, their home, and every folder they have chosen with
+;;; + -- which on a Mac chooses a folder to open where it is (and keeps it as a place) rather than copying files in.
+;;; The phone has none: its sandbox holds only the app's own folder, and its + copies in.
+
+(defvar *kiln-home-places* nil "True where Media should offer the person's own folders (a Mac).")
+
+(defun %kiln-places-file ()
+  (let ((d (%kiln-documents-dir))) (and d (concatenate 'string d "media-places"))))
+
+(defun %kiln-chosen-places ()
+  "The folders chosen with Media's +, as directories, those that are still there."
+  (let ((f (%kiln-places-file)))
+    (when (and f (probe-file f))
+      (with-open-file (in f)
+        (loop for line = (read-line in nil) while line
+              for d = (and (plusp (length line)) (uiop:directory-exists-p line))
+              when d collect d)))))
+
+(defun %kiln-remember-place (dir)
+  (let ((f (%kiln-places-file)) (name (namestring dir)))
+    (when (and f (not (member name (mapcar #'namestring (%kiln-chosen-places)) :test #'string=)))
+      (with-open-file (o f :direction :output :if-exists :append :if-does-not-exist :create)
+        (write-line name o)))))
+
+(defun %kiln-media-places ()
+  "(label . directory) for each of Media's places: the person's Music, Movies, Downloads and home, then what
+   they chose."
+  (let ((home (user-homedir-pathname)))
+    (append (loop for (label sub) in '(("Music" "Music/") ("Movies" "Movies/") ("Downloads" "Downloads/"))
+                  for d = (uiop:directory-exists-p (merge-pathnames sub home))
+                  when d collect (cons label d))
+            (list (cons "Home" home))
+            (loop for d in (%kiln-chosen-places)
+                  collect (cons (car (last (pathname-directory d))) d)))))
+
+(defun %kiln-set-places (lib)
+  (funcall (fdefinition (list 'setf (find-symbol "LIBRARY-PLACES" "WARP-MEDIA"))) (%kiln-media-places) lib))
+
+(defun %kiln-choose-folder ()
+  "Media's + on a Mac: the folder chooser; the folder chosen is opened where it is, and kept as a place."
+  (let ((h (%kiln-swift "files_choose_folder")))
+    (when (and h (plusp h))
+      (funcall (find-symbol "ON-EVENT" "KILN-SWIFT") :folder h
+               (lambda (path h)
+                 (declare (ignore h))
+                 (let ((lib glass.desk::*media-library*) (dir (uiop:directory-exists-p path)))
+                   (when (and lib dir)
+                     (%kiln-remember-place dir)
+                     (%kiln-set-places lib)
+                     (funcall (find-symbol "LIBRARY-OPEN" "WARP-MEDIA") lib dir))))))))
+
+(defun %kiln-media-dir (bundle)
+  "Where Media plays from: Documents/media/, which the Files app shows as On My iPhone > the app >
+   media, and where the + picker puts what it brings in (iCloud Drive and the rest); the bundle's
+   sample media are copied into its Samples folder the first time (a marker file remembers, so
+   Samples deleted stay deleted).  Without the Swift side, the bundle's own media/ folder."
+  (let ((docs (%kiln-documents-dir)))
+    (if (null docs)
+        (concatenate 'string bundle "media/")
+        (let* ((root (concatenate 'string docs "media/"))
+               (marker (concatenate 'string root ".kiln-seeded")))
+          (ignore-errors (ensure-directories-exist root))
+          (unless (probe-file marker)
+            (let ((addr (find-symbol "%ADDR" "KILN-SWIFT")) (octets (find-symbol "%OCTETS" "KILN-SWIFT")))
+              (let ((src (funcall octets (concatenate 'string bundle "media")))
+                    (dst (funcall octets (concatenate 'string root "Samples"))))
+                (%kiln-swift "files_copy" (funcall addr src) (length src) (funcall addr dst) (length dst))))
+            (ignore-errors (with-open-file (o marker :direction :output :if-exists :supersede)
+                             (write-line "seeded" o))))
+          root))))
+
+;;; GENERATIONAL GC FOR THE PHONE'S WORLD (modus docs/generational-gc.md).  The world core is
+;;; ~280 MB that survives every collection, and every region-0 collection copied all of it: a
+;;; film's pictures are shared arrays in the lock arena, which only a region-0 collection gives
+;;; back, so playing one collected ~20 times a second at ~30 ms a time (Mac; more on the phone),
+;;; and with the 64 MB worker regions carved region 0 had ~60 MB over its live data and starved.
+;;; Tenured, the world is an OLD space collections scan by card and never copy (~2 ms each).
+;;; FIRST A THREAD, so the regions and the lock arena are carved: region 0 cannot be carved once
+;;; it has an old space.  NO PROMOTION: a major collection copies the old space into a young
+;;; semispace, and the world (280 MB) does not fit in one (half of region 0's ~340 MB) -- so the
+;;; world stays old for good and only what the desk makes since boot is ever copied.
+;;; KILN_GC=plain leaves the plain collector.
+(defun %kiln-gen-gc-start ()
+  (cond ((not (fboundp 'gc-tenure)) nil)
+        ((equal (modus-int::%cli-getenv "KILN_GC") "plain") (format t "~&kiln: gc plain~%") nil)
+        ((ignore-errors (modus-int::%gc-old-space-p)) nil)
+        (t (handler-case
+               (progn
+                 (sb-thread:join-thread (sb-thread:make-thread (lambda () nil) :name "kiln-carve"))
+                 (let ((r (gc-tenure :promote nil)))
+                   (format t "~&kiln: gc generational, old ~D MB, young 2 x ~D MB~%"
+                           (floor (- (second r) (first r)) #x100000) (floor (third r) #x100000))
+                   r))
+             (error (e) (format t "~&kiln: gc tenure failed: ~A~%" e) nil)))))
+
+;;; THE SCREEN'S LAYOUT, at start and whenever the phone turns: (Y0 X0 DW DH) -- where the desk's
+;;; top-left device pixel is, and its size in desk pixels (K device pixels each).  PORTRAIT keeps
+;;; TOP points for the status bar and 20 for the home indicator, the desk centred across.
+;;; LANDSCAPE has no status bar, and the Dynamic Island and the home indicator are on the sides and
+;;; the bottom: the desk goes inside the safe area (pseudo-syscall 1001, 3..6: its insets in pixels).
+(defvar *kiln-safe-area* nil
+  "True where pseudo-syscall 1001 answers 3..6 with the safe area's insets (iOS: src/ios.lisp).
+   Elsewhere it answers something else for them -- the Zero, 1 -- and the layout is portrait's.")
+
+(defun %kiln-layout (sw sh k top &optional full)
+  (when full                                       ; over the whole screen: no margins at all
+    (return-from %kiln-layout (list 0 0 (floor sw k) (floor sh k))))
+  (flet ((inset (i) (and *kiln-safe-area*
+                         (let ((v (%kiln-sys 1001 i 0 0))) (if (and (integerp v) (>= v 0)) v nil)))))
+    (let ((st (inset 3)) (sl (inset 4)) (sb (inset 5)) (sr (inset 6)))
+      (if (and (> sw sh) st sl sb sr)
+          (let* ((uw (- sw sl sr)) (dw (floor uw k)) (dh (floor (- sh st sb) k)))
+            (list st (+ sl (floor (- uw (* dw k)) 2)) dw dh))
+          (let* ((y0 (* top k)) (dw (floor sw k)) (dh (floor (- sh y0 (* 20 k)) k)))
+            (list y0 (floor (- sw (* dw k)) 2) dw dh))))))
+
+(defun %kiln-apply-desk-size (desk sw sh dw dh)
+  "The desk is now DW x DH desk pixels on a SW x SH screen: clear the screen, resize the window
+   manager's (it lays its windows out again), and show all of it."
+  (%kiln-sys 1002 0 (+ sw (* sh 65536)) #x1E2530)
+  (if (%wm-desk-p desk)
+      (%wm-call "WM-RESIZE-SCREEN" desk dw dh)
+      (glass:fb-resize (%kiln-desk-fb desk) dw dh))
+  (glass:fb-mark-frame (%kiln-desk-fb desk) :full)
+  (when *kiln-present-changes* (funcall *kiln-present-changes*))
+  (%kiln-sys 1003 0 0 0))
+
 (defun kiln-app-main (&key autoplay (top 60) (media t))
   "The app: a glass desk (glass/desk) on the phone's screen -- windows dragged by their title
-   bars, a root menu on the background -- with the media player open.  AUTOPLAY, a file name in
+   bars, a root menu on the background -- with the Actions window open (the media player
+   without it).  AUTOPLAY, a file name in
    the bundle's media folder, starts playing once the first picture is up (kiln ios
    --autoplay=FILE) -- for trying a build without touching it.  MEDIA NIL leaves out the
    player and its codecs (warp, reel, reed, cassette) and opens the Clock instead: the
@@ -496,147 +921,350 @@
   (let* ((sw (%kiln-sys 1001 0 0 0))
          (sh (%kiln-sys 1001 1 0 0))
          (dir (or (%kiln-bundle-dir) "./"))
+         ;; MEDIA'S FOLDER is the phone's Documents (Files: On My iPhone > the app), not the bundle
+         (mdir (if media (%kiln-media-dir dir) (concatenate 'string dir "media/")))
          ;; THE SCREEN IS IN DEVICE PIXELS and the desk is laid out in desktop pixels, so glass
          ;; magnifies it, at the screen's own scale (3 on this phone): ONE DESK PIXEL IS ONE
          ;; POINT, and 16-pixel text is iOS's 16-point text.  At 2x it was two-thirds of that
          ;; and read as tiny.  Touches divide by the same K.
          (k (max 1 (%kiln-sys 1001 2 0 0)))
-         (y0 (* top (%kiln-sys 1001 2 0 0)))         ; TOP points: iOS's status bar
-         (dw (floor sw k))
-         (dh (floor (- sh y0 (* 20 k)) k))
-         (x0 (floor (- sw (* dw k)) 2))
-         (big (if (= k 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
+         ;; HIDPI: the desk is laid out in POINTS (DW x DH below) and drawn in the screen's own
+         ;; pixels -- glass.wm's density (WM-SET-DENSITY) -- so what knows about density (a page, a
+         ;; picture, a film) is sharp, and what does not is magnified by the window manager, as the
+         ;; whole desk used to be.  KILN_HIDPI=0: the whole desk magnified K times, as before.
+         (hidpi (and (%wm-sym "WM-SET-DENSITY") (> k 1)
+                     (not (equal (ignore-errors (modus-int::%cli-getenv "KILN_HIDPI")) "0"))))
+         (dens (if hidpi k 1))            ; desk pixels to a point
+         (mag (if hidpi 1 k))             ; screen pixels to a desk pixel
+         (lay (%kiln-layout sw sh k top))
+         (y0 (first lay)) (x0 (second lay)) (dw (third lay)) (dh (fourth lay))
+         (big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
          ;; SOUND: a mixer whose clock is this loop (see %KILN-PUMP-AUDIO), and a
          ;; speaker at its rate.  No speaker, no mixer -- the player then paces the
          ;; picture by the wall clock, as it did before there was sound.
          (speaker (zerop (%kiln-sys 1010 +kiln-rate+ 0 0)))
          (mixer (and speaker (glass:make-mixer :rate +kiln-rate+)))
          (sink (and mixer (glass:mixer-subscribe mixer :name "speaker" :rate +kiln-rate+)))
-         ;; warp is looked up when media is on: the iOS world may not carry it
+         ;; warp is looked up when media is on: the iOS world may not carry it.  Its player lists
+         ;; audio only now (a phone watching the DESKTOP over WebRTC cannot afford a video stream beside
+         ;; it); here the films are on the phone itself, so their containers go back on, as the Zero's do
+         (_ (when media
+              (let ((ext (find-symbol "*EXTENSIONS*" "WARP-MEDIA")))
+                (setf (symbol-value ext)
+                      (remove-duplicates (append '("webm" "mkv" "mp4" "m4v" "mov" "mpg" "mpeg" "ts")
+                                                 (symbol-value ext))
+                                         :test #'string=)))))
          (lib (and media (funcall (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")
-                                  :root (concatenate 'string dir "media/") :mixer mixer)))
-         (desk (glass.desk:make-desk (glass:make-framebuffer dw dh))))
+                                  :root mdir :mixer mixer)))
+         (desk (%kiln-make-desk (glass:make-framebuffer (* dw dens) (* dh dens)))))
+    (declare (ignorable _))
+    ;; NOW PLAYING: Media's player shown where the system shows what plays, and driven by the media keys
+    ;; (vessel's now-playing.lisp, where the world has it)
+    (when (and lib *kiln-home-places* (find-symbol "LIBRARY-PLACES" "WARP-MEDIA"))
+      (%kiln-set-places lib))
+    (let ((follow (and (find-package "KILN-MEDIA") (find-symbol "FOLLOW-PLAYER" "KILN-MEDIA"))))
+      (when (and lib follow (fboundp follow))
+        (funcall follow (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib))))
     (setf *kiln-desk* desk)
+    (when hidpi
+      ;; the window manager's chrome and units in points at this density; a screen this many
+      ;; pixels across is not an RFB client's to refuse (*SCREEN-MAX*)
+      (%wm-call "WM-SET-DENSITY" desk dens)
+      (setf (symbol-value (%wm-sym "*WM-SCALE*")) (* *kiln-wm-scale* dens))
+      (let ((mx (%wm-sym "*SCREEN-MAX*"))) (when mx (setf (symbol-value mx) 8192))))
     ;; a window's copy box puts its text on the host's clipboard (the iPhone's pasteboard)
     (when (fboundp '%kiln-copy-text)
       (setf glass.desk:*desk-copy* (symbol-function '%kiln-copy-text)))
-    (format t "~&kiln: ~Dx~D screen, desk ~Dx~D at ~Dx, media from ~A~%" sw sh dw dh k dir)
+    (format t "~&kiln: ~Dx~D screen, desk ~Dx~D at ~Dx, media from ~A~%" sw sh dw dh k mdir)
     (%kiln-sys 1002 0 (+ sw (* sh 65536)) #x1E2530)
     ;; TOUCH-SIZED CHROME: a 34-point title bar to drag by, 44-point menu rows (iOS's
     ;; minimum touch target), 16-point labels
-    (setf glass.desk:*title-h* 34 glass.desk:*menu-item-h* 44 glass.desk:*menu-w* 220
-          glass.desk:*font-size* 16)
+    (unless (%wm-desk-p desk)
+      (setf glass.desk:*title-h* 34 glass.desk:*menu-item-h* 44 glass.desk:*menu-w* 220
+            glass.desk:*font-size* 16))
     ;; the media and notes windows take the width of the phone
     ;; FIVE values, then NIL: warp's MAKE-MEDIA-WINDOW answers the WM surface contract, whose
     ;; sixth value is its CONSUMER -- and the desk reads an app's sixth value as TEXT-P, so the
     ;; player counted as a text window and raised the keyboard at launch.
+    ;; MEDIA is glass's, as the served desktop's: tabs for Music (warp's player, over this library),
+    ;; Stations (internet radio through spool, on this mixer), Pictures and Documents -- or warp's
+    ;; player alone where the image has no glass Media.
     (when media
-      (glass.desk:desk-register-app desk "Media"
-                                    (lambda (fb)
-                                      (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
-                                          (funcall (find-symbol "MAKE-MEDIA-WINDOW" "WARP-MEDIA-GLASS") fb lib)
-                                        (values on-key on-pointer dirty-p copy-p close-fn nil)))
-                                    :width dw :height 440))
-    (glass.desk:desk-register-app desk "Clock" #'%kiln-clock-app :width 260 :height 110)
-    (glass.desk:desk-register-app desk "Notes" #'%kiln-notes-app
+      (let ((glass-media (find-symbol "MEDIA-APP" "GLASS.DESK")))
+        (if (and glass-media (fboundp glass-media))
+            (progn
+              (setf glass.desk::*media-library* lib
+                    glass.desk::*media-mixer* mixer
+                    glass.desk::*media-root* mdir)
+              ;; THE + at the end of Media's tabs: the system's document picker, iCloud Drive and
+              ;; every other provider, its picks copied into the folder Media is showing
+              (let ((import (find-symbol "*MEDIA-IMPORT*" "GLASS.DESK")))
+                (when (and import (%kiln-documents-dir))
+                  (setf (symbol-value import)
+                        (if *kiln-home-places*
+                            #'%kiln-choose-folder
+                        (lambda ()
+                          (let ((lib glass.desk::*media-library*))
+                            (%kiln-swift-text "files_pick"
+                                              (namestring
+                                               (if lib
+                                                   (funcall (find-symbol "LIBRARY-FOLDER" "WARP-MEDIA") lib)
+                                                   mdir)))))))))
+              (%kiln-desk-register-app desk "Media"
+                                       (lambda (fb)
+                                         ;; EVERY value: its RESIZE-FN (the rack widens it when the phone
+                                         ;; turns), DRAG-P (in THEATER a swipe is the rack's) and its tenth,
+                                         ;; FULLSCREEN-P (in THEATER it is shown over the whole screen)
+                                         (values-list (multiple-value-list (funcall glass-media fb))))
+                                       :width dw :height (min dh 560)))
+            (%kiln-desk-register-app desk "Media"
+                                     (lambda (fb)
+                                       ;; warp's sixth value is its consumer: resizing is the
+                                       ;; framebuffer, then RESYNC (it lays out from the framebuffer)
+                                       (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn consumer)
+                                           (funcall (find-symbol "MAKE-MEDIA-WINDOW" "WARP-MEDIA-GLASS") fb lib)
+                                         (values on-key on-pointer dirty-p copy-p close-fn
+                                                 (lambda (w h)
+                                                   (glass:fb-resize fb w h #x0c0e12)
+                                                   (let ((resync (find-symbol "RESYNC" "WARP")))
+                                                     (when (and resync consumer) (funcall resync consumer)))))))
+                                     :width dw :height 440))))
+    (%kiln-desk-register-app desk "Clock" #'%kiln-clock-app :width 260 :height 110)
+    (%kiln-desk-register-app desk "Notes" #'%kiln-notes-app
                                   :width (if media dw (min dw 420)) :height 300)
+    ;; PAINT, glass's own (desk-apps), as the served desktop has it: a finger draws
+    (let ((app (find-symbol "PAINT-APP" "GLASS.DESK")))
+      (when (and app (fboundp app))
+        (%kiln-desk-register-app desk "Paint" (symbol-function app) :width dw :height (min dh 420))))
     ;; the terminal-emulating Terminal (zero-term.lisp: glass/term + quill) where the image has it
-    (glass.desk:desk-register-app desk "Terminal"
+    (%kiln-desk-register-app desk "Terminal"
                                   (if (fboundp '%kiln-vt-terminal-app)
                                       (symbol-function '%kiln-vt-terminal-app)
                                       #'%kiln-terminal-app)
                                   :width (min dw 600) :height 320)
     ;; the board's serial console, dmesg style, with a line to type into (zero-console.lisp)
     (when (and (fboundp 'kiln-console-available-p) (funcall 'kiln-console-available-p))
-      (glass.desk:desk-register-app desk "Console" (symbol-function '%kiln-console-app)
+      (%kiln-desk-register-app desk "Console" (symbol-function '%kiln-console-app)
                                     :width (min dw 600) :height 320))
     ;; THE ACTIONS window (actions.lisp, when it is loaded): a grid of buttons, each typing a form into a Terminal
     (when (fboundp '%kiln-actions-app)
-      (glass.desk:desk-register-app desk "Actions" (symbol-function '%kiln-actions-app)
+      (%kiln-desk-register-app desk "Actions" (symbol-function '%kiln-actions-app)
                                     :width (min dw 300) :height 220))
+;; SPEAK AND LISTEN (glass/voice-apps), where the image has them: the desk's voice and ear by hand, over
+    ;; whatever voice and ear glass has -- the session's chord and stave, or the phone's own (speech.lisp)
+    (let ((speak (find-symbol "SPEAK-APP" "GLASS.DESK")) (listen (find-symbol "LISTEN-APP" "GLASS.DESK")))
+      (when (and speak (fboundp speak))
+        (%kiln-desk-register-app desk "Speak" (symbol-function speak) :width (min dw 400) :height 300))
+      (when (and listen (fboundp listen))
+        (%kiln-desk-register-app desk "Listen" (symbol-function listen) :width (min dw 400) :height 320)))
+    ;; THE MIXER (glass/mixer-desk), where the image has it: what is playing into the speaker, each thing's
+    ;; level, mute and gain, and who reads the mix -- this loop's mixer, the one the speaker hears
+    (let ((app (find-symbol "MIXER-APP" "GLASS.DESK")))
+      (when (and app (fboundp app))
+        (%kiln-desk-register-app desk "Mixer" (lambda (fb) (funcall app fb mixer))
+                                      :width (min dw 420) :height 360)))
+    ;; THE STORYBOOK of the native components (ios-storybook.lisp), where the image has it: not a window -- its
+    ;; views are the platform's own, over the desk -- so a menu action
+    (when (find-package "KILN-STORYBOOK")
+      (%kiln-desk-register-action desk "Storybook"
+                                       (lambda () (funcall (find-symbol "STORYBOOK" "KILN-STORYBOOK")))))
+    ;; BITCHAT (chirp/app), where the image has it: a chat with phones nearby over Bluetooth, in native screens
+    ;; over the desk -- like the storybook, a menu action
+    (when (find-package "CHIRP-APP")
+      (%kiln-desk-register-action desk "Bitchat"
+                                       (lambda () (funcall (find-symbol "OPEN-CHAT" "CHIRP-APP")))))
+    ;; WEB (browser.lisp), where the image has it: loom, the browser over weft
+    (let ((app (and (find-package "KILN-BROWSER") (find-symbol "BROWSER-APP" "KILN-BROWSER"))))
+      (when (and app (fboundp app))
+        (%kiln-desk-register-app desk "Web" (symbol-function app) :width dw :height (min dh 680))))
+    ;; FILES (files.lisp), where the image has it: warren, the column file browser, over Documents/
+    (let ((app (and (find-package "KILN-FILES") (find-symbol "FILES-APP" "KILN-FILES"))))
+      (when (and app (fboundp app))
+        (%kiln-desk-register-app desk "Files" (symbol-function app) :width dw :height (min dh 560))))
+    ;; OPERANDI (operandi.lisp), where the image has it: the agent's chat in a window, the phone's own input
+    (let ((app (and (find-package "KILN-OPERANDI") (find-symbol "OPERANDI-APP" "KILN-OPERANDI"))))
+      (when (and app (fboundp app))
+        (%kiln-desk-register-app desk "Operandi" (symbol-function app) :width dw :height (min dh 640))))
+    ;; the platform's own windows
+    (dolist (f *kiln-desk-setup-hooks*)
+      (handler-case (funcall f desk dw dh)
+        (serious-condition (e) (format t "~&desk setup hook ~A: ~A~%" f e))))
     ;; THE KEYBOARD follows the focus: the desk raises the phone's keyboard (pseudo-syscall 1006)
     ;; when a window that takes text is opened or tapped into, and puts it away when you tap
     ;; elsewhere; what is typed arrives as key events below
-    (setf (glass.desk:desk-keyboard-fn desk)
-          (lambda (on) (%kiln-sys 1006 (if on 1 0) 0 0)))
-    (glass.desk:desk-open desk (if media "Media" "Clock"))
+    (%kiln-desk-keyboard desk (lambda (on) (%kiln-sys 1006 (if on 1 0) 0 0)))
+    ;; THE FIRST WINDOW: Actions, where the image has it (a phone's first look is what it can do); else the
+    ;; media player, else the Clock.  An autoplay opens the player too, below.
+    (%kiln-desk-open desk (cond ((fboundp '%kiln-actions-app) "Actions") (media "Media") (t "Clock")))
     (format t "~&kiln: ~:[no speaker~;speaker at ~D Hz~]~%" speaker +kiln-rate+)
+    (when lib (setf *kiln-stats-player* (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib)))
+    (when (%kiln-stats-on-p)
+      ;; master's player has no worker stats (they were the modus-threads branch's): ask, don't assume
+      (let ((s (find-symbol "*WORKER-STATS*" "WARP-MEDIA"))) (when s (setf (symbol-value s) t))))
+    (%kiln-stats-init)
+    (%kiln-tap-start)
+    (%kiln-gen-gc-start)
+    ;; KILN_AUTOPLAY=FILE: play one of the films at launch (devicectl / simctl pass it), as :AUTOPLAY does
+    (let ((a (modus-int::%cli-getenv "KILN_AUTOPLAY")))
+      (when (and a (> (length a) 0) (not autoplay)) (setq autoplay a)))
     (when (and media autoplay)
       (let ((path (concatenate 'string dir "media/" autoplay)))
         (if (probe-file path)
             (progn (format t "~&kiln: autoplay ~A~%" autoplay)
+                   (when (fboundp '%kiln-actions-app) (%kiln-desk-open desk "Media"))
                    (funcall (find-symbol "PLAY-PATH" "WARP-MEDIA")
                             (funcall (find-symbol "LIBRARY-PLAYER" "WARP-MEDIA") lib) path))
             (format t "~&kiln: autoplay ~A: no such file~%" autoplay))))
     (when media
       (format t "~&kiln: ~D track~:P~%"
-              (length (funcall (find-symbol "FOLDER-TRACKS" "WARP-MEDIA")
-                               (concatenate 'string dir "media/")))))
+              (length (funcall (find-symbol "FOLDER-TRACKS" "WARP-MEDIA") mdir))))
     ;; THE UI SYNC: what has changed is shown now.  A Return is handled only after this, so a line
     ;; is drawn before it is evaluated (a form may block for a long time), and pasted text, which
     ;; arrives as keys, shows before its newline runs.
     (setf *kiln-present-changes*
           (lambda ()
-            (multiple-value-bind (changed x y w h) (glass.desk:desk-tick desk)
+            (multiple-value-bind (changed x y w h) (%kiln-desk-tick desk)
               (when changed
-                (if (eq (glass:fb-format (glass.desk:desk-fb desk)) :xrgb)
+                (if (eq (glass:fb-format (%kiln-desk-fb desk)) :xrgb)
                     (progn
-                      (if (= k 1)
-                          (%kiln-blit-region (glass.desk:desk-fb desk) 1 x0 y0 x y w h)
+                      (if (= mag 1)
+                          (%kiln-blit-region (%kiln-desk-fb desk) 1 x0 y0 x y w h)
                           (progn
-                            (glass:fb-blit-scaled-region big (glass.desk:desk-fb desk) k x y w h)
-                            (%kiln-blit-region big k x0 y0 x y w h)))
+                            (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) mag x y w h)
+                            (%kiln-blit-region big mag x0 y0 x y w h)))
                       (%kiln-sys 1003 0 0 0))
-                    (%kiln-sys 1007 (glass.desk:desk-fb desk) 0 0))))))
+                    (%kiln-sys 1007 (%kiln-desk-fb desk) 0 0))))))
     ;; A tap or a repaint that signals is logged and dropped: one bad gesture
     ;; must not take the app down (an error out of here ends the process).
+    (let ((vsync (and (not (fboundp '%kiln-frame-wait)) (>= (%kiln-sys 1008 34 0 0) 0)))
+          (held nil)
+          (full nil))                     ; the desk is over the whole screen, for a unit that asked
+    (format t "~&kiln: frames paced by ~:[a sleep~;the display~]~%" vsync)
     (loop
      (handler-case
-      (let ((e (%kiln-sys 1004 0 0 0)))
+      (let ((e (or (shiftf held nil) (%kiln-sys 1004 0 0 0))))
+        ;; MOVES COALESCE: of a run of finger moves waiting together only the last matters -- a
+        ;; drag recomposited the window for every one, and a 120 Hz touch screen reports two or
+        ;; more a frame.  The first event that is not a move is held for the next pass.
+        (when (= (floor e 1099511627776) 2)
+          (loop (let ((n (%kiln-sys 1004 0 0 0)))
+                  (cond ((zerop n) (return))
+                        ((= (floor n 1099511627776) 2) (setq e n))
+                        (t (setq held n) (return))))))
         (if (zerop e)
-            (let ((t0 (get-internal-real-time)))
+            (let ((t0 (get-internal-real-time))
+                  (queued (and *kiln-stats* mixer (%kiln-sys 1012 0 0 0)))
+                  (tp 0))
+              ;; FULL SCREEN: a unit filling a turned screen asks for all of it (Media's theater):
+              ;; the desk goes over the safe area's margins, and comes back inside them after
+              (when (and (%wm-desk-p desk) (%wm-sym "WM-WANTS-FULLSCREEN"))
+                (let ((want (and (%wm-call "WM-WANTS-FULLSCREEN" desk) t)))
+                  (unless (eq want full)
+                    (setq full want)
+                    (let ((lay (%kiln-layout sw sh k top full)))
+                      (setq y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
+                            big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
+                      (%wm-call "WM-SET-FULLSCREEN" desk full)
+                      (%kiln-apply-desk-size desk sw sh (* dw dens) (* dh dens))))))
+              (setf *kiln-phase* :audio)
               (when mixer (%kiln-pump-audio mixer sink))
+              (setf *kiln-phase* :tick)
+              (setf tp (get-internal-real-time))
               ;; ONLY WHAT CHANGED is magnified and shown: a video window is a fifth of the
               ;; screen, and the whole of it 2x was most of a frame
-              (multiple-value-bind (changed x y w h) (glass.desk:desk-tick desk)
+              (multiple-value-bind (changed x y w h) (%kiln-timed (:tick) (%kiln-desk-tick desk))
                 (when changed
-                  (if (eq (glass:fb-format (glass.desk:desk-fb desk)) :xrgb)
+                  (%kiln-stats-add :blits 1) (%kiln-stats-add :px (* w h))
+                  (if (eq (glass:fb-format (%kiln-desk-fb desk)) :xrgb)
                       (progn
                         ;; at 1x the magnified copy IS the desk: show it straight from there
                         ;; (the copy was a tenth of a Pi Zero's drag frame)
-                        (if (= k 1)
-                            (%kiln-blit-region (glass.desk:desk-fb desk) 1 x0 y0 x y w h)
+                        (if (= mag 1)
+                            (%kiln-timed (:blit) (%kiln-blit-region (%kiln-desk-fb desk) 1 x0 y0 x y w h))
                             (progn
-                              (glass:fb-blit-scaled-region big (glass.desk:desk-fb desk) k x y w h)
-                              (%kiln-blit-region big k x0 y0 x y w h)))
-                        (%kiln-sys 1003 0 0 0))
+                              (%kiln-timed (:scale) (glass:fb-blit-scaled-region big (%kiln-desk-fb desk) mag x y w h))
+                              (%kiln-timed (:blit) (%kiln-blit-region big mag x0 y0 x y w h))))
+                        (%kiln-timed (:blit) (%kiln-sys 1003 0 0 0)))
                       ;; A Y'CbCr desk (glass :I420) is shown as it is: the platform scans
                       ;; the planes out (pseudo-syscall 1007, the Zero's HVS)
-                      (%kiln-sys 1007 (glass.desk:desk-fb desk) 0 0))))
+                      (%kiln-sys 1007 (%kiln-desk-fb desk) 0 0))))
+              (when *kiln-stats*
+                (%kiln-stats-pass (floor (- (get-internal-real-time) t0) 1000)
+                                  (floor (- (get-internal-real-time) tp) 1000) queued))
+              (setf *kiln-phase* :hooks)
               (%kiln-run-queued-frame)
-              (%kiln-run-frame-hooks)
+              (%kiln-timed (:hooks) (%kiln-run-frame-hooks))
+              (setf *kiln-phase* :input)
               ;; a frame is 16 ms; sleep only what is left of it, not 16 ms on top of the work --
               ;; or spend it on the platform's own work (the Zero's sockets, when they share
               ;; this thread) if it has a way to wait that does that
-              (let ((left (- 16 (floor (- (get-internal-real-time) t0) 1000))))
-                (when (> left 1)
-                  (if (fboundp '%kiln-frame-wait) (funcall '%kiln-frame-wait left) (modus-int::%sleep-ms left)))))
-            (let ((type (floor e 1099511627776))
+              ;; THE PHONE'S FRAME CLOCK (pseudo-syscall 1008, a CADisplayLink): wait for the
+              ;; screen's next refresh, so a frame is drawn once a refresh and in step with it.  A
+              ;; 16 ms sleep overslept to ~22 (45 frames a second) and drifted against the display:
+              ;; a drag stuttered.  Elsewhere the sleep stays.
+              (if vsync
+                  (%kiln-timed (:wait) (%kiln-sys 1008 34 0 0))
+                  (let ((left (- 16 (floor (- (get-internal-real-time) t0) 1000))))
+                    (when (> left 1)
+                      (if (fboundp '%kiln-frame-wait) (funcall '%kiln-frame-wait left) (modus-int::%sleep-ms left))))))
+            (let ((type (logand (floor e 1099511627776) #xFF))
                   (y (logand (floor e 1048576) #xFFFFF))
                   (x (logand e #xFFFFF)))
-              (if (= type 4)
-                  ;; a key: the keysym is the low 40 bits; a press and its release
-                  (let ((ks (logand e #xFFFFFFFFFF)) (focus (glass.desk::desk-focus desk)))
+              (cond
+                ;; THE KEYBOARD (type 7): it covers X device pixels at the bottom of the screen.
+                ;; What it hides of the desk, in desk pixels, goes to the window manager, which
+                ;; lays the rack out in what is left (glass.wm WM-SET-OBSCURED).
+                ((= type 7)
+                 (let* ((desk-bottom (+ y0 (* dh k)))
+                        (hidden (max 0 (ceiling (- desk-bottom (- sh x)) mag))))
+                   (when (and (%wm-desk-p desk) (%wm-sym "WM-SET-OBSCURED"))
+                     (%wm-call "WM-SET-OBSCURED" desk hidden))))
+                ;; THE PHONE TURNED (type 6): the screen is now X by Y pixels.  Lay the desk out
+                ;; again and let glass.wm fit the windows to it (WM-RESIZE-SCREEN, as a VNC
+                ;; client's resize); it repaints the whole screen.
+                ((= type 6)
+                 (let ((lay (%kiln-layout x y k top)))
+                   (setq sw x sh y full nil
+                         y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
+                         big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
+                   (format t "~&kiln: turned: ~Dx~D screen, desk ~Dx~D~%" sw sh dw dh)
+                   (when (and (%wm-desk-p desk) (%wm-sym "WM-SET-FULLSCREEN"))
+                     (%wm-call "WM-SET-FULLSCREEN" desk nil))
+                   (%kiln-apply-desk-size desk sw sh (* dw dens) (* dh dens))))
+                ;; WHAT THE DESK DOES NOT TAKE (types 13 and up): a held pointer's motion (13, a Mac game's
+                ;; mouse-look), a finger's own touch (14, a phone game's sticks, sent beside the 1/2/3 the
+                ;; desk reads)
+                ((>= type 13) nil)
+                ;; A POINTER WITH ITS BUTTONS (type 12, a Mac's): X11's mask in bits 48 up -- 1 left, 2
+                ;; middle, 4 right, 8 and 16 the wheel up and down, 32 and 64 left and right
+                ((= type 12)
+                 (%kiln-stats-add :events 1)
+                 (%kiln-timed (:input)
+                   (%kiln-desk-pointer desk (logand (ash e -48) #xFF)
+                                       (floor (- x x0) mag) (floor (- y y0) mag))))
+                (t
+              (if (or (= type 4) (= type 8) (= type 9))
+                  ;; a key: the keysym is the low 40 bits.  4 is a press and its release (the phone's
+                  ;; keyboard, text typed in); 8 a press alone and 9 a release (a Mac's keys, the
+                  ;; modifiers among them)
+                  (let ((ks (logand e #xFFFFFFFFFF)))
                     ;; ~ or / with no text window focused opens a Terminal (typed into one,
                     ;; they are just characters)
-                    (if (and (or (= ks #x7e) (= ks #x2f))
-                             (not (and focus (glass.desk::win-text-p focus))))
-                        (glass.desk:desk-open desk "Terminal")
-                        (progn (when (and (= ks #xff0d) *kiln-present-changes*)
-                                 (funcall *kiln-present-changes*))   ; the line is drawn before it runs
-                               (glass.desk:desk-key desk t ks)
-                               (glass.desk:desk-key desk nil ks))))
-                  (glass.desk:desk-pointer desk (if (or (= type 3) (= type 5)) 0 1)
-                                           (floor (- x x0) k) (floor (- y y0) k))))))
-       (error (c) (format t "~&kiln: ~A~%"
-                          (if (fboundp 'modus-int::%escape-describe) (modus-int::%escape-describe c) c)))))))
+                    (cond ((and (or (= ks #x7e) (= ks #x2f))
+                                (/= type 9)
+                                (not (%kiln-desk-focus-text-p desk)))
+                           (%kiln-desk-open desk "Terminal"))
+                          ((= type 9) (%kiln-desk-key desk nil ks))
+                          (t (when (and (= ks #xff0d) *kiln-present-changes*)
+                               (funcall *kiln-present-changes*))   ; the line is drawn before it runs
+                             (%kiln-desk-key desk t ks)
+                             (when (= type 4) (%kiln-desk-key desk nil ks)))))
+                  (progn
+                    (%kiln-stats-add :events 1)
+                    (%kiln-timed (:input)
+                      (%kiln-desk-pointer desk (if (or (= type 3) (= type 5)) 0 1)
+                                          (floor (- x x0) mag) (floor (- y y0) mag))))))))))
+       ;; SERIOUS-CONDITION, not ERROR: a condition that is not an ERROR (a STORAGE-CONDITION, say) escaped
+       ;; this loop, KILN-APP-MAIN returned, and the app ended with exit code 0 and nothing said
+       (serious-condition (c) (format t "~&kiln: [~A] ~A: ~A~%" *kiln-phase* (type-of c)
+                                      (if (fboundp 'modus-int::%escape-describe) (modus-int::%escape-describe c) c))))))))
