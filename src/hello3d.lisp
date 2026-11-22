@@ -407,9 +407,10 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
 (defparameter *dusk* #x1d2a3c "The sky, and the fog the far things fade into.")
 
 (defun corner (scale ox oy)
-  "Clip space shrunk by SCALE and moved to OX OY (in -1..1): a small picture drawn in a corner of the view."
+  "Clip space shrunk by SCALE and moved to OX OY (in -1..1): a small picture drawn in a corner of the view.  Its
+   depth is squeezed into the nearest thousandth, so it is in front of the scene and still sorted within itself."
   (let ((m (identity-mat)))
-    (setf (aref m 0) (float scale 1.0) (aref m 5) (float scale 1.0)
+    (setf (aref m 0) (float scale 1.0) (aref m 5) (float scale 1.0) (aref m 10) 0.001
           (aref m 12) (float ox 1.0) (aref m 13) (float oy 1.0))
     m))
 
@@ -424,16 +425,18 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
       (kiln-sound:spatial-head-attitude)))
 
 (defun draw-head (pass g w h)
-  "The listener's head, turned as the headphones say, seen as from just behind and above it -- its nose points into
-   the screen while you face the screen -- in the view's lower right."
+  "The listener's head, turned as the headphones say, seen from straight behind it at eye level -- an overlay of
+   your own head, its pointer into the screen while you face the screen -- in the view's lower right."
   (multiple-value-bind (yaw pitch roll) (head-attitude g)
     (when (and yaw (game-line-pipeline g))
       (let* ((model (mat* (rotation-y yaw) (mat* (rotation-x pitch) (rotation-z (- roll)))))
-             (view (mat* (translation 0 0.1 -5.2) (rotation-x 0.22)))   ; from behind and a little above
+             (view (translation 0 0 -5.2))   ; from straight behind, at eye level: your own head, not a model in the scene
              (transform (mat* (corner 0.3 0.72 -0.6) (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view model))))
              ;; 2.5 points wide: the half-width in pixels, then half the view
              (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0)))
-        (kiln-gpu:gpu-depth pass :none)
+        ;; depth tested: over the scene (the corner's depth is the nearest thousandth), and the head's own lines in
+        ;; front of one another as they are -- the nose behind the head is hidden where the head's lines cross it
+        (kiln-gpu:gpu-depth pass :test-and-write)
         (kiln-gpu:gpu-cull pass :none)
         (kiln-gpu:gpu-use pass (game-line-pipeline g))
         (kiln-gpu:gpu-bind pass (game-egg g) 0)
