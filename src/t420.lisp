@@ -5,7 +5,7 @@
 ;;;;
 ;;;; The platform layer for app.lisp, as zero.lisp is for the Pi Zero, over the bare i386
 ;;;; image's own drivers: kernel/net/pc-vbe.lisp (VBE through the pcboot shim's PM_BIOS, the
-;;;; framebuffer mapped at #x0C000000) and plain port I/O for the 8042.  `kiln t420' installs
+;;;; framebuffer mapped at #x0E000000) and plain port I/O for the 8042.  `kiln t420' installs
 ;;;; this file, app.lisp, glass and scribe into the image under QEMU and saves the core; the
 ;;;; core's restart hook is KILN-T420-MAIN.
 ;;;;
@@ -301,10 +301,93 @@
   (if *t4-events* (pop *t4-events*) 0))
 
 (defun %kiln-frame-wait (ms)
-  "Sleep out the rest of a frame, polling the keyboard and mouse meanwhile."
+  "Sleep out the rest of a frame, polling the keyboard and mouse meanwhile; the log goes to
+   the disk from here when it has news."
+  (%t4-log-idle)
   (let ((end (+ (get-internal-real-time) (* ms (floor internal-time-units-per-second 1000)))))
     (loop (%t4-poll)
           (when (or *t4-events* (>= (get-internal-real-time) end)) (return)))))
+
+;;; --- the log on the boot disk --------------------------------------------------------------------
+;;; A PC like the T420 has no serial port, and a camera cannot read 14-pixel text, so what the
+;;; console prints from the desk's start (DHCP, the NIC's diagnostics, errors: pc-console.lisp's
+;;; console ring) and what the desk says (T4-LOG) go to a RAM log, written to the boot disk's last 2 MB through the BIOS (INT 13h AH=43h, the pcboot
+;;; shim's PM_BIOS) when the desk is idle.  On the rig the disk is the Pi Zero's USB gadget, so
+;;; the log is read straight out of its image file; on a stick, out of the stick:
+;;;   LBA +0: "T4LOG" then the byte count (u32 at +8) and the flush count (+12); data from LBA +1.
+;;; `kiln t420' pads the disk so the region exists (*T4-LOG-LBA*, 4096 sectors).
+
+(defvar *t4-log-lba* 64000)
+(defvar *t4-log* (make-array (* 1024 1024) :element-type '(unsigned-byte 8)))
+(defvar *t4-log-n* 0)           ; bytes in the log
+(defvar *t4-log-flushed* 0)     ; bytes on the disk
+(defvar *t4-log-flushes* 0)
+(defvar *t4-log-at* 0)          ; GET-INTERNAL-REAL-TIME of the last flush
+
+(defun t4-log-byte (b)
+  (when (< *t4-log-n* (length *t4-log*))
+    (setf (aref *t4-log* *t4-log-n*) b *t4-log-n* (+ *t4-log-n* 1))))
+
+(defun t4-log (fmt &rest args)
+  "Append a line to the disk log, as FORMAT would print it."
+  (let ((s (apply #'format nil fmt args)))
+    (dotimes (i (length s)) (t4-log-byte (logand (char-code (char s i)) 255)))
+    (t4-log-byte 10)
+    nil))
+
+(defun %t4-disk-write (lba nsec)
+  "Write NSEC (<= 64) sectors from #x30000 to LBA of the boot disk.  T when the BIOS said yes."
+  (setf (mem-ref #xC000 :u8) 16 (mem-ref #xC001 :u8) 0
+        (mem-ref #xC002 :u8) nsec (mem-ref #xC003 :u8) 0
+        (mem-ref #xC004 :u32) 0                       ; buffer offset 0 ...
+        (mem-ref #xC006 :u8) #x00 (mem-ref #xC007 :u8) #x30   ; ... segment 3000h
+        (mem-ref #xC008 :u32) lba (mem-ref #xC00C :u32) 0)
+  (and (modus-int::%pcbios-int #x13 #x4300 0 0 (logand (mem-ref #x58C :u32) #xFF) #xC000 0 0)
+       (zerop (logand (modus-int::%pcbios-out 40) 1))))   ; carry clear
+
+(defun t4-log-flush ()
+  "Write what is new in the log (whole sectors from the first unwritten one), then the header."
+  (%t4-ring-drain)
+  (when (and (> *t4-log-n* *t4-log-flushed*) (modus-int::%pcbios-present-p))
+    (let* ((first (floor *t4-log-flushed* 512)) (last (ceiling *t4-log-n* 512)) (s first))
+      (loop while (< s last)
+            do (let ((n (min 64 (- last s))))
+                 (dotimes (i (* n 512))
+                   (let ((k (+ (* s 512) i)))
+                     (setf (mem-ref (+ #x30000 i) :u8) (if (< k *t4-log-n*) (aref *t4-log* k) 0))))
+                 (%t4-disk-write (+ *t4-log-lba* 1 s) n)
+                 (setq s (+ s n))))
+      (setq *t4-log-flushes* (+ *t4-log-flushes* 1))
+      (dotimes (i 512) (setf (mem-ref (+ #x30000 i) :u8) 0))
+      (let ((m "T4LOG")) (dotimes (i 5) (setf (mem-ref (+ #x30000 i) :u8) (char-code (char m i)))))
+      (setf (mem-ref #x30008 :u32) *t4-log-n* (mem-ref #x3000C :u32) *t4-log-flushes*)
+      (%t4-disk-write *t4-log-lba* 1)
+      (setq *t4-log-flushed* *t4-log-n* *t4-log-at* (get-internal-real-time))))
+  *t4-log-n*)
+
+(defun %t4-log-idle ()
+  "From the desk's idle wait: flush, at most every 2 s."
+  (%t4-ring-drain)
+  (when (and (> *t4-log-n* *t4-log-flushed*)
+             (> (- (get-internal-real-time) *t4-log-at*) (* 2 internal-time-units-per-second)))
+    (t4-log-flush)))
+
+(defvar *t4-ring-read* 0)        ; how much of the console ring the log has taken
+
+(defun %t4-console-to-log (on)
+  "While ON, what the console prints is kept: pc-console.lisp's console ring (64 KB at #x60000,
+   count at #x5FFF0) is switched on here, and drained into the log at each flush.  The console
+   itself stays on VGA text memory (#x1B078 = 2), which a graphics mode does not show."
+  (if on
+      (setf (mem-ref #x5FFF0 :u32) 0 *t4-ring-read* 0 (mem-ref #x5FFF4 :u32) #x1234567)
+      (setf (mem-ref #x5FFF4 :u32) 0))
+  (when (plusp *t4-w*) (setf (mem-ref #x1B078 :u32) (if on 2 1))))
+
+(defun %t4-ring-drain ()
+  (let ((n (min (mem-ref #x5FFF0 :u32) 65536)))
+    (loop while (< *t4-ring-read* n)
+          do (t4-log-byte (mem-ref (+ #x60000 *t4-ring-read*) :u8))
+             (setq *t4-ring-read* (+ *t4-ring-read* 1)))))
 
 ;;; --- app.lisp's platform calls ---------------------------------------------------------------
 

@@ -9,7 +9,7 @@
 ;;;;   block  +0 interrupt  +4 EAX  +8 EBX  +12 ECX  +16 EDX  +20 ESI  +24 EDI  +28 EBP
 ;;;;          +32 DS  +36 ES                                     (+40 FLAGS out)
 ;;;;
-;;;; The mapping: boot/boot-i386-cl.lisp gives the image a 16 MB window at VA #x0C000000 whose four
+;;;; The mapping: boot/boot-i386-cl.lisp gives the image a 16 MB window at VA #x0E000000 whose four
 ;;;; page tables sit at PA = VA #x20000, empty.  Filling them is two stores a page: x86 caches no
 ;;;; not-present entry, so there is nothing to flush.  The window's VA is a fixnum on a 30-bit
 ;;;; tower; the framebuffer's own physical address (#xE0000000 and up) is not.
@@ -119,7 +119,7 @@
 (defun vbe-height () (mem-ref #x1B06C :u32))
 
 (defun vbe-init (&optional max-w max-h)
-  "Set the best linear 32-bit mode and map it at #x0C000000.  Returns (width height) or NIL
+  "Set the best linear 32-bit mode and map it at #x0E000000 (boot-i386-cl.lisp +I386-CL-FB-WINDOW+).  Returns (width height) or NIL
    (no shim, no VBE 2, or no such mode: the screen stays in text mode)."
   (let ((c (and (%pcbios-present-p) (%vbe-choose max-w max-h))))
     (when c
@@ -127,7 +127,7 @@
         (when (and (%pcbios-int #x10 #x4F02 (logior mode #x4000) 0 0 0 0 0)
                    (= (%pcbios-ax) #x004F))
           (%vbe-map base (* pitch h))
-          (setf (mem-ref #x1B060 :u32) #x0C000000 (mem-ref #x1B064 :u32) pitch
+          (setf (mem-ref #x1B060 :u32) #x0E000000 (mem-ref #x1B064 :u32) pitch
                 (mem-ref #x1B068 :u32) w (mem-ref #x1B06C :u32) h
                 (mem-ref #x1B070 :u32) bpp (mem-ref #x1B074 :u32) mode)
           (%fbc-init)

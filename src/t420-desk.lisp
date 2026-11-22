@@ -9,6 +9,8 @@
 
 (in-package :cl-user)
 
+(defvar *t4-ip* nil "The address the network pipeline got at boot (four octets), or why not.")
+
 (defun %kiln-blit-region (big k x0 y0 x y w h)
   "Show desk rectangle (X,Y,W,H), already magnified by K into BIG, at screen offset (X0,Y0)."
   (let* ((bw (glass:fb-width big)) (px (glass:fb-pixels big))
@@ -24,10 +26,27 @@
 (defun kiln-t420-main (&key max-w max-h)
   "The desk on this PC's screen, until Ctrl-Alt-Del.  MAX-W / MAX-H bound the VBE mode.
    Answers :NO-VBE where there is no VBE (QEMU's -kernel boot has no BIOS shim)."
+  ;; THE NETWORK FIRST, before the screen and the 8042 are touched: the T420's 82579 shares its
+  ;; PHY with the management engine, which parks it when no driver claims it -- run minutes
+  ;; after boot (from the desk's Terminal), the pipeline found a PHY reading all zeros over MDIO
+  ;; and no link; run at boot, as the r-t420n image did, it got DHCP.  No cable: the desk comes
+  ;; up once DHCP's tries run out.
+  (%t4-console-to-log t)                 ; the console ring on: the pipeline's own messages
+  (let ((ip (handler-case
+                (progn (modus-int::run-net-pipeline)
+                       (let ((s (modus-int::e1000-state-base)))
+                         (list (mem-ref (+ s 24) :u8) (mem-ref (+ s 25) :u8)
+                               (mem-ref (+ s 26) :u8) (mem-ref (+ s 27) :u8))))
+              (error (e) (list :error (princ-to-string e))))))
+    (setf *t4-ip* ip)
+    (t4-log "kiln t420: network ~S" ip))
   (unless (%t4-screen-up max-w max-h)
     (return-from kiln-t420-main :no-vbe))
   (%t4-mouse-init)
   (setf *t4-px* (floor *t4-w* 2) *t4-py* (floor *t4-h* 2))
+  (t4-log "kiln t420: desk ~Dx~D, mouse ~:[off~;on~]" *t4-w* *t4-h* *t4-mouse-ok*)
+  (t4-log-flush)
   (unwind-protect
        (kiln-app-main :top 0 :media nil)
+    (%t4-console-to-log nil)
     (%t4-screen-down)))
