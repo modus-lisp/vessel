@@ -61,9 +61,12 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
 // lines, unlit and THICK: a wireframe in one colour (the head).  A GPU's lines are one pixel wide, so each segment
 // (a pair of points) is drawn as a quad, six vertices, widened on the screen to WIDTH pixels whatever its distance.
 // params: x the half-width in pixels, y and z half the view's size in pixels.
+// THE FAR SIDE IS FAINTER: a wireframe has no depth of its own, and a nose pointing away looks the same as one
+// pointing near.  So each point's distance, against the object's centre, dims what is behind it.
 struct Lines { float4x4 transform; float4 colour; float4 params; };
-vertex float4 line_vertex(uint id [[vertex_id]], device const packed_float3 *points [[buffer(0)]],
-                          constant Lines &lines [[buffer(2)]]) {
+struct LineOut { float4 position [[position]]; float near; };
+vertex LineOut line_vertex(uint id [[vertex_id]], device const packed_float3 *points [[buffer(0)]],
+                           constant Lines &lines [[buffer(2)]]) {
     uint seg = id / 6, corner = id % 6;
     float4 a = lines.transform * float4(float3(points[seg * 2]), 1.0);
     float4 b = lines.transform * float4(float3(points[seg * 2 + 1]), 1.0);
@@ -73,9 +76,15 @@ vertex float4 line_vertex(uint id [[vertex_id]], device const packed_float3 *poi
     bool at_b = corner == 2 || corner == 4 || corner == 5;
     float side = (corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0;
     float4 q = at_b ? b : a;
-    return float4(q.xy + normal * side / half_view * q.w, q.z, q.w);
+    float centre = (lines.transform * float4(0, 0, 0, 1)).w;
+    LineOut out;
+    out.position = float4(q.xy + normal * side / half_view * q.w, q.z, q.w);
+    out.near = clamp(0.5 + (centre - q.w) * 0.8, 0.0, 1.0);   // 1 in front of the centre, falling to 0 behind
+    return out;
 }
-fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return lines.colour; }
+fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[buffer(2)]]) {
+    return float4(lines.colour.rgb * mix(0.3, 1.0, in.near), lines.colour.a);
+}
 ")
 
 ;;; ---- vectors and matrices: single-floats, the matrices column-major as Metal reads them ---------------------------
@@ -169,28 +178,26 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
         (incf n 4)))
     (values (apply #'floats (nreverse verts)) (nreverse indices))))
 
-(defun egg-lines (&key (rx 0.75) (ry 1.0) (rz 0.85) (rings 3) (meridians 6) (steps 24))
-  "An egg-shaped head as line segments (pairs of points, three floats each): RINGS of latitude and MERIDIANS of
-   longitude round an ellipsoid of radii RX RY RZ, facing -Z."
+(defun egg-lines (&key (rx 0.75) (ry 1.0) (rz 0.85) (steps 48))
+  "The head as three ovals, a gizmo's: round the vertical (level), round the left-right axis (front to back, over
+   the top), round the front-back axis (side to side, over the top) -- each STEPS segments, one after another, as
+   pairs of points.  Radii RX RY RZ; it faces -Z."
   (let ((pts '()))
-    (flet ((at (lat lon) (list (* rx (cos lat) (sin lon)) (* ry (sin lat)) (- (* rz (cos lat) (cos lon)))))
-           (seg (a b) (setf pts (append (reverse b) (reverse a) pts))))
-      (loop for r from 1 to rings
-            for lat = (- (* pi (/ r (1+ rings))) (/ pi 2))
-            do (dotimes (k steps)
-                 (seg (at lat (* 2 pi (/ k steps))) (at lat (* 2 pi (/ (1+ k) steps))))))
-      (dotimes (m meridians)
-        (let ((lon (* 2 pi (/ m meridians))))
-          (dotimes (k steps)
-            (seg (at (- (* pi (/ k steps)) (/ pi 2)) lon) (at (- (* pi (/ (1+ k) steps)) (/ pi 2)) lon))))))
-    (apply #'floats (nreverse pts))))
+    (flet ((ring (fn)
+             (dotimes (k steps)
+               (let ((a (* 2 pi (/ k steps))) (b (* 2 pi (/ (1+ k) steps))))
+                 (setf pts (append (reverse (funcall fn b)) (reverse (funcall fn a)) pts))))))
+      (ring (lambda (t0) (list (* rx (sin t0)) 0 (- (* rz (cos t0))))))       ; level
+      (ring (lambda (t0) (list 0 (* ry (sin t0)) (- (* rz (cos t0))))))       ; front to back
+      (ring (lambda (t0) (list (* rx (sin t0)) (* ry (cos t0)) 0))))          ; side to side
+    (values (apply #'floats (nreverse pts)) steps)))
 
 (defun nose-lines ()
-  "A nose, and two eyes: which way the head faces."
-  (floats 0 0.0 -0.84    0 -0.15 -1.6
-          0 -0.15 -1.6   0 -0.35 -0.8
-          -0.3 0.18 -0.78  -0.18 0.18 -0.82
-          0.3 0.18 -0.78   0.18 0.18 -0.82))
+  "Which way the head faces: a pointer from the front of the head well out ahead of it, with a small arrowhead -- no
+   face, whose features, seen through a wireframe from behind, read as a face looking back."
+  (floats 0 0 -0.86   0 0 -2.3
+          0 0 -2.3    0.14 0 -2.0
+          0 0 -2.3   -0.14 0 -2.0))
 
 (defun floor-mesh (size tiles)
   "A square of SIZE on y = 0, facing up, its texture repeated TILES times across."
@@ -406,6 +413,7 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
           (aref m 12) (float ox 1.0) (aref m 13) (float oy 1.0))
     m))
 
+(defvar *head-log* nil "HELLO3D_HEAD_LOG set: the head's angles, logged twice a second.")
 (defvar *head-demo* nil "HELLO3D_HEAD_DEMO set: a head that sways by itself, with no headphones to follow.")
 
 (defun head-attitude (g)
@@ -421,16 +429,19 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
   (multiple-value-bind (yaw pitch roll) (head-attitude g)
     (when (and yaw (game-line-pipeline g))
       (let* ((model (mat* (rotation-y yaw) (mat* (rotation-x pitch) (rotation-z (- roll)))))
-             (view (mat* (translation 0 -0.2 -4.6) (rotation-x 0.5)))     ; from behind and above: your own head
+             (view (mat* (translation 0 0.1 -5.2) (mat* (rotation-x 0.22) (rotation-y -0.35))))   ; behind, a little above and right
              (transform (mat* (corner 0.3 0.72 -0.6) (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view model))))
              ;; 2.5 points wide: the half-width in pixels, then half the view
-             (params (list (* 1.25 (game-scale g)) (/ w 2.0) (/ h 2.0) 0)))
+             (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0)))
         (kiln-gpu:gpu-depth pass :none)
         (kiln-gpu:gpu-cull pass :none)
         (kiln-gpu:gpu-use pass (game-line-pipeline g))
         (kiln-gpu:gpu-bind pass (game-egg g) 0)
-        (kiln-gpu:gpu-constants pass (apply #'floats transform 0.85 0.92 1.0 1.0 params) 2)
-        (kiln-gpu:gpu-draw pass (* 3 (game-egg-count g)))
+        ;; the three ovals in a gizmo's colours: level blue, front-to-back red, side-to-side green
+        (loop for colour in '((0.35 0.55 1.0) (1.0 0.35 0.35) (0.45 0.9 0.45))
+              for i from 0
+              do (kiln-gpu:gpu-constants pass (apply #'floats transform (append colour (list 1.0) params)) 2)
+                 (kiln-gpu:gpu-draw pass (* 6 (game-egg-count g)) :start (* i 6 (game-egg-count g))))
         (kiln-gpu:gpu-bind pass (game-nose g) 0)
         (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
         (kiln-gpu:gpu-draw pass (* 3 (game-nose-count g)))))))
@@ -662,9 +673,10 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
     (unless (game-pipeline g) (error "hello3d: the shader or its pipeline did not build (see the log)"))
     (let ((shader (kiln-gpu:gpu-shader *shader*)))
       (setf (game-line-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "line_vertex" "line_fragment"))))
-    (let ((egg (egg-lines)) (nose (nose-lines)))
-      (setf (game-egg g) (kiln-gpu:gpu-buffer egg) (game-egg-count g) (floor (length egg) 3)
-            (game-nose g) (kiln-gpu:gpu-buffer nose) (game-nose-count g) (floor (length nose) 3)))
+    (multiple-value-bind (egg steps) (egg-lines)
+     (let ((nose (nose-lines)))
+      (setf (game-egg g) (kiln-gpu:gpu-buffer egg) (game-egg-count g) steps
+            (game-nose g) (kiln-gpu:gpu-buffer nose) (game-nose-count g) (floor (length nose) 3))))
     (multiple-value-bind (v i) (cube-mesh)
       (setf (game-cube-vertices g) (kiln-gpu:gpu-buffer v) (game-cube-indices g) (kiln-gpu:gpu-indices i)))
     (multiple-value-bind (v i) (floor-mesh 120 60)
@@ -692,6 +704,7 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
   (%sys 1002 0 (+ (%sys 1001 0 0 0) (* (%sys 1001 1 0 0) 65536)) *dusk*)   ; under the view, until it draws
   (%sys 1003 0 0 0)
   (setf *head-demo* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_DEMO"))) (and v (plusp (length v)))))
+  (setf *head-log* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_LOG"))) (and v (plusp (length v)))))
   (let ((g (start :touch touch)) (last (get-internal-real-time)))
     (format t "~&hello3d: running~%")
     (loop
@@ -713,6 +726,12 @@ fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return line
           (when (>= since 0.5)
             (kiln-swift:ui-set-text (game-fps-label g)
                                     (format nil "~D frames a second" (round (game-frames g) since)))
+            (when *head-log*
+              (multiple-value-bind (yaw pitch roll) (kiln-sound:spatial-head-attitude)
+                (when yaw
+                  (format t "~&hello3d: head yaw ~,2F pitch ~,2F roll ~,2F (degrees ~D ~D ~D)~%" yaw pitch roll
+                          (round (* yaw 57.3)) (round (* pitch 57.3)) (round (* roll 57.3)))
+                  (finish-output))))
             (when (game-status g)
               (kiln-mac:status-title (game-status g) (format nil "~D fps" (round (game-frames g) since))))
             ;; the controller: said when one comes or goes, and its light the middle cube's colour
