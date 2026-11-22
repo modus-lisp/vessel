@@ -66,7 +66,13 @@
               (let ((now (get-universal-time)))
                 (when (/= now last)
                   (setf last now)
-                  (multiple-value-bind (s m h) (decode-universal-time now)
+                  (multiple-value-bind (s m h)
+                      ;; the platform's zone when it names one (hours west, as CL counts
+                      ;; them): modus has no zone database and decodes in GMT otherwise
+                      (decode-universal-time now (if (and (boundp '*kiln-time-zone*)
+                                                          (symbol-value '*kiln-time-zone*))
+                                                     (symbol-value '*kiln-time-zone*)
+                                                     0))
                     (glass:fb-fill fb #x10141a)
                     (glass:fb-text fb 16 20 (format nil "~2,'0d:~2,'0d:~2,'0d" h m s)
                                    :size 40 :color #xe6ebf2))

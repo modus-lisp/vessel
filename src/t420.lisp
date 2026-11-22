@@ -52,6 +52,48 @@
       (setf (mem-ref #x1B078 :u32) 2)
       wh)))
 
+;;; THE PANEL'S OWN RESOLUTION.  The T420's BIOS offers no 16:9 mode (its best: 1024x768 and
+;;; 960x600; the panel is 1366x768), so the VBE mode is a 4:3 picture the CPU's panel fitter
+;;; stretches -- the wrong shape.  Measured on the T420's Intel HD 3000: pipe A's TIMINGS are the
+;;; panel's native 1366x768 already (HTOTAL/VTOTAL active), only its SOURCE size (PIPEASRC) is
+;;; 1024x768 and the panel fitter (PF_CTL) scales it.  So: source = native, fitter off, plane A's
+;;; stride for the wider rows, and the surface register rewritten to latch it.  Only when the GPU
+;;; is Intel's, pipe A's active size is the EDID's, and the VBE mode is not already it.
+(defvar *t4-native* t)     ; switch to the panel's native size at boot
+
+(defun %t4-native-panel ()
+  "Switch an Intel GPU's pipe A to the panel's native size.  (W H) when it did, else NIL."
+  (ignore-errors
+   (multiple-value-bind (ew eh) (modus-int::%vbe-edid-size)
+     (let* ((pcr (lambda (r) (modus-int::pci-config-read 0 2 0 r)))
+            (id (funcall pcr 0)))
+       (when (and ew eh (= (logand id #xFFFF) #x8086)
+                  (not (and (= ew *t4-w*) (= eh *t4-h*))))
+         (let* ((bar (logand (funcall pcr #x10) (lognot 15)))
+                (va (modus-int::pc-mmio-map (+ bar #x60000) #x12000))
+                (rd (lambda (o) (modus-int::%mmio-read32 (+ va (- o #x60000)))))
+                (wr (lambda (o v) (modus-int::%mmio-write32 (+ va (- o #x60000)) v)))
+                (htotal (funcall rd #x60000)) (vtotal (funcall rd #x6000C)))
+           (when (and (= (1+ (logand htotal #xFFF)) ew) (= (1+ (logand vtotal #xFFF)) eh))
+             (let ((pitch (* 64 (ceiling (* ew 4) 64)))
+                   (phys (logand (mem-ref #x20000 :u32) (lognot #xFFF))))   ; the window's first page
+               ;; Panel fitter off.  On Sandy Bridge a fitter change takes effect only when
+               ;; PF_WIN_SZ is written, so CTL alone leaves the BIOS's 1024->1366 scaling live,
+               ;; and the 1366-wide source then scans out as its first row repeated.
+               (funcall wr #x68080 0)                                    ; PF_CTL
+               (funcall wr #x68070 0)                                    ; PF_WIN_POS
+               (funcall wr #x68074 0)                                    ; PF_WIN_SZ: arms the change
+               (funcall wr #x6001C (logior (ash (1- ew) 16) (1- eh)))    ; PIPEASRC
+               (funcall wr #x70188 pitch)                                ; DSPASTRIDE
+               ;; DSPACNTR bit 14, trickle feed off: what i915 sets on Sandy Bridge (read back from
+               ;; Linux on this T420).  Without it a 1366-wide plane scans out one repeated pixel.
+               (funcall wr #x70180 (logior (funcall rd #x70180) #x4000))
+               (funcall wr #x7019C (funcall rd #x7019C))                 ; DSPASURF: latch
+               (modus-int::%vbe-map phys (* pitch eh))
+               (setf *t4-w* ew *t4-h* eh *t4-pitch* pitch
+                     (mem-ref #x1B064 :u32) pitch (mem-ref #x1B068 :u32) ew (mem-ref #x1B06C :u32) eh)
+               (list ew eh)))))))))
+
 (defun %t4-screen-down ()
   "Give the screen back to the framebuffer console."
   (when (plusp *t4-w*) (setf (mem-ref #x1B078 :u32) 1)))
@@ -190,24 +232,41 @@
 (defun %t4-cmd (c) (%t4-wait-write) (modus-int::io-out-byte #x64 c))
 (defun %t4-data (d) (%t4-wait-write) (modus-int::io-out-byte #x60 d))
 
+(defun %t4-drain ()
+  "Throw away whatever the controller holds (a mouse's stray packet, a key's break code)."
+  (dotimes (i 64) (if (logbitp 0 (%t4-status)) (%t4-in) (return))))
+
 (defun %t4-mouse-send (b)
-  "Send B to the aux device; its answer (#xFA, ACK) or NIL."
+  "Send B to the aux device; its answer -- #xFA (ACK), #xFE (resend), #xFC (error) -- or NIL.
+   Bytes that are none of those (a packet already in flight) are skipped."
   (%t4-cmd #xD4) (%t4-data b)
-  (and (%t4-wait-read) (%t4-in)))
+  (dotimes (i 8 nil)
+    (unless (%t4-wait-read) (return nil))
+    (let ((r (%t4-in))) (when (member r '(#xFA #xFE #xFC)) (return r)))))
 
 (defvar *t4-mouse-ok* nil)
 
 (defun %t4-mouse-init ()
-  "Enable the aux port and its device, in plain 3-byte PS/2 mode, polled (no IRQ 12)."
-  (dotimes (i 32) (if (logbitp 0 (%t4-status)) (%t4-in) (return)))   ; drain
+  "Enable the aux port and its device in plain 3-byte PS/2 mode, polled (no IRQ 12).  On a
+   docked T420 the port is shared by the TrackPoint, the touchpad and the dock's mouse port
+   (and a USB mouse, by the BIOS's emulation), any of which may be mid-packet or slow to
+   answer -- so the controller is drained first and each step is tried three times.  The aux
+   port is polled whatever the answers: *T4-MOUSE-OK* only says whether they came."
+  (%t4-drain)
   (%t4-cmd #xA8)                                                      ; enable the aux port
   (%t4-cmd #x20)                                                      ; read the config byte
   (let ((cfg (if (%t4-wait-read) (%t4-in) 0)))
     ;; clear bit 5 (aux clock disabled) and both IRQ enables: this layer polls
     (%t4-cmd #x60) (%t4-data (logand cfg (lognot (logior #x20 #x02 #x01)))))
-  (let ((a (%t4-mouse-send #xF6)) (b (%t4-mouse-send #xF4)))         ; defaults, then report
-    (setf *t4-mouse-ok* (and (eql a #xFA) (eql b #xFA))))
-  (dotimes (i 32) (if (logbitp 0 (%t4-status)) (%t4-in) (return)))
+  (let ((ok nil))
+    (dotimes (try 3)
+      (%t4-drain)
+      (when (and (eql (%t4-mouse-send #xF6) #xFA)                    ; defaults
+                 (eql (%t4-mouse-send #xF4) #xFA))                   ; report
+        (setq ok t) (return)))
+    (setf *t4-mouse-ok* ok))
+  (%t4-drain)
+  (setf *t4-pkt-n* 0)
   *t4-mouse-ok*)
 
 ;;; keyboard: scan code set 1, as the 8042 translates it.  A table of (code . (plain shifted)).
@@ -365,9 +424,73 @@
       (setq *t4-log-flushed* *t4-log-n* *t4-log-at* (get-internal-real-time))))
   *t4-log-n*)
 
+;;; --- the disk command channel ---------------------------------------------------------------
+;;; Lisp to evaluate, without the keyboard or the screen: the rig's Zero writes it into the disk
+;;; image (scripts on the Zero: t4cmd.py) and the desk's idle loop picks it up and logs the answer.
+;;;   LBA *T4-CMD-LBA*: "T4CMD" then a sequence number (u32 at +8) and the text's length (+12);
+;;;   the text from +16, up to 15 sectors in all.  A new sequence number is a new command.
+(defvar *t4-cmd-lba* 66560)     ; inside the log's region, past what a 1 MB log can reach
+(defvar *t4-cmd-seq* nil)       ; the last one seen (NIL: none yet -- the first read only records it)
+(defvar *t4-cmd-at* 0)
+
+(defun %t4-disk-read (lba nsec)
+  "Read NSEC (<= 64) sectors at LBA of the boot disk to #x30000.  T when the BIOS said yes."
+  (setf (mem-ref #xC000 :u8) 16 (mem-ref #xC001 :u8) 0
+        (mem-ref #xC002 :u8) nsec (mem-ref #xC003 :u8) 0
+        (mem-ref #xC004 :u32) 0
+        (mem-ref #xC006 :u8) #x00 (mem-ref #xC007 :u8) #x30
+        (mem-ref #xC008 :u32) lba (mem-ref #xC00C :u32) 0)
+  (and (modus-int::%pcbios-int #x13 #x4200 0 0 (logand (mem-ref #x58C :u32) #xFF) #xC000 0 0)
+       (zerop (logand (modus-int::%pcbios-out 40) 1))))
+
+(defun %t4-cmd-poll ()
+  "Run the command in the command sectors if it is new (at most once a second)."
+  (when (and (modus-int::%pcbios-present-p)
+             (> (- (get-internal-real-time) *t4-cmd-at*) internal-time-units-per-second))
+    (setq *t4-cmd-at* (get-internal-real-time))
+    (when (and (%t4-disk-read *t4-cmd-lba* 16)
+               (= (mem-ref #x30000 :u8) 84) (= (mem-ref #x30004 :u8) 68))       ; "T...D"
+      (let ((seq (mem-ref #x30008 :u32)) (n (min (mem-ref #x3000C :u32) (- (* 16 512) 16))))
+        (cond ((null *t4-cmd-seq*) (setq *t4-cmd-seq* seq))
+              ((/= seq *t4-cmd-seq*)
+               (setq *t4-cmd-seq* seq)
+               (let ((text (make-string n)))
+                 (dotimes (i n) (setf (char text i) (code-char (mem-ref (+ #x30010 i) :u8))))
+                 (handler-case
+                     (t4-log "cmd ~d => ~s" seq (eval (read-from-string text)))
+                   (error (c) (t4-log "cmd ~d error: ~a" seq c))))
+               (t4-log-flush)))))))
+
+;;; --- the GPU's registers, for comparing with what Linux sets ---------------------------------
+(defvar *t4-gpu-va* nil)          ; the first 1 MB of BAR0, mapped once
+
+(defun %t4-gpu-va ()
+  (or *t4-gpu-va*
+      (setq *t4-gpu-va*
+            (modus-int::pc-mmio-map (logand (modus-int::pci-config-read 0 2 0 #x10) (lognot 15))
+                                    #x100000))))
+(defun t4-gpu-reg (off) (modus-int::%mmio-read32 (+ (%t4-gpu-va) off)))
+(defun t4-gpu-set (off v) (modus-int::%mmio-write32 (+ (%t4-gpu-va) off) v))
+
+(defparameter *t4-gpu-ranges*
+  '((#x42000 #x100) (#x44000 #x40) (#x45000 #x200) (#x46000 #x100) (#x48000 #x300) (#x4F000 #x100)
+    (#x60000 #x200) (#x64000 #x100) (#x68000 #x100) (#x70000 #x200) (#xC6000 #x100)
+    (#xC7000 #x300) (#xE0000 #x100) (#xE1100 #x100) (#xF0000 #x100)))
+
+(defun t4-gpu-dump (label)
+  "Log every non-zero register in *T4-GPU-RANGES*, as `LABEL OFFSET VALUE' lines (hex)."
+  (ignore-errors
+   (when (= (logand (modus-int::pci-config-read 0 2 0 0) #xFFFF) #x8086)
+     (dolist (r *t4-gpu-ranges*)
+       (loop for o from (first r) below (+ (first r) (second r)) by 4
+             do (let ((v (t4-gpu-reg o)))
+                  (unless (zerop v) (t4-log "~a ~5,'0x ~8,'0x" label o v)))))
+     (t4-log-flush))))
+
 (defun %t4-log-idle ()
-  "From the desk's idle wait: flush, at most every 2 s."
+  "From the desk's idle wait: run a new disk command; flush, at most every 2 s."
   (%t4-ring-drain)
+  (ignore-errors (%t4-cmd-poll))
   (when (and (> *t4-log-n* *t4-log-flushed*)
              (> (- (get-internal-real-time) *t4-log-at*) (* 2 internal-time-units-per-second)))
     (t4-log-flush)))
@@ -388,6 +511,93 @@
     (loop while (< *t4-ring-read* n)
           do (t4-log-byte (mem-ref (+ #x60000 *t4-ring-read*) :u8))
              (setq *t4-ring-read* (+ *t4-ring-read* 1)))))
+
+;;; --- the date -------------------------------------------------------------------------------
+;;; Modus counts GET-UNIVERSAL-TIME from boot until something sets it (SET-UNIVERSAL-TIME).  A PC
+;;; has a battery clock, the CMOS RTC, which the BIOS keeps in LOCAL time (the Windows habit) --
+;;; read at boot, so the clock is right before the network answers -- and SNTP sets it properly
+;;; once the network is up.  The desk shows *KILN-TIME-ZONE* (app.lisp's clock): hours west of
+;;; Greenwich, as CL counts them.  5: the rig's own machines run at UTC-5.
+
+(defvar *kiln-time-zone* 5)
+(defvar *t4-clock-source* nil)        ; :sntp, :rtc or NIL
+
+(defun %t4-kfn (name)
+  "The kernel function NAME (a string), from whichever kernel package holds it, or NIL."
+  (dolist (p '("MODUS-INT" "MODUS.NET" "MODUS.MVM" "MODUS.RUNTIME" "COMMON-LISP-USER") nil)
+    ;; INTERN, not FIND-SYMBOL: a baked kernel function's symbol exists only once something has
+    ;; read its name (as the REPL does for modus-int::udp-send), and the call resolves by name.
+    (let ((sym (and (find-package p)
+                    (if (string= p "MODUS-INT") (intern name p) (find-symbol name p)))))
+      (when (and sym (fboundp sym)) (return (symbol-function sym))))))
+
+(defun %t4-cmos (reg)
+  (modus-int::io-out-byte #x70 reg)
+  (modus-int::io-in-byte #x71))
+
+(defun t4-rtc-time ()
+  "The CMOS clock's time as universal time (the RTC taken as *KILN-TIME-ZONE* local), or NIL."
+  (dotimes (i 100000) (unless (logbitp 7 (%t4-cmos #x0A)) (return)))   ; not mid-update
+  (let* ((b (%t4-cmos #x0B))
+         (bcd (not (logbitp 2 b))) (h24 (logbitp 1 b))
+         (conv (lambda (v) (if bcd (+ (* 10 (ash v -4)) (logand v 15)) v)))
+         (sec (funcall conv (%t4-cmos #x00)))
+         (min (funcall conv (%t4-cmos #x02)))
+         (hr-raw (%t4-cmos #x04))
+         (hr (let ((h (funcall conv (logand hr-raw #x7F))))
+               (if h24 h (+ (mod h 12) (if (logbitp 7 hr-raw) 12 0)))))
+         (day (funcall conv (%t4-cmos #x07)))
+         (mon (funcall conv (%t4-cmos #x08)))
+         (yr (+ 2000 (funcall conv (%t4-cmos #x09)))))
+    (when (and (<= 2020 yr 2099) (<= 1 mon 12) (<= 1 day 31) (< hr 24) (< min 60) (< sec 60))
+      (encode-universal-time sec min hr day mon yr *kiln-time-zone*))))
+
+(defun t4-sntp (&key (server "pool.ntp.org") (tries 3))
+  "Universal time from SNTP (RFC 4330) over modus's own UDP (net/ip.lisp), or NIL.  Needs the
+   network up (KILN-T420-MAIN brings it up first)."
+  (let ((dns (%t4-kfn "DNS-RESOLVE")) (send (%t4-kfn "UDP-SEND")) (recv (%t4-kfn "UDP-RECEIVE"))
+        (ref (%t4-kfn "UDP-RX-DATA-REF")) (base (%t4-kfn "E1000-STATE-BASE")))
+    (unless (and dns send recv ref base)
+      (t4-log "sntp: missing ~S" (list :dns dns :send send :recv recv :ref ref :base base))
+      (return-from t4-sntp nil))
+    (let* ((n (length server)) (name (make-array n)))
+      (dotimes (i n) (setf (aref name i) (char-code (char server i))))
+      (let ((ip (funcall dns name n)))
+        (if (or (null ip) (zerop ip))
+            (progn (t4-log "sntp: no address for ~A" server) nil)
+            (let ((q (make-array 48 :initial-element 0)))
+              (setf (aref q 0) #x23)                               ; LI 0, VN 4, mode 3
+              (dotimes (k tries (progn (t4-log "sntp: no answer from ~A" server) nil))
+                (funcall send ip 123 12399 q 48)
+                (let ((got (funcall recv 2000)))
+                  (when (and got (>= got 48)
+                             (= (mem-ref (+ (funcall base) #x74) :u16) 123))   ; from port 123
+                    (let ((ut (logior (ash (funcall ref 40) 24) (ash (funcall ref 41) 16)
+                                      (ash (funcall ref 42) 8) (funcall ref 43))))
+                      (when (> ut 3900000000) (return ut))))))))))))
+
+;;; The bare i386 image has no SET-UNIVERSAL-TIME (its GET-UNIVERSAL-TIME answers 0: no RTC is
+;;; read).  GET-UNIVERSAL-TIME is a CL symbol, so redefining it reaches every caller compiled at
+;;; run time -- the desk's clock among them: UT now, counted on by GET-INTERNAL-REAL-TIME.
+(defun %t4-set-ut (ut)
+  (let ((base (- ut (floor (get-internal-real-time) internal-time-units-per-second))))
+    (setf (fdefinition 'get-universal-time)
+          (lambda () (+ base (floor (get-internal-real-time) internal-time-units-per-second))))
+    ut))
+
+(defun t4-set-clock (&optional network-up)
+  "Set the date: SNTP when the network is up, else the CMOS clock.  The source, or NIL."
+  (let ((set (%t4-kfn "SET-UNIVERSAL-TIME"))
+        (ut nil) (src nil))
+    (when network-up (setq ut (ignore-errors (t4-sntp)) src :sntp))
+    (unless ut (setq ut (ignore-errors (t4-rtc-time)) src :rtc))
+    (cond ((null ut) (t4-log "clock: neither SNTP nor the RTC answered") nil)
+          (t (if set (funcall set ut) (%t4-set-ut ut))
+             (setf *t4-clock-source* src)
+             (multiple-value-bind (s m h d mo y) (decode-universal-time ut *kiln-time-zone*)
+               (t4-log "clock: ~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d (UTC-~d) from ~(~a~)"
+                       y mo d h m s *kiln-time-zone* src))
+             src))))
 
 ;;; --- app.lisp's platform calls ---------------------------------------------------------------
 
