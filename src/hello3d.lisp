@@ -198,6 +198,9 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (hums '()) blip (sound t) (spatial nil) (head nil)
   ;; where each toggle is shown, to keep them in step: the HUD's buttons, and the menus' items (a Mac's)
   spin-button sound-button head-button speed-slider (spin-items '()) (sound-items '()) (head-items '()) status
+  ;; the HUD's pane, (x y w h) in points, and the pointer's shape as last set: the arrow over the pane, a crosshair
+  ;; over the scene, where a click looks around
+  hud-rect (shape nil)
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -303,6 +306,14 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
            (when (and (= ks #xff1b) (game-locked g))
              (kiln-mac:window-pointer-lock nil) (setf (game-locked g) nil))))
       (9 (remhash (logand e #xFFFFFFFFFF) (game-held g)))
+      (5 (let* ((k (game-scale g)) (px (floor (logand e #xFFFFF) k)) (py (floor (logand (ash e -20) #xFFFFF) k))
+                (shape (if (and (game-hud-rect g)
+                                (destructuring-bind (x y w h) (game-hud-rect g)
+                                  (and (<= x px (+ x w)) (<= y py (+ y h)))))
+                           :arrow :crosshair)))
+           (unless (eq shape (game-shape g))
+             (setf (game-shape g) shape)
+             (kiln-mac:window-pointer-shape shape))))
       (1 (unless (game-locked g)
            (kiln-mac:window-pointer-lock t) (setf (game-locked g) t) (blip g)))
       (13 (when (game-locked g)
@@ -426,8 +437,10 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
          (below (if narrow 40 0))
          ;; ON A MAC, A PANE OF GLASS: what goes on it is placed from its top left
          (panel (and (not (game-touch g)) (kiln-mac:glass-panel (- x 12) y 560 160 :radius 20)))
+         (_ (when panel (setf (game-hud-rect g) (list (- x 12) y 560 160))))
          (x (if panel 14 x))
          (y (if panel -2 y)))
+    (declare (ignorable _))
     (flet ((put (h) (when panel (kiln-swift:ui-add panel h)) h)
            (glassy (h) (when panel (kiln-mac:glass-button h)) h))
       (put (kiln-swift:ui-label "Hello, world" x (+ y 8) (min w 300) 30))

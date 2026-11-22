@@ -15,6 +15,9 @@
 ;;;;   (window-fullscreen t)
 ;;;;   (window-remember "desk")        the window opens where it was last time
 ;;;;
+;;;;   (window-pointer-shape :ibeam)   the pointer over the window: :arrow :ibeam :hand :open-hand :closed-hand
+;;;;                                   :crosshair :resize-left-right :resize-up-down :not-allowed
+;;;;
 ;;;; THE MAC'S OWN CHROME (modus's host/macos/swift/MacChrome.swift):
 ;;;;   (glass-panel x y w h &key radius tint)   Liquid Glass (macOS 26; frosted before): a UI handle, and what is
 ;;;;                                   added to it (kiln-swift:ui-add) sits inside, placed from its top left
@@ -41,7 +44,7 @@
 (defpackage #:kiln-mac
   (:use #:cl)
   (:export #:window-title #:window-chrome #:window-size #:window-min-size #:window-fullscreen #:window-remember
-           #:window-pointer-lock
+           #:window-pointer-lock #:window-pointer-shape
            #:glass-panel #:glass-button #:menu #:menu-item #:menu-separator #:menu-check #:menu-enable
            #:status-item #:status-title
            #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce))
@@ -79,6 +82,14 @@
    the low 20 bits, DY in the next 20, two's complement, points) rather than places; NIL lets it go.  The window
    losing the keyboard lets it go too."
   (kiln-swift:swift-call "window_pointer_lock" (if on 1 0)))
+
+(defun window-pointer-shape (shape)
+  "The pointer's SHAPE over the window: :ARROW :IBEAM (text) :HAND (a link, a button) :OPEN-HAND (draggable)
+   :CLOSED-HAND (dragging) :CROSSHAIR :RESIZE-LEFT-RIGHT :RESIZE-UP-DOWN :NOT-ALLOWED."
+  (kiln-swift:swift-call "window_pointer_shape"
+                         (or (position shape '(:arrow :ibeam :hand :open-hand :closed-hand :crosshair
+                                               :resize-left-right :resize-up-down :not-allowed))
+                             0)))
 
 (defun window-remember (name)
   "Keep the window's frame under NAME: where the person leaves it is where it opens next time."
