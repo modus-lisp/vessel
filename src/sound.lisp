@@ -22,12 +22,16 @@
 ;;;;   (spatial-place voice x y z &key gain)   where it is, each frame
 ;;;;   (spatial-listener x y z yaw pitch)   where the listener is and which way it faces (yaw 0 down -Z)
 ;;;;   (spatial-stop voice)   (spatial-volume 0.0..1.0)
+;;;;   (spatial-head on)                    follow the listener's head (AirPods): off until asked
+;;;;   (spatial-head-permission)            :not-asked :allowed :refused, or :not-needed (a Mac): ask the person,
+;;;;                                        saying what for, before the system does
 
 (defpackage #:kiln-sound
   (:use #:cl)
   (:export #:sound-open #:tone #:pluck #:play #:voice-set #:voice-stop #:sound-pump #:place #:*rate* #:*cushion*
            #:*master*
-           #:spatial-open #:spatial-voice #:spatial-place #:spatial-listener #:spatial-stop #:spatial-volume))
+           #:spatial-open #:spatial-voice #:spatial-place #:spatial-listener #:spatial-stop #:spatial-volume
+           #:spatial-head #:spatial-head-permission))
 
 (in-package #:kiln-sound)
 
@@ -193,3 +197,11 @@
 (defun spatial-stop (voice) (%call "spatial_stop" voice))
 
 (defun spatial-volume (v) (%call "spatial_volume" (round (* 1000 (max 0.0 (min 1.0 v))))))
+
+(defun spatial-head (on)
+  "Follow the listener's head through their headphones (ON), or stop.  On a phone the first time asks for Motion &
+   Fitness: see SPATIAL-HEAD-PERMISSION."
+  (%call "spatial_head" (if on 1 0)))
+
+(defun spatial-head-permission ()
+  (case (%call "spatial_head_permission") (0 :not-asked) (1 :allowed) (2 :refused) (t :not-needed)))

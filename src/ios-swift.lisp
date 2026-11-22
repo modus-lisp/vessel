@@ -16,7 +16,7 @@
 
 (defpackage #:kiln-swift
   (:use #:cl)
-  (:export #:swift-call #:ui-label #:ui-button #:ui-switch #:ui-slider #:ui-text-field #:ui-panel
+  (:export #:swift-call #:ui-label #:ui-button #:ui-symbol-button #:ui-symbol-button-set #:ui-switch #:ui-slider #:ui-text-field #:ui-panel
            #:ui-text-view #:ui-segmented #:ui-progress #:ui-spinner
            #:ui-stepper #:ui-page-control #:ui-date-picker #:ui-on-long-press
            #:ui-alert #:ui-alert-action #:ui-alert-present #:ui-tab-bar #:ui-on-refresh #:ui-send-refresh
@@ -453,6 +453,16 @@
 (defun ui-scroll (x y w h)
   "A scroll view: the children added to it stack vertically and scroll."
   (swift-call "ui_scroll_new" x y w h))
+
+(defun ui-symbol-button (name x y w h)
+  "A button showing the SF Symbol NAME (\"headphones\"), with a toggle's look: off until UI-SYMBOL-BUTTON-SET says.
+   A tap is a :tap event."
+  (let ((b (%octets name)))
+    (swift-call "ui_symbol_button_new" (%addr b) (length b) x y w h)))
+
+(defun ui-symbol-button-set (handle on)
+  "Show HANDLE (a UI-SYMBOL-BUTTON) as on or off."
+  (swift-call "ui_symbol_button_set" handle (if on 1 0)))
 
 (defun ui-image (name x y w h)
   "An SF Symbol by NAME (\"star.fill\"), in white."

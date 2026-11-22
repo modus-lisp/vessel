@@ -195,7 +195,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   ;; a game controller: its state, read each frame (gamepad.lisp); A as it was, to see it pressed; the HUD's line
   (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1)
   ;; sound (sound.lisp): a humming voice per cube, the ring's then the middle one's; a blip; on or off
-  (hums '()) blip (sound t) (spatial nil)
+  (hums '()) blip (sound t) (spatial nil) (head nil)
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -393,6 +393,39 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                                      kiln-sound:*master* (if (game-sound g) 1.0 0.0))
                                (when (game-spatial g) (kiln-sound:spatial-volume (if (game-sound g) 1.0 0.0)))
                                (kiln-swift:ui-set-text sound (if (game-sound g) "sound: on" "sound: off")))))
+  ;; FOLLOW THE HEAD (AirPods), off until tapped: where the system will ask for Motion & Fitness, the person is told
+  ;; first what it is for, and may say not now
+  (when (game-spatial g)
+    (let ((head (if narrow
+                    (kiln-swift:ui-symbol-button "headphones" (+ x 120) (+ y 92 below) 48 32)
+                    (kiln-swift:ui-symbol-button "headphones" (+ x 460) (+ y 92) 48 32))))
+      (flet ((follow (on)
+               (setf (game-head g) on)
+               (format t "~&hello3d: following the head ~:[off~;on~]~%" on)
+               (kiln-sound:spatial-head on)
+               (kiln-swift:ui-symbol-button-set head on)))
+        (kiln-swift:on-tap head
+                           (lambda (value h)
+                             (declare (ignore value h))
+                             (cond ((game-head g) (follow nil))
+                                   ((eq (kiln-sound:spatial-head-permission) :not-asked)
+                                    (let ((alert (kiln-swift:ui-alert
+                                                  "Follow your head?"
+                                                  "With AirPods, each sound stays in place as you turn your head. Next, you'll be asked to allow Motion & Fitness.")))
+                                      (kiln-swift:ui-alert-action alert "Not Now")
+                                      (kiln-swift:ui-alert-action alert "Continue")
+                                      (kiln-swift:on-event :alert alert
+                                                           (lambda (index h)
+                                                             (declare (ignore h))
+                                                             (when (eql index 1) (follow t))))
+                                      (kiln-swift:ui-alert-present alert)))
+                                   ((eq (kiln-sound:spatial-head-permission) :refused)
+                                    (let ((alert (kiln-swift:ui-alert
+                                                  "Motion & Fitness is off"
+                                                  "To follow your head, allow Hello 3D in Settings > Privacy & Security > Motion & Fitness.")))
+                                      (kiln-swift:ui-alert-action alert "OK")
+                                      (kiln-swift:ui-alert-present alert)))
+                                   (t (follow t))))))))
   (let ((spin (kiln-swift:ui-button "spin: on" x (+ y 92) 110 32))
         (speed (kiln-swift:ui-slider 50 (+ x 120) (+ y 96) 200 24)))     ; mid-way: 0.4
     (kiln-swift:on-tap spin (lambda (value h)
