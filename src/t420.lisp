@@ -160,6 +160,41 @@
           (funcall f)))
     nil))
 
+;;; --- write-combining for the framebuffer --------------------------------------------------------
+;;; The BIOS leaves the graphics aperture uncached, so every 4-byte store to the screen is its own
+;;; bus transaction: measured on the T420, 17.5 ms to show a 600x400 drag frame (~70 ns a pixel).
+;;; Write-combining gathers them into 64-byte bursts: below the clock's 0.5 ms resolution.
+;;; PAT entry 1 (selected by a PTE with only PWT set) becomes WC, and the window's PTEs set PWT.
+;;;   pushal; movl $0x277,%ecx; rdmsr; andl $0xFFFF00FF,%eax; orl $0x100,%eax; wrmsr; wbinvd;
+;;;   movl %cr3,%eax; movl %eax,%cr3; popal; xorl %eax,%eax; ret
+(defparameter *t4-wc-code*
+  '(#x60 #xB9 #x77 #x02 #x00 #x00 #x0F #x32 #x25 #xFF #x00 #xFF #xFF #x0D #x00 #x01 #x00 #x00
+    #x0F #x30 #x0F #x09 #x0F #x20 #xD8 #x0F #x22 #xD8 #x61 #x31 #xC0 #xC3))
+
+(defun %t4-install-code (bytes)
+  "BYTES into the native tier's code area, as a function; NIL where there is no code area."
+  (let ((ptr (and (boundp 'modus-int::*n386-ptr*) modus-int::*n386-ptr*))
+        (end (and (boundp 'modus-int::*n386-end*) modus-int::*n386-end*)))
+    (when (and (integerp ptr) (integerp end) (< (+ ptr (length bytes) 32) end))
+      (let ((a (logand (+ ptr 15) (lognot 15))) (i 0))
+        (dolist (b bytes) (setf (mem-ref (+ a i) :u8) b) (setq i (+ i 1)))
+        (setf modus-int::*n386-ptr* (+ a (* 16 (ceiling (length bytes) 16))))
+        (modus-int::%word->val (logior a 3))))))
+
+(defun %t4-write-combining ()
+  "Make the framebuffer window (its page tables at #x20000) write-combining.  The page count."
+  (ignore-errors
+   (let ((f (%t4-install-code *t4-wc-code*)) (p0 (logand (mem-ref #x20000 :u32) (lognot #xFFF))) (n 0))
+     (when f
+       (loop for k from 0 below 4096
+             do (let ((e (mem-ref (+ #x20000 (* 4 k)) :u32)))
+                  (if (and (logbitp 0 e) (<= p0 (logand e (lognot #xFFF)))
+                           (< (logand e (lognot #xFFF)) (+ p0 #x1000000)))
+                      (progn (setf (mem-ref (+ #x20000 (* 4 k)) :u32) (logior e 8)) (setq n (+ n 1)))
+                      (return))))
+       (funcall f)                    ; PAT, then WBINVD and a CR3 reload put the PTEs in force
+       n))))
+
 ;;; --- the pointer -----------------------------------------------------------------------------
 ;;; Drawn over the screen, with the pixels under it kept and put back when it moves.  The
 ;;; framebuffer is uncached, so the pixels under it are not read back from it: they are kept

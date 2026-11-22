@@ -47,6 +47,7 @@
   (t4-gpu-dump "bios")
   (let ((native (and *t4-native* (%t4-native-panel))))
     (t4-log "kiln t420: screen ~Dx~D~:[ (VBE)~; (native, the panel fitter off)~]" *t4-w* *t4-h* native))
+  (t4-log "kiln t420: screen write-combining (~D pages)" (%t4-write-combining))
   (%t4-mouse-init)
   (setf *t4-px* (floor *t4-w* 2) *t4-py* (floor *t4-h* 2))
   (t4-log "kiln t420: desk ~Dx~D, mouse ~:[off~;on~]" *t4-w* *t4-h* *t4-mouse-ok*)
