@@ -300,6 +300,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   ;; THE MAP, a second window: the scene from above, and where you are -- its window, its GPU view, the arrow's lines
   ;; (rewritten each frame), and whether it is showing
   map-window map-view map-arrow (map-shown nil)
+  ;; the field of view, which a trackpad's pinch narrows and widens (radians)
+  (fov (/ pi 3))
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -405,6 +407,13 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
            (when (and (= ks #xff1b) (game-locked g))
              (kiln-mac:window-pointer-lock nil) (setf (game-locked g) nil))))
       (9 (remhash (logand e #xFFFFFFFFFF) (game-held g)))
+      ;; A TRACKPAD: pinch to zoom (the field of view), two fingers turned to turn, double-tapped to zoom back
+      (15 (multiple-value-bind (kind phase amount) (kiln-mac:gesture-event e)
+            (declare (ignore phase))
+            (case kind
+              (:pinch (setf (game-fov g) (max 0.3 (min 1.7 (/ (game-fov g) (+ 1 amount))))))
+              (:rotate (incf (game-yaw g) (* amount (/ pi 180))))
+              (:smart-zoom (setf (game-fov g) (/ pi 3))))))
       (5 (let* ((k (game-scale g)) (px (floor (logand e #xFFFFF) k)) (py (floor (logand (ash e -20) #xFFFFF) k))
                 (shape (if (and (game-hud-rect g)
                                 (destructuring-bind (x y w h) (game-hud-rect g)
@@ -647,7 +656,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
 (defun render (g)
   (multiple-value-bind (w h) (kiln-gpu:gpu-view-size (game-view g))
     (when (and (plusp w) (plusp h))
-      (let* ((projection (perspective (/ pi 3) (/ w h) 0.1 120.0))
+      (let* ((projection (perspective (game-fov g) (/ w h) 0.1 120.0))
              (view (look (game-eye g) (game-yaw g) (game-pitch g)))
              (frame (floats (mat* projection view)
                             -0.5 -1.0 -0.35 0.0

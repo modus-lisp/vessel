@@ -29,6 +29,11 @@
 ;;;;                                   it opens MENU when clicked, or calls FN
 ;;;;   (status-title item "120 fps")
 ;;;;
+;;;; TRACKPAD GESTURES come with the window's own events (type 15, pseudo-syscall 1004), for the app's loop:
+;;;;   (gesture-event e)               (values kind phase amount) for a type 15 event E: KIND :pinch (AMOUNT the
+;;;;                                   change, 0.1 a tenth bigger), :rotate (degrees, counter-clockwise), :smart-zoom,
+;;;;                                   :swipe (:left :right :up :down); PHASE :began :changed :ended
+;;;;
 ;;;; MORE WINDOWS than the one the desk (or app) is in:
 ;;;;   (new-window "Map" 360 360)      a window, shown, centred: a UI handle -- KILN-SWIFT:UI-ADD puts views in it,
 ;;;;                                   placed from its top left; a GPU view made to fill (GPU-VIEW 0 0 0 0) fills it
@@ -56,7 +61,8 @@
            #:glass-panel #:glass-button #:menu #:menu-item #:menu-separator #:menu-check #:menu-enable
            #:status-item #:status-title
            #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce
-           #:new-window #:window-show #:window-hide #:window-retitle #:on-window-close #:on-window-resize))
+           #:new-window #:window-show #:window-hide #:window-retitle #:on-window-close #:on-window-resize
+           #:gesture-event))
 
 (in-package #:kiln-mac)
 
@@ -216,3 +222,17 @@
 (defun on-window-resize (win fn)
   "FN gets WIN's new content width and height, in points, as it is resized."
   (kiln-swift:on-event :winresize win (lambda (wh h) (declare (ignore h)) (funcall fn (floor wh 65536) (mod wh 65536)))))
+
+;;; ---- trackpad gestures ----------------------------------------------------------------------------------------------
+
+(defun gesture-event (e)
+  "A trackpad gesture (a type 15 window event): (values kind phase amount), KIND :PINCH :ROTATE :SMART-ZOOM or :SWIPE,
+   PHASE :BEGAN :CHANGED or :ENDED, AMOUNT a pinch's change (0.1: a tenth bigger), a rotation's degrees
+   (counter-clockwise), a swipe's direction (:LEFT :RIGHT :UP :DOWN), NIL for a smart zoom."
+  (let* ((kind (ldb (byte 4 32) e)) (phase (ldb (byte 2 36) e))
+         (raw (ldb (byte 32 0) e)) (n (if (logbitp 31 raw) (- raw (ash 1 32)) raw)))
+    (values (case kind (0 :pinch) (1 :rotate) (2 :smart-zoom) (t :swipe))
+            (case phase (0 :began) (1 :changed) (t :ended))
+            (case kind
+              (0 (/ n 1000.0)) (1 (/ n 1000.0)) (2 nil)
+              (t (case n (1 :left) (2 :right) (3 :up) (t :down)))))))
