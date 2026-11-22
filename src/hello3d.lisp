@@ -196,6 +196,8 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (pad (make-array 19 :element-type 'single-float :initial-element 0.0)) (pad-a nil) pad-label (pad-seen -1)
   ;; sound (sound.lisp): a humming voice per cube, the ring's then the middle one's; a blip; on or off
   (hums '()) blip (sound t) (spatial nil) (head nil)
+  ;; where each toggle is shown, to keep them in step: the HUD's buttons, and the menus' items (a Mac's)
+  spin-button sound-button head-button speed-slider (spin-items '()) (sound-items '()) (head-items '()) status
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -250,7 +252,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
         ;; A, pressed (not held): spin on or off, and a short buzz to say so
         (let ((a (kiln-pad:pad-button p :a)))
           (when (and a (not (game-pad-a g)))
-            (setf (game-spin g) (not (game-spin g)))
+            (set-spin g (not (game-spin g)))
             (blip g)
             (kiln-pad:pad-rumble 0 0.5 80))
           (setf (game-pad-a g) a))))
@@ -368,73 +370,107 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                             (mat* (rotation-y (* -0.5 a)) (scaling 1.8)))
                       (floats 1.0 0.85 0.55 1)))))))
 
+(defun set-spin (g on)
+  "Spin on or off, shown wherever it is: the HUD's button, the menus' check marks."
+  (setf (game-spin g) on)
+  (when (game-spin-button g) (kiln-swift:ui-set-text (game-spin-button g) (if on "spin: on" "spin: off")))
+  (dolist (i (game-spin-items g)) (kiln-mac:menu-check i on)))
+
+(defun set-sound (g on)
+  (setf (game-sound g) on kiln-sound:*master* (if on 1.0 0.0))
+  (when (game-spatial g) (kiln-sound:spatial-volume (if on 1.0 0.0)))
+  (when (game-sound-button g) (kiln-swift:ui-set-text (game-sound-button g) (if on "sound: on" "sound: off")))
+  (dolist (i (game-sound-items g)) (kiln-mac:menu-check i on)))
+
+(defun set-speed (g speed)
+  (setf (game-speed g) (max 0.05 (min 0.8 speed)))
+  (when (game-speed-slider g) (kiln-swift:ui-set-value (game-speed-slider g) (round (* 125 (game-speed g))))))
+
+(defun set-head (g on)
+  "Follow the head (AirPods) or not."
+  (setf (game-head g) on)
+  (format t "~&hello3d: following the head ~:[off~;on~]~%" on)
+  (kiln-sound:spatial-head on)
+  (when (game-head-button g) (kiln-swift:ui-symbol-button-set (game-head-button g) on))
+  (dolist (i (game-head-items g)) (kiln-mac:menu-check i on)))
+
+(defun toggle-head (g)
+  "FOLLOW THE HEAD, off until asked for: where the system will ask for Motion & Fitness, the person is told first what
+   it is for, and may say not now; refused before, where in Settings to allow it."
+  (cond ((game-head g) (set-head g nil))
+        ((eq (kiln-sound:spatial-head-permission) :not-asked)
+         (let ((alert (kiln-swift:ui-alert
+                       "Follow your head?"
+                       "With AirPods, each sound stays in place as you turn your head. Next, you'll be asked to allow Motion & Fitness.")))
+           (kiln-swift:ui-alert-action alert "Not Now")
+           (kiln-swift:ui-alert-action alert "Continue")
+           (kiln-swift:on-event :alert alert (lambda (index h) (declare (ignore h)) (when (eql index 1) (set-head g t))))
+           (kiln-swift:ui-alert-present alert)))
+        ((eq (kiln-sound:spatial-head-permission) :refused)
+         (let ((alert (kiln-swift:ui-alert
+                       "Motion & Fitness is off"
+                       "To follow your head, allow Hello 3D in Settings > Privacy & Security > Motion & Fitness.")))
+           (kiln-swift:ui-alert-action alert "OK")
+           (kiln-swift:ui-alert-present alert)))
+        (t (set-head g t))))
+
 (defun make-hud (g)
-  "The platform's own controls over the picture, inside the safe area (a phone's notch, turned)."
+  "The platform's own controls over the picture, inside the safe area (a phone's notch, turned) -- on a Mac on a pane
+   of Liquid Glass, its buttons glass too."
   (let* ((scale (game-scale g))
          (x (+ 20 (floor (%sys 1001 4 0 0) scale))) (y (+ 8 (floor (max 0 (%sys 1001 3 0 0)) scale)))
          ;; the width there is, in points: a phone held upright has under 400, so lines are shorter and the
          ;; sound button goes under spin rather than beside it
          (w (- (floor (%sys 1001 0 0 0) scale) x 20 (floor (max 0 (%sys 1001 6 0 0)) scale)))
          (narrow (< w 480))
-         (below (if narrow 40 0)))
-  (kiln-swift:ui-label "Hello, world" x (+ y 8) (min w 300) 30)
-  (setf (game-fps-label g) (kiln-swift:ui-label "" x (+ y 38) (min w 300) 22))
-  (kiln-swift:ui-label (cond ((not (game-touch g)) "click: look around   Esc: let go   WASD, QE: move   arrows: turn")
-                             (narrow "left thumb: move   right thumb: look")
-                             (t "left thumb: move   right thumb: look   or a game controller"))
-                       x (+ y 62) (min w 600) 22)
-  (setf (game-pad-label g) (kiln-swift:ui-label "" x (+ y 132 below) (min w 600) 22))
-  (let ((sound (if narrow
-                   (kiln-swift:ui-button "sound: on" x (+ y 92 below) 110 32)
-                   (kiln-swift:ui-button "sound: on" (+ x 340) (+ y 92) 110 32))))
-    (kiln-swift:on-tap sound (lambda (value h)
-                               (declare (ignore value h))
-                               (setf (game-sound g) (not (game-sound g))
-                                     kiln-sound:*master* (if (game-sound g) 1.0 0.0))
-                               (when (game-spatial g) (kiln-sound:spatial-volume (if (game-sound g) 1.0 0.0)))
-                               (kiln-swift:ui-set-text sound (if (game-sound g) "sound: on" "sound: off")))))
-  ;; FOLLOW THE HEAD (AirPods), off until tapped: where the system will ask for Motion & Fitness, the person is told
-  ;; first what it is for, and may say not now
-  (when (game-spatial g)
-    (let ((head (if narrow
-                    (kiln-swift:ui-symbol-button "headphones" (+ x 120) (+ y 92 below) 48 32)
-                    (kiln-swift:ui-symbol-button "headphones" (+ x 460) (+ y 92) 48 32))))
-      (flet ((follow (on)
-               (setf (game-head g) on)
-               (format t "~&hello3d: following the head ~:[off~;on~]~%" on)
-               (kiln-sound:spatial-head on)
-               (kiln-swift:ui-symbol-button-set head on)))
-        (kiln-swift:on-tap head
-                           (lambda (value h)
-                             (declare (ignore value h))
-                             (cond ((game-head g) (follow nil))
-                                   ((eq (kiln-sound:spatial-head-permission) :not-asked)
-                                    (let ((alert (kiln-swift:ui-alert
-                                                  "Follow your head?"
-                                                  "With AirPods, each sound stays in place as you turn your head. Next, you'll be asked to allow Motion & Fitness.")))
-                                      (kiln-swift:ui-alert-action alert "Not Now")
-                                      (kiln-swift:ui-alert-action alert "Continue")
-                                      (kiln-swift:on-event :alert alert
-                                                           (lambda (index h)
-                                                             (declare (ignore h))
-                                                             (when (eql index 1) (follow t))))
-                                      (kiln-swift:ui-alert-present alert)))
-                                   ((eq (kiln-sound:spatial-head-permission) :refused)
-                                    (let ((alert (kiln-swift:ui-alert
-                                                  "Motion & Fitness is off"
-                                                  "To follow your head, allow Hello 3D in Settings > Privacy & Security > Motion & Fitness.")))
-                                      (kiln-swift:ui-alert-action alert "OK")
-                                      (kiln-swift:ui-alert-present alert)))
-                                   (t (follow t))))))))
-  (let ((spin (kiln-swift:ui-button "spin: on" x (+ y 92) 110 32))
-        (speed (kiln-swift:ui-slider 50 (+ x 120) (+ y 96) 200 24)))     ; mid-way: 0.4
-    (kiln-swift:on-tap spin (lambda (value h)
-                              (declare (ignore value h))
-                              (setf (game-spin g) (not (game-spin g)))
-                              (kiln-swift:ui-set-text spin (if (game-spin g) "spin: on" "spin: off"))))
-    (kiln-swift:on-event :slider speed (lambda (value h)
-                                         (declare (ignore h))
-                                         (setf (game-speed g) (/ value 125.0)))))))
+         (below (if narrow 40 0))
+         ;; ON A MAC, A PANE OF GLASS: what goes on it is placed from its top left
+         (panel (and (not (game-touch g)) (kiln-mac:glass-panel (- x 12) y 560 160 :radius 20)))
+         (x (if panel 14 x))
+         (y (if panel -2 y)))
+    (flet ((put (h) (when panel (kiln-swift:ui-add panel h)) h)
+           (glassy (h) (when panel (kiln-mac:glass-button h)) h))
+      (put (kiln-swift:ui-label "Hello, world" x (+ y 8) (min w 300) 30))
+      (setf (game-fps-label g) (put (kiln-swift:ui-label "" x (+ y 38) (min w 300) 22)))
+      (put (kiln-swift:ui-label (cond ((not (game-touch g)) "click: look around   Esc: let go   WASD, QE: move   arrows: turn")
+                                      (narrow "left thumb: move   right thumb: look")
+                                      (t "left thumb: move   right thumb: look   or a game controller"))
+                                x (+ y 62) (min w 600) 22))
+      (setf (game-pad-label g) (put (kiln-swift:ui-label "" x (+ y 132 below) (min w 600) 22)))
+      (let ((spin (put (glassy (kiln-swift:ui-button "spin: on" x (+ y 92) 110 32))))
+            (speed (put (kiln-swift:ui-slider 50 (+ x 120) (+ y 96) 200 24)))     ; mid-way: 0.4
+            (sound (put (glassy (if narrow
+                                    (kiln-swift:ui-button "sound: on" x (+ y 92 below) 110 32)
+                                    (kiln-swift:ui-button "sound: on" (+ x 340) (+ y 92) 110 32))))))
+        (setf (game-spin-button g) spin (game-speed-slider g) speed (game-sound-button g) sound)
+        (kiln-swift:on-tap spin (lambda (v h) (declare (ignore v h)) (set-spin g (not (game-spin g)))))
+        (kiln-swift:on-tap sound (lambda (v h) (declare (ignore v h)) (set-sound g (not (game-sound g)))))
+        (kiln-swift:on-event :slider speed (lambda (value h) (declare (ignore h)) (setf (game-speed g) (/ value 125.0)))))
+      (when (game-spatial g)
+        (let ((head (put (if narrow
+                             (kiln-swift:ui-symbol-button "headphones" (+ x 120) (+ y 92 below) 48 32)
+                             (kiln-swift:ui-symbol-button "headphones" (+ x 460) (+ y 92) 48 32)))))
+          (setf (game-head-button g) head)
+          (kiln-swift:on-tap head (lambda (v h) (declare (ignore v h)) (toggle-head g))))))))
+
+(defun make-menus (g)
+  "A Mac's menus: Game in the menu bar -- spin, sound, following the head, faster, slower -- and a status item with
+   the frame rate, whose menu has spin and sound.  The check marks follow the toggles wherever they are changed."
+  (let ((m (kiln-mac:menu "Game")))
+    (push (kiln-mac:menu-item m "Spin" (lambda () (set-spin g (not (game-spin g)))) :key "s") (game-spin-items g))
+    (push (kiln-mac:menu-item m "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
+    (when (game-spatial g)
+      (push (kiln-mac:menu-item m "Follow Your Head" (lambda () (toggle-head g))) (game-head-items g)))
+    (kiln-mac:menu-separator m)
+    (kiln-mac:menu-item m "Faster" (lambda () (set-speed g (* (game-speed g) 1.25))) :key "=")
+    (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-"))
+  (let ((sm (kiln-mac:menu "Hello 3D" :in-bar nil)))
+    (push (kiln-mac:menu-item sm "Spin" (lambda () (set-spin g (not (game-spin g))))) (game-spin-items g))
+    (push (kiln-mac:menu-item sm "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
+    (setf (game-status g) (kiln-mac:status-item :symbol "cube.fill" :title "" :menu sm)))
+  (set-spin g (game-spin g))
+  (set-sound g (game-sound g))
+  (dolist (i (game-head-items g)) (kiln-mac:menu-check i (game-head g))))
 
 (defun start (&key touch)
   "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
@@ -461,6 +497,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
               (game-blip g) (kiln-sound:pluck 880))
         (format t "~&hello3d: sound ~:[panned left and right~;in 3D (the platform's renderer)~]~%" (game-spatial g))))
     (make-hud g)
+    (unless touch (make-menus g))
     (setf (game-fps-at g) (get-internal-real-time))
     g))
 
@@ -489,6 +526,8 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
           (when (>= since 0.5)
             (kiln-swift:ui-set-text (game-fps-label g)
                                     (format nil "~D frames a second" (round (game-frames g) since)))
+            (when (game-status g)
+              (kiln-mac:status-title (game-status g) (format nil " ~D fps" (round (game-frames g) since))))
             ;; the controller: said when one comes or goes, and its light the middle cube's colour
             (let ((n (kiln-pad:pad-count)))
               (unless (= n (game-pad-seen g))
