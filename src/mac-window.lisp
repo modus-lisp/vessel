@@ -29,6 +29,14 @@
 ;;;;                                   it opens MENU when clicked, or calls FN
 ;;;;   (status-title item "120 fps")
 ;;;;
+;;;; MORE WINDOWS than the one the desk (or app) is in:
+;;;;   (new-window "Map" 360 360)      a window, shown, centred: a UI handle -- KILN-SWIFT:UI-ADD puts views in it,
+;;;;                                   placed from its top left; a GPU view made to fill (GPU-VIEW 0 0 0 0) fills it
+;;;;   (window-show win)  (window-hide win)  (window-retitle win "Map: 3 cubes")
+;;;;   (on-window-close win fn)        FN, of no arguments, when its close button is clicked (it is hidden, and can
+;;;;                                   be shown again)
+;;;;   (on-window-resize win fn)       FN gets its new width and height, in points
+;;;;
 ;;;; THE APP'S OWN EVENTS AND THE DOCK:
 ;;;;   (on-open fn)                    FN gets each file's path or link opened with the app: Finder's Open With
 ;;;;                                   (kiln mac --opens=UTIS), `open', the app's URL scheme (--url-scheme=NAME)
@@ -47,7 +55,8 @@
            #:window-pointer-lock #:window-pointer-shape
            #:glass-panel #:glass-button #:menu #:menu-item #:menu-separator #:menu-check #:menu-enable
            #:status-item #:status-title
-           #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce))
+           #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce
+           #:new-window #:window-show #:window-hide #:window-retitle #:on-window-close #:on-window-resize))
 
 (in-package #:kiln-mac)
 
@@ -185,3 +194,25 @@
 (defun dock-bounce (&optional critical)
   "The Dock icon bounces once -- until the app is active, if CRITICAL."
   (kiln-swift:swift-call "dock_bounce" (if critical 1 0)))
+
+;;; ---- more windows ---------------------------------------------------------------------------------------------------
+
+(defun new-window (title width height)
+  "A window titled TITLE, WIDTH x HEIGHT points, centred and shown: a UI handle that views are added to."
+  (let ((b (%bytes title)))
+    (kiln-swift:swift-call "window_new" (kiln-swift::%addr b) (length b) width height)))
+
+(defun window-show (win) (kiln-swift:swift-call "window_show" win))
+(defun window-hide (win) (kiln-swift:swift-call "window_hide" win))
+
+(defun window-retitle (win title)
+  (let ((b (%bytes title)))
+    (kiln-swift:swift-call "window_retitle" win (kiln-swift::%addr b) (length b))))
+
+(defun on-window-close (win fn)
+  "FN, of no arguments, when WIN's close button is clicked; WIN is hidden, and WINDOW-SHOW brings it back."
+  (kiln-swift:on-event :winclose win (lambda (value h) (declare (ignore value h)) (funcall fn))))
+
+(defun on-window-resize (win fn)
+  "FN gets WIN's new content width and height, in points, as it is resized."
+  (kiln-swift:on-event :winresize win (lambda (wh h) (declare (ignore h)) (funcall fn (floor wh 65536) (mod wh 65536)))))

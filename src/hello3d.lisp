@@ -297,6 +297,9 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   watch watch-count (watch-turn nil) (watch-bpm 0) (watch-at 0)
   ;; A FLIP: when it began (internal real time), or NIL -- each cube turns head over heels once, in turn
   (flip-at nil) (flip-plucked 0)
+  ;; THE MAP, a second window: the scene from above, and where you are -- its window, its GPU view, the arrow's lines
+  ;; (rewritten each frame), and whether it is showing
+  map-window map-view map-arrow (map-shown nil)
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -464,6 +467,69 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
                      (kiln-sound:play (kiln-sound:pluck (* 440 (expt 2 (/ (* 2 i) 12)))) :gain 0.25))
                    (incf (game-flip-plucked g))))
         (when (> since (+ (* 8 *flip-stagger*) *flip-seconds*)) (setf (game-flip-at g) nil))))))
+
+(defparameter *map-half* 13.0 "The map shows this far from the middle each way, in the world's units.")
+
+(defun top-down (aspect)
+  "Looking straight down on the scene, north (-Z) up: x and z across the view (*MAP-HALF* each way, the narrower side
+   of the view), height as depth -- the higher, the nearer."
+  (let ((m (mat)) (k (/ 1.0 *map-half*)))
+    (setf (aref m 0) (float (if (> aspect 1) (/ k aspect) k) 1.0)  ; x across
+          (aref m 9) (float (- (if (< aspect 1) (* k aspect) k)) 1.0)  ; z up the view, -Z at the top
+          (aref m 6) (/ -1.0 40)  (aref m 14) 0.5                 ; height: depth 0.5 at 0, nearer above
+          (aref m 15) 1.0)
+    m))
+
+(defun arrow-points (x z yaw)
+  "Where you are and which way you face, as three segments: a dart, two units long, flat at a height above the cubes."
+  (let* ((fx (- (sin yaw))) (fz (- (cos yaw))) (rx (cos yaw)) (rz (- (sin yaw)))
+         (tipx (+ x (* 1.4 fx))) (tipz (+ z (* 1.4 fz)))
+         (lx (- x (* 0.8 rx) (* 0.6 fx))) (lz (- z (* 0.8 rz) (* 0.6 fz)))
+         (bx (+ x (* 0.8 rx) (* -0.6 fx))) (bz (+ z (* 0.8 rz) (* -0.6 fz))) (y 6))
+    (floats lx y lz tipx y tipz   tipx y tipz bx y bz   bx y bz lx y lz)))
+
+(defun open-map (g)
+  "The map window: made the first time, shown after."
+  (if (game-map-window g)
+      (kiln-mac:window-show (game-map-window g))
+      (let ((win (kiln-mac:new-window "Map" 360 360)))
+        (setf (game-map-window g) win
+              (game-map-view g) (kiln-gpu:gpu-view 0 0 0 0)
+              (game-map-arrow g) (kiln-gpu:gpu-buffer (* 4 18)))
+        (kiln-swift:ui-add win (game-map-view g))
+        (kiln-mac:on-window-close win (lambda () (setf (game-map-shown g) nil)))))
+  (setf (game-map-shown g) t))
+
+(defun render-map (g)
+  "The map's frame: the floor and the cubes from above, unfogged, and the arrow over them."
+  (when (and (game-map-shown g) (game-map-view g))
+    (multiple-value-bind (w h) (kiln-gpu:gpu-view-size (game-map-view g))
+      (when (and (plusp w) (plusp h))
+        (let* ((projection (top-down (/ w h)))
+               (frame (floats projection -0.5 -1.0 -0.35 0.0   0 60 0 1   500 1000 0 0   0 0 0 1))
+               (a (game-angle g)))
+          (kiln-gpu:with-gpu-pass (pass (game-map-view g) :clear *dusk*)
+            (kiln-gpu:gpu-use pass (game-pipeline g))
+            (kiln-gpu:gpu-cull pass :none)          ; the view from above is a mirror image: no face is culled
+            (kiln-gpu:gpu-constants pass frame 1)
+            (draw-thing pass (game-floor-vertices g) (game-floor-indices g) 6 (game-floor-texture g)
+                        (identity-mat) (floats 1 1 1 1))
+            (dotimes (i 8)
+              (multiple-value-bind (x y z) (ring-position i a)
+                (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
+                            (mat* (translation x y z) (rotation-y (+ a (* i 0.7)))) (hue (/ i 8.0)))))
+            (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
+                        (mat* (translation 0 (middle-height a) 0) (scaling 1.8)) (floats 1.0 0.85 0.55 1))
+            ;; YOU: an orange dart, over everything
+            (destructuring-bind (ex ey ez) (game-eye g)
+              (declare (ignore ey))
+              (kiln-gpu:gpu-write (game-map-arrow g) (arrow-points ex ez (game-yaw g))))
+            (kiln-gpu:gpu-depth pass :none)
+            (kiln-gpu:gpu-cull pass :none)
+            (kiln-gpu:gpu-use pass (game-line-pipeline g))
+            (kiln-gpu:gpu-bind pass (game-map-arrow g) 0)
+            (kiln-gpu:gpu-constants pass (floats projection 1.0 0.62 0.25 1.0 (* 1.0 (game-scale g)) (/ w 2.0) (/ h 2.0) 0) 2)
+            (kiln-gpu:gpu-draw pass 18)))))))
 
 (defun draw-thing (pass vertices indices count texture model tint)
   "One object: its vertices, texture, model matrix and tint, drawn."
@@ -789,7 +855,9 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-")
     (kiln-mac:menu-separator m)
     (kiln-mac:menu-item m "Remind Me in 10 Seconds" (lambda () (remind g)))
-    (kiln-mac:menu-item m "Flip the Cubes" (lambda () (flip g)) :key "f"))
+    (kiln-mac:menu-item m "Flip the Cubes" (lambda () (flip g)) :key "f")
+    (kiln-mac:menu-separator m)
+    (kiln-mac:menu-item m "Show Map" (lambda () (open-map g))))
   (let ((sm (kiln-mac:menu "Hello 3D" :in-bar nil)))
     (push (kiln-mac:menu-item sm "Spin" (lambda () (set-spin g (not (game-spin g))))) (game-spin-items g))
     (push (kiln-mac:menu-item sm "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
@@ -870,6 +938,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
           (serious-condition (c) (format t "~&hello3d: sound: ~A~%" c)))
         (handler-case (render g)
           (serious-condition (c) (format t "~&hello3d: ~A~%" c)))
+        (handler-case (render-map g)
+          (serious-condition (c) (format t "~&hello3d: map: ~A~%" c)))
         ;; the frame rate, twice a second
         (incf (game-frames g))
         (let ((since (/ (- now (game-fps-at g)) internal-time-units-per-second)))
