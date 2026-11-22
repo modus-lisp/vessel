@@ -29,6 +29,8 @@
 ;;;;                                   it opens MENU when clicked, or calls FN
 ;;;;   (status-title item "120 fps")
 ;;;;
+;;;; PRINTING: (print-window "Desk")  the window's picture to the print panel (a GPU view: KILN-GPU:GPU-PRINT)
+;;;;
 ;;;; TRACKPAD GESTURES come with the window's own events (type 15, pseudo-syscall 1004), for the app's loop:
 ;;;;   (gesture-event e)               (values kind phase amount) for a type 15 event E: KIND :pinch (AMOUNT the
 ;;;;                                   change, 0.1 a tenth bigger), :rotate (degrees, counter-clockwise), :smart-zoom,
@@ -62,7 +64,7 @@
            #:status-item #:status-title
            #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce
            #:new-window #:window-show #:window-hide #:window-retitle #:on-window-close #:on-window-resize
-           #:gesture-event))
+           #:gesture-event #:print-window))
 
 (in-package #:kiln-mac)
 
@@ -238,3 +240,8 @@
             (case kind
               (0 (/ n 1000.0)) (1 (/ n 1000.0)) (2 nil)
               (t (case n (1 :left) (2 :right) (3 :up) (t :down)))))))
+
+(defun print-window (&optional (title "Window"))
+  "The window's picture -- its framebuffer, as last shown -- to the system's print panel, titled TITLE."
+  (let ((b (%bytes title)))
+    (kiln-swift:swift-call "print_window" (kiln-swift::%addr b) (length b))))

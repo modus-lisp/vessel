@@ -32,7 +32,7 @@
   (:export #:gpu-view #:gpu-shader #:gpu-pipeline #:gpu-buffer #:gpu-write
            #:gpu-pass-begin #:gpu-pass-end #:with-gpu-pass #:gpu-use #:gpu-bind #:gpu-draw #:floats
            #:gpu-view-size #:gpu-depth #:gpu-cull #:gpu-constants #:gpu-texture #:gpu-bind-texture
-           #:gpu-indices #:gpu-draw-indexed))
+           #:gpu-indices #:gpu-draw-indexed #:gpu-print))
 
 (in-package #:kiln-gpu)
 
@@ -146,3 +146,7 @@
   "Draw COUNT of the 16-bit INDICES (a GPU-INDICES buffer) from FIRST."
   (%call "gpu_draw_indexed" pass (ecase primitive (:triangles 0) (:triangle-strip 1) (:lines 2) (:points 3))
          indices count first 0))
+
+(defun gpu-print (view)
+  "VIEW's next frame, copied out of the GPU, to the system's print panel."
+  (%call "gpu_view_print" view))
