@@ -53,6 +53,13 @@
   (t4-log "kiln t420: desk ~Dx~D, mouse ~:[off~;on~]" *t4-w* *t4-h* *t4-mouse-ok*)
   (t4-log-flush)
   (unwind-protect
-       (kiln-app-main :top 0 :media nil)
+       (progn
+         ;; glass.wm where the image has it (app.lisp %KILN-MAKE-DESK): a laptop's screen and
+         ;; mouse, so desktop density (1x OPEN LOOK, not the phone's touch-sized 2x), and no
+         ;; wireframe drags -- they are for a link that falls behind, and this screen is local
+         (setq *kiln-wm-scale* 1)
+         (let ((s (and (find-package "GLASS.WM") (find-symbol "*DRAG-ADAPTIVE*" "GLASS.WM"))))
+           (when s (setf (symbol-value s) nil)))
+         (kiln-app-main :top 0 :media nil))
     (%t4-console-to-log nil)
     (%t4-screen-down)))

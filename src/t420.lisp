@@ -370,15 +370,17 @@
     (let* ((h (first *t4-pkt*))
            (dx (if (logbitp 4 h) (- (second *t4-pkt*) 256) (second *t4-pkt*)))
            (dy (if (logbitp 5 h) (- (third *t4-pkt*) 256) (third *t4-pkt*)))
-           (nb (logand h 1)) (was *t4-buttons*))
+           ;; X11's mask, as app.lisp's type-12 event carries it: PS/2 has left, right, middle
+           ;; in bits 0-2; X11 counts 1 left, 2 middle, 4 right (glass.wm's window menu is 4)
+           (nb (logior (logand h 1) (if (logbitp 2 h) 2 0) (if (logbitp 1 h) 4 0))))
       (unless (or (logbitp 6 h) (logbitp 7 h))                         ; overflow: drop it
         (setf *t4-px* (max 0 (min (- *t4-w* 1) (+ *t4-px* dx)))
               *t4-py* (max 0 (min (- *t4-h* 1) (- *t4-py* dy))))      ; PS/2 Y grows upward
         (setf *t4-buttons* nb)
         (%t4-pointer-hide) (%t4-pointer-show)
-        (%t4-event (cond ((and (= nb 1) (= was 0)) 1) ((and (= nb 0) (= was 1)) 3)
-                         ((= nb 1) 2) (t 5))
-                   *t4-px* *t4-py*)))))
+        ;; type 12: a pointer with all its buttons (bits 48 up), every packet -- a press, a
+        ;; release, a drag and a hover alike; the desk works out which from the mask
+        (+ (* nb 281474976710656) (%t4-event 12 *t4-px* *t4-py*))))))
 
 (defvar *t4-events* nil)
 
@@ -411,7 +413,7 @@
 ;;;   LBA +0: "T4LOG" then the byte count (u32 at +8) and the flush count (+12); data from LBA +1.
 ;;; `kiln t420' pads the disk so the region exists (*T4-LOG-LBA*, 4096 sectors).
 
-(defvar *t4-log-lba* 64000)
+(defvar *t4-log-lba* 128000)
 (defvar *t4-log* (make-array (* 1024 1024) :element-type '(unsigned-byte 8)))
 (defvar *t4-log-n* 0)           ; bytes in the log
 (defvar *t4-log-flushed* 0)     ; bytes on the disk
@@ -464,7 +466,7 @@
 ;;; image (scripts on the Zero: t4cmd.py) and the desk's idle loop picks it up and logs the answer.
 ;;;   LBA *T4-CMD-LBA*: "T4CMD" then a sequence number (u32 at +8) and the text's length (+12);
 ;;;   the text from +16, up to 15 sectors in all.  A new sequence number is a new command.
-(defvar *t4-cmd-lba* 66560)     ; inside the log's region, past what a 1 MB log can reach
+(defvar *t4-cmd-lba* 130560)    ; inside the log's region, past what a 1 MB log can reach
 (defvar *t4-cmd-seq* nil)       ; the last one seen (NIL: none yet -- the first read only records it)
 (defvar *t4-cmd-at* 0)
 
@@ -570,8 +572,12 @@
   (modus-int::io-out-byte #x70 reg)
   (modus-int::io-in-byte #x71))
 
+(defvar *t4-rtc-zone* 0
+  "The zone the CMOS clock keeps, in CL's hours west: 0, UTC -- what this T420's held (it read
+   23:47 at 18:47 in UTC-5).  A machine whose clock Windows set keeps local time: *KILN-TIME-ZONE*.")
+
 (defun t4-rtc-time ()
-  "The CMOS clock's time as universal time (the RTC taken as *KILN-TIME-ZONE* local), or NIL."
+  "The CMOS clock's time as universal time (the RTC taken as *T4-RTC-ZONE*), or NIL."
   (dotimes (i 100000) (unless (logbitp 7 (%t4-cmos #x0A)) (return)))   ; not mid-update
   (let* ((b (%t4-cmos #x0B))
          (bcd (not (logbitp 2 b))) (h24 (logbitp 1 b))
@@ -585,7 +591,7 @@
          (mon (funcall conv (%t4-cmos #x08)))
          (yr (+ 2000 (funcall conv (%t4-cmos #x09)))))
     (when (and (<= 2020 yr 2099) (<= 1 mon 12) (<= 1 day 31) (< hr 24) (< min 60) (< sec 60))
-      (encode-universal-time sec min hr day mon yr *kiln-time-zone*))))
+      (encode-universal-time sec min hr day mon yr *t4-rtc-zone*))))
 
 (defun t4-sntp (&key (server "pool.ntp.org") (tries 3))
   "Universal time from SNTP (RFC 4330) over modus's own UDP (net/ip.lisp), or NIL.  Needs the
@@ -597,7 +603,11 @@
       (return-from t4-sntp nil))
     (let* ((n (length server)) (name (make-array n)))
       (dotimes (i n) (setf (aref name i) (char-code (char server i))))
-      (let ((ip (funcall dns name n)))
+      ;; the first lookup after DHCP can go unanswered (one boot logged DNS:F): try again
+      (let ((ip (dotimes (k 3 nil)
+                  (let ((a (ignore-errors (funcall dns name n))))
+                    (when (and a (not (eql a 0))) (return a))
+                    (modus-int::%sleep-ms 500)))))
         (if (or (null ip) (zerop ip))
             (progn (t4-log "sntp: no address for ~A" server) nil)
             (let ((q (make-array 48 :initial-element 0)))
