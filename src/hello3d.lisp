@@ -258,6 +258,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (background-sound t) (app-state :active)
   ;; THE HEAD, as the headphones report it, drawn as a wireframe in a corner: its pipeline and lines
   line-pipeline egg egg-count nose nose-count
+  ;; A FLIP: when it began (internal real time), or NIL -- each cube turns head over heels once, in turn
+  (flip-at nil) (flip-plucked 0)
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -397,6 +399,35 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
                          (kiln-sound:voice-set v :gain gain :pan pan)))))))
     (kiln-sound:sound-pump)))
 
+(defparameter *flip-seconds* 0.9 "How long a cube takes to go head over heels.")
+(defparameter *flip-stagger* 0.12 "The next cube begins this much later.")
+
+(defun flip-turn (g i)
+  "How far cube I (0-7 the ring, 8 the middle) has turned in the flip, 0 to 2 pi, eased in and out."
+  (let ((at (game-flip-at g)))
+    (if (null at)
+        0.0
+        (let* ((since (/ (- (get-internal-real-time) at) internal-time-units-per-second))
+               (u (max 0.0 (min 1.0 (/ (- since (* i *flip-stagger*)) *flip-seconds*)))))
+          (* 2 pi (- (* 3 u u) (* 2 u u u)))))))
+
+(defun flip (g)
+  "Every cube head over heels, one after another, each with a pluck as it goes."
+  (setf (game-flip-at g) (get-internal-real-time) (game-flip-plucked g) 0)
+  (format t "~&hello3d: flip!~%") (finish-output))
+
+(defun flip-tick (g)
+  "Plucks as each cube starts its flip (rising notes), and the flip forgotten once the last has landed."
+  (let ((at (game-flip-at g)))
+    (when at
+      (let ((since (/ (- (get-internal-real-time) at) internal-time-units-per-second)))
+        (loop while (and (< (game-flip-plucked g) 9) (<= (* (game-flip-plucked g) *flip-stagger*) since))
+              do (let ((i (game-flip-plucked g)))
+                   (when (game-blip g)
+                     (kiln-sound:play (kiln-sound:pluck (* 440 (expt 2 (/ (* 2 i) 12)))) :gain 0.25))
+                   (incf (game-flip-plucked g))))
+        (when (> since (+ (* 8 *flip-stagger*) *flip-seconds*)) (setf (game-flip-at g) nil))))))
+
 (defun draw-thing (pass vertices indices count texture model tint)
   "One object: its vertices, texture, model matrix and tint, drawn."
   (kiln-gpu:gpu-bind pass vertices 0)
@@ -473,12 +504,13 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
             (multiple-value-bind (x y z) (ring-position i a)
               (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
                           (mat* (translation x y z)
-                                (mat* (rotation-y (+ a (* i 0.7))) (rotation-x (* 0.6 a))))
+                                (mat* (rotation-x (flip-turn g i))
+                                      (mat* (rotation-y (+ a (* i 0.7))) (rotation-x (* 0.6 a)))))
                           (hue (/ i 8.0)))))
           ;; and in the middle, a bigger one, bobbing
           (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
                       (mat* (translation 0 (middle-height a) 0)
-                            (mat* (rotation-y (* -0.5 a)) (scaling 1.8)))
+                            (mat* (rotation-x (flip-turn g 8)) (mat* (rotation-y (* -0.5 a)) (scaling 1.8))))
                       (floats 1.0 0.85 0.55 1))
           ;; over everything, while the head is followed: the head
           (when (or (game-head g) *head-demo*) (draw-head pass g w h)))))))
@@ -596,10 +628,9 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
 
 (defun remind (g)
   "A notification ten seconds on.  The first time, the person is told what it is for before the system asks."
-  (declare (ignore g))
   (flet ((post ()
            (kiln-notify:notify "Hello 3D" "The cubes are still turning." :after 10
-                               :on-click (lambda () (format t "~&hello3d: the reminder was clicked~%") (finish-output)))
+                               :on-click (lambda () (flip g)))
            (format t "~&hello3d: a reminder in 10 seconds~%") (finish-output)))
     (case (kiln-notify:notify-permission)
       (:allowed (post))
@@ -649,7 +680,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (kiln-mac:menu-item m "Faster" (lambda () (set-speed g (* (game-speed g) 1.25))) :key "=")
     (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-")
     (kiln-mac:menu-separator m)
-    (kiln-mac:menu-item m "Remind Me in 10 Seconds" (lambda () (remind g))))
+    (kiln-mac:menu-item m "Remind Me in 10 Seconds" (lambda () (remind g)))
+    (kiln-mac:menu-item m "Flip the Cubes" (lambda () (flip g)) :key "f"))
   (let ((sm (kiln-mac:menu "Hello 3D" :in-bar nil)))
     (push (kiln-mac:menu-item sm "Spin" (lambda () (set-spin g (not (game-spin g))))) (game-spin-items g))
     (push (kiln-mac:menu-item sm "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
@@ -719,6 +751,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
         (setf last now)
         (steer g dt)
         (when (game-spin g) (incf (game-angle g) (* dt (game-speed g))))
+        (flip-tick g)
         (handler-case (hear g)
           (serious-condition (c) (format t "~&hello3d: sound: ~A~%" c)))
         (handler-case (render g)
