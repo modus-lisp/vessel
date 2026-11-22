@@ -199,6 +199,38 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
           0 0 -2.3    0.14 0 -2.0
           0 0 -2.3   -0.14 0 -2.0))
 
+(defun phone-lines ()
+  "The phone as it is held: a slab in the device's own axes -- x to the right of its screen, y to its top, z out of
+   the screen -- its screen's face, its back, the four edges between, and a bar across the top of the screen (the
+   earpiece), so which end is up can be told."
+  (let ((w 0.42) (h 0.86) (d 0.06) (out '()))
+    (flet ((seg (a b) (setf out (append out a b))))
+      (dolist (z (list d (- d)))
+        (seg (list (- w) (- h) z) (list w (- h) z)) (seg (list w (- h) z) (list w h z))
+        (seg (list w h z) (list (- w) h z)) (seg (list (- w) h z) (list (- w) (- h) z)))
+      (dolist (x (list (- w) w))
+        (dolist (y (list (- h) h)) (seg (list x y d) (list x y (- d)))))
+      (seg (list -0.12 (- h 0.1) d) (list 0.12 (- h 0.1) d)))
+    (apply #'floats out)))
+
+(defun watch-lines ()
+  "The watch as it is worn, in its own axes (x to the right of its screen, y to twelve o'clock, z out of the screen):
+   its case, the band above and below it, and the crown on its right side (the last segment)."
+  (let ((w 0.3) (h 0.36) (d 0.09) (band 0.2) (out '()))
+    (flet ((seg (a b) (setf out (append out a b))))
+      (dolist (z (list d (- d)))
+        (seg (list (- w) (- h) z) (list w (- h) z)) (seg (list w (- h) z) (list w h z))
+        (seg (list w h z) (list (- w) h z)) (seg (list (- w) h z) (list (- w) (- h) z)))
+      (dolist (x (list (- w) w))
+        (dolist (y (list (- h) h)) (seg (list x y d) (list x y (- d)))))
+      ;; the band: two straps going on past the case, narrower than it, from its back half
+      (dolist (sy '(1 -1))
+        (dolist (x (list (- band) band))
+          (seg (list x (* sy h) 0) (list x (* sy (+ h 0.5)) (- (* 0.25 d)))))
+        (seg (list (- band) (* sy (+ h 0.5)) (- (* 0.25 d))) (list band (* sy (+ h 0.5)) (- (* 0.25 d)))))
+      (seg (list w 0.1 0) (list (+ w 0.1) 0.1 0)))
+    (apply #'floats out)))
+
 (defun floor-mesh (size tiles)
   "A square of SIZE on y = 0, facing up, its texture repeated TILES times across."
   (let ((h (/ size 2.0)) (tl (float tiles 1.0)))
@@ -258,6 +290,11 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (background-sound t) (app-state :active)
   ;; THE HEAD, as the headphones report it, drawn as a wireframe in a corner: its pipeline and lines
   line-pipeline egg egg-count nose nose-count
+  ;; THE PHONE, as it is held, beside the head: its lines (13 segments, the last its earpiece)
+  phone phone-count
+  ;; THE WATCH, as its app on the wrist reports it over the link (hello3d-watch.lisp): its lines, its rotation (nine
+  ;; floats, or NIL), the heart rate, and when it last spoke (internal real time)
+  watch watch-count (watch-turn nil) (watch-bpm 0) (watch-at 0)
   ;; A FLIP: when it began (internal real time), or NIL -- each cube turns head over heels once, in turn
   (flip-at nil) (flip-plucked 0)
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
@@ -480,6 +517,67 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
         (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
         (kiln-gpu:gpu-draw pass (* 3 (game-nose-count g)))))))
 
+(defun rotation-3x3 (r)
+  "The 4x4 (column-major) of the 3x3 rotation R, nine floats row-major."
+  (let ((m (identity-mat)))
+    (dotimes (row 3 m)
+      (dotimes (col 3)
+        (setf (aref m (+ (* col 4) row)) (aref r (+ (* row 3) col)))))))
+
+(defun draw-phone (pass g w h)
+  "The phone, turned as it is held against how it was when following began, seen as you see it in your hand -- its
+   screen towards you -- beside the head."
+  (let ((r (kiln-motion:device-attitude)))
+    (when (and r (game-line-pipeline g) (game-phone g))
+      (let* ((view (translation 0 0 -5.2))
+             (transform (mat* (corner 0.3 0.4 -0.6)
+                              (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view (rotation-3x3 r)))))
+             (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0))
+             (n (game-phone-count g)))
+        (kiln-gpu:gpu-depth pass :test-and-write)
+        (kiln-gpu:gpu-cull pass :none)
+        (kiln-gpu:gpu-use pass (game-line-pipeline g))
+        (kiln-gpu:gpu-bind pass (game-phone g) 0)
+        ;; the slab pale, its earpiece (the last segment) the nose's orange
+        (kiln-gpu:gpu-constants pass (apply #'floats transform 0.85 0.88 0.95 1.0 params) 2)
+        (kiln-gpu:gpu-draw pass (* 6 (1- n)))
+        (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
+        (kiln-gpu:gpu-draw pass 6 :start (* 6 (1- n)))))))
+
+(defun watch-fresh-p (g)
+  "Whether the watch has spoken in the last second."
+  (and (game-watch-turn g)
+       (< (- (get-internal-real-time) (game-watch-at g)) internal-time-units-per-second)))
+
+(defun hear-watch (g term)
+  "A message from the watch app: its turn and heart rate, the crown (the speed), a tap (a flip)."
+  (case (first term)
+    (:m (let ((r (or (game-watch-turn g) (make-array 9 :element-type 'single-float :initial-element 0.0))))
+          (loop for v in (rest term) for i below 9 do (setf (aref r i) (/ v 10000.0)))
+          (setf (game-watch-turn g) r
+                (game-watch-bpm g) (or (nth 10 term) 0)
+                (game-watch-at g) (get-internal-real-time))))
+    (:crown (set-speed g (* 0.8 (/ (second term) 100.0))))
+    (:tap (flip g))))
+
+(defun draw-watch (pass g w h)
+  "The watch, turned as it is worn against how it was when it began to report (or was recentered), beside the phone."
+  (when (and (watch-fresh-p g) (game-line-pipeline g) (game-watch g))
+    (let* ((view (translation 0 0 -5.2))
+           (transform (mat* (corner 0.3 0.08 -0.6)
+                            (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view (rotation-3x3 (game-watch-turn g))))))
+           (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0))
+           (n (game-watch-count g)))
+      (kiln-gpu:gpu-depth pass :test-and-write)
+      (kiln-gpu:gpu-cull pass :none)
+      (kiln-gpu:gpu-use pass (game-line-pipeline g))
+      (kiln-gpu:gpu-bind pass (game-watch g) 0)
+      ;; the case and band a pale green, the crown the nose's orange
+      (kiln-gpu:gpu-constants pass (apply #'floats transform 0.6 0.95 0.7 1.0 params) 2)
+      (kiln-gpu:gpu-draw pass (* 6 (1- n)))
+      (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
+      (kiln-gpu:gpu-draw pass 6 :start (* 6 (1- n))))))
+
 (defun render (g)
   (multiple-value-bind (w h) (kiln-gpu:gpu-view-size (game-view g))
     (when (and (plusp w) (plusp h))
@@ -513,7 +611,11 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
                             (mat* (rotation-x (flip-turn g 8)) (mat* (rotation-y (* -0.5 a)) (scaling 1.8))))
                       (floats 1.0 0.85 0.55 1))
           ;; over everything, while the head is followed: the head
-          (when (or (game-head g) *head-demo*) (draw-head pass g w h)))))))
+          (when (or (game-head g) *head-demo*) (draw-head pass g w h))
+          ;; and beside it, on a phone, the phone
+          (when (game-head g) (draw-phone pass g w h))
+          ;; and the watch, while its app is sending
+          (draw-watch pass g w h))))))
 
 (defun set-spin (g on)
   "Spin on or off, shown wherever it is: the HUD's button, the menus' check marks."
@@ -536,6 +638,10 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (setf (game-head g) on)
   (format t "~&hello3d: following the head ~:[off~;on~]~%" on)
   (kiln-sound:spatial-head on)
+  ;; the phone's own turn too, drawn beside the head: neutral from now, as the head's is
+  (when (kiln-motion:device-motion on) (when on (kiln-motion:device-recenter)))
+  ;; and the watch's, if its app is listening
+  (when on (kiln-link:link-send (list :recenter)))
   (when (game-head-button g) (kiln-swift:ui-symbol-button-set (game-head-button g) on))
   (dolist (i (game-head-items g)) (kiln-mac:menu-check i on)))
 
@@ -675,7 +781,9 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (when (game-spatial g)
       (push (kiln-mac:menu-item m "Follow Your Head" (lambda () (toggle-head g))) (game-head-items g)))
     (when (game-spatial g)
-      (kiln-mac:menu-item m "Recenter Head" (lambda () (kiln-sound:spatial-head-recenter)) :key "r"))
+      (kiln-mac:menu-item m "Recenter Head" (lambda () (kiln-sound:spatial-head-recenter) (kiln-motion:device-recenter)
+                                                (kiln-link:link-send (list :recenter)))
+                         :key "r"))
     (kiln-mac:menu-separator m)
     (kiln-mac:menu-item m "Faster" (lambda () (set-speed g (* (game-speed g) 1.25))) :key "=")
     (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-")
@@ -712,6 +820,12 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
      (let ((nose (nose-lines)))
       (setf (game-egg g) (kiln-gpu:gpu-buffer egg) (game-egg-count g) steps
             (game-nose g) (kiln-gpu:gpu-buffer nose) (game-nose-count g) (floor (length nose) 3))))
+    (let ((phone (phone-lines)) (watch (watch-lines)))
+      (setf (game-phone g) (kiln-gpu:gpu-buffer phone) (game-phone-count g) (floor (length phone) 6)
+            (game-watch g) (kiln-gpu:gpu-buffer watch) (game-watch-count g) (floor (length watch) 6)))
+    ;; THE WATCH APP, if there is one on the wrist: what it sends (hear-watch)
+    (when (kiln-link:link-open)
+      (kiln-link:on-link (lambda (term) (when (consp term) (hear-watch g term)))))
     (multiple-value-bind (v i) (cube-mesh)
       (setf (game-cube-vertices g) (kiln-gpu:gpu-buffer v) (game-cube-indices g) (kiln-gpu:gpu-indices i)))
     (multiple-value-bind (v i) (floor-mesh 120 60)
@@ -761,7 +875,9 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
         (let ((since (/ (- now (game-fps-at g)) internal-time-units-per-second)))
           (when (>= since 0.5)
             (kiln-swift:ui-set-text (game-fps-label g)
-                                    (format nil "~D frames a second" (round (game-frames g) since)))
+                                    (format nil "~D frames a second~:[~*~;  ·  watch~@[ ♥ ~D~]~]"
+                                            (round (game-frames g) since) (watch-fresh-p g)
+                                            (and (plusp (game-watch-bpm g)) (game-watch-bpm g))))
             (when *head-log*
               (multiple-value-bind (yaw pitch roll) (kiln-sound:spatial-head-attitude)
                 (when yaw
