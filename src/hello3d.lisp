@@ -492,6 +492,29 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
         (setf (game-crate-texture g) tex)
         (format t "~&hello3d: not a picture this can read~%"))))
 
+(defun remind (g)
+  "A notification ten seconds on.  The first time, the person is told what it is for before the system asks."
+  (declare (ignore g))
+  (flet ((post ()
+           (kiln-notify:notify "Hello 3D" "The cubes are still turning." :after 10
+                               :on-click (lambda () (format t "~&hello3d: the reminder was clicked~%") (finish-output)))
+           (format t "~&hello3d: a reminder in 10 seconds~%") (finish-output)))
+    (case (kiln-notify:notify-permission)
+      (:allowed (post))
+      (:refused (let ((alert (kiln-swift:ui-alert "Notifications are off"
+                                                  "To be reminded, allow Hello 3D in System Settings > Notifications.")))
+                  (kiln-swift:ui-alert-action alert "OK")
+                  (kiln-swift:ui-alert-present alert)))
+      (t (let ((alert (kiln-swift:ui-alert "Remind you?"
+                                           "Hello 3D can send a notification in 10 seconds. Next, you'll be asked to allow notifications.")))
+           (kiln-swift:ui-alert-action alert "Not Now")
+           (kiln-swift:ui-alert-action alert "Continue")
+           (kiln-swift:on-event :alert alert
+                                (lambda (index h)
+                                  (declare (ignore h))
+                                  (when (eql index 1) (kiln-notify:notify-ask (lambda (ok) (when ok (post)))))))
+           (kiln-swift:ui-alert-present alert))))))
+
 (defun make-menus (g)
   "A Mac's menus: Game in the menu bar -- spin, sound, following the head, faster, slower -- and a status item with
    the frame rate, whose menu has spin and sound.  The check marks follow the toggles wherever they are changed."
@@ -502,7 +525,9 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
       (push (kiln-mac:menu-item m "Follow Your Head" (lambda () (toggle-head g))) (game-head-items g)))
     (kiln-mac:menu-separator m)
     (kiln-mac:menu-item m "Faster" (lambda () (set-speed g (* (game-speed g) 1.25))) :key "=")
-    (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-"))
+    (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-")
+    (kiln-mac:menu-separator m)
+    (kiln-mac:menu-item m "Remind Me in 10 Seconds" (lambda () (remind g))))
   (let ((sm (kiln-mac:menu "Hello 3D" :in-bar nil)))
     (push (kiln-mac:menu-item sm "Spin" (lambda () (set-spin g (not (game-spin g))))) (game-spin-items g))
     (push (kiln-mac:menu-item sm "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
