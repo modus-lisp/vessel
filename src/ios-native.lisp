@@ -37,7 +37,7 @@
            #:app-bar-button-enable #:app-table #:app-table-set #:app-table-actions #:app-table-refresh
            #:app-table-refresh-end #:app-table-empty #:app-table-loading #:app-table-append #:app-table-placeholder #:app-alert #:app-alert-action #:app-alert-field
            #:app-alert-show #:app-form #:app-form-field #:app-form-button #:app-form-note #:app-form-show #:app-invoice #:app-invoice-status #:app-thumbnail #:app-image-jpeg
-           #:app-status #:app-pick-file #:app-share-file #:app-preview #:app-copy #:app-documents #:app-utc-offset #:app-resolve
+           #:app-status #:app-pick-file #:app-share-file #:app-preview #:app-copy #:app-documents #:app-choose-folder #:app-folder-path #:app-utc-offset #:app-resolve
            #:app-nav-present #:app-nav-dismiss #:app-compose #:app-table-scroll-end
            #:ble-start #:ble-send #:ble-stop
            #:on-event))
@@ -341,6 +341,24 @@
          (buf (make-array cap :element-type '(unsigned-byte 8) :initial-element 0))
          (n (swift-call "app_documents" (kiln-swift::%addr buf) cap)))
     (if (<= 1 n cap) (seal:utf8-decode buf :end n) "")))
+
+(defun app-choose-folder (key)
+  "The document picker for a folder -- iCloud Drive, or any other place the Files app reaches -- kept under KEY
+   (a string) for APP-FOLDER-PATH on later runs.  Returns a handle (0 when no picker could come up); its :FOLDER
+   event's value is the chosen folder's path, or \"\" when the picker was cancelled."
+  (let ((b (kiln-swift::%octets key)))
+    (swift-call "files_choose_folder" (kiln-swift::%addr b) (length b))))
+
+(defun app-folder-path (key)
+  "The folder chosen under KEY (APP-CHOOSE-FOLDER), opened for this run: its path, ending in /, or NIL when none
+   was chosen or it can no longer be reached (moved, deleted, its provider signed out)."
+  (let* ((cap 2048)
+         (k (kiln-swift::%octets key))
+         (buf (make-array cap :element-type '(unsigned-byte 8) :initial-element 0))
+         (n (swift-call "files_folder_path" (kiln-swift::%addr k) (length k) (kiln-swift::%addr buf) cap)))
+    (when (<= 1 n cap)
+      (let ((s (seal:utf8-decode buf :end n)))
+        (if (char= (char s (1- (length s))) #\/) s (concatenate 'string s "/"))))))
 
 (defun app-utc-offset ()
   "The local time zone's offset from UTC now, in seconds (east positive)."
