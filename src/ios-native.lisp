@@ -4,7 +4,7 @@
 ;;;;
 ;;;;   (app-nav-new "Title")  -> nav, made the window's root     (app-nav-root nav) -> its first screen
 ;;;;   (app-push nav "Title") -> screen        (app-pop nav)     (app-set-title screen "Title")
-;;;;   (app-path-title screen '("home" "ferry" "docs"))   a path, centred, ellipsis at the left when it does not fit
+;;;;   (app-path-title screen '("home" "projects" "docs"))   a path, centred, ellipsis at the left when it does not fit
 ;;;;   (app-browser) -> screen whose bar holds still   (app-browser-push browser '("home" "docs")) -> table
 ;;;;                                       a page that slides in beneath the bar; back slides it away: :pop table
 ;;;;   (app-browser-preview browser path name)   Quick Look in the browser's pane (below; beside, in landscape)
