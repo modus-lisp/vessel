@@ -23,6 +23,7 @@
 ;;;;   (spatial-listener x y z yaw pitch)   where the listener is and which way it faces (yaw 0 down -Z)
 ;;;;   (spatial-stop voice)   (spatial-volume 0.0..1.0)
 ;;;;   (spatial-head on)                    follow the listener's head (AirPods): off until asked
+;;;;   (spatial-head-attitude)              the head's (values yaw pitch roll) in radians, or NIL when not following
 ;;;;   (spatial-head-permission)            :not-asked :allowed :refused, or :not-needed (a Mac): ask the person,
 ;;;;                                        saying what for, before the system does
 
@@ -31,7 +32,7 @@
   (:export #:sound-open #:tone #:pluck #:play #:voice-set #:voice-stop #:sound-pump #:place #:*rate* #:*cushion*
            #:*master*
            #:spatial-open #:spatial-voice #:spatial-place #:spatial-listener #:spatial-stop #:spatial-volume
-           #:spatial-head #:spatial-head-permission))
+           #:spatial-head #:spatial-head-permission #:spatial-head-attitude))
 
 (in-package #:kiln-sound)
 
@@ -205,3 +206,11 @@
 
 (defun spatial-head-permission ()
   (case (%call "spatial_head_permission") (0 :not-asked) (1 :allowed) (2 :refused) (t :not-needed)))
+
+(defvar *attitude* (make-array 3 :element-type 'single-float :initial-element 0.0))
+
+(defun spatial-head-attitude ()
+  "The listener's head as the headphones report it: (values yaw pitch roll) in radians -- yaw from where it was when
+   following began, positive turning left; pitch positive looking up -- or NIL when nothing is following it."
+  (when (eql 1 (%call "spatial_head_attitude" (%addr *attitude*)))
+    (values (aref *attitude* 0) (aref *attitude* 1) (aref *attitude* 2))))

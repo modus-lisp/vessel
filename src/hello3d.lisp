@@ -57,6 +57,25 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     float fog = clamp((d - frame.fog.x) / (frame.fog.y - frame.fog.x), 0.0, 1.0);
     return float4(mix(colour, frame.fog_colour.rgb, fog), 1.0);
 }
+
+// lines, unlit and THICK: a wireframe in one colour (the head).  A GPU's lines are one pixel wide, so each segment
+// (a pair of points) is drawn as a quad, six vertices, widened on the screen to WIDTH pixels whatever its distance.
+// params: x the half-width in pixels, y and z half the view's size in pixels.
+struct Lines { float4x4 transform; float4 colour; float4 params; };
+vertex float4 line_vertex(uint id [[vertex_id]], device const packed_float3 *points [[buffer(0)]],
+                          constant Lines &lines [[buffer(2)]]) {
+    uint seg = id / 6, corner = id % 6;
+    float4 a = lines.transform * float4(float3(points[seg * 2]), 1.0);
+    float4 b = lines.transform * float4(float3(points[seg * 2 + 1]), 1.0);
+    float2 half_view = lines.params.yz;
+    float2 d = normalize(b.xy / b.w * half_view - a.xy / a.w * half_view);
+    float2 normal = float2(-d.y, d.x) * lines.params.x;
+    bool at_b = corner == 2 || corner == 4 || corner == 5;
+    float side = (corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0;
+    float4 q = at_b ? b : a;
+    return float4(q.xy + normal * side / half_view * q.w, q.z, q.w);
+}
+fragment float4 line_fragment(constant Lines &lines [[buffer(2)]]) { return lines.colour; }
 ")
 
 ;;; ---- vectors and matrices: single-floats, the matrices column-major as Metal reads them ---------------------------
@@ -90,6 +109,10 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
 (defun rotation-x (a)
   (let ((m (identity-mat)) (c (float (cos a) 1.0)) (s (float (sin a) 1.0)))
     (setf (aref m 5) c (aref m 9) (- s) (aref m 6) s (aref m 10) c) m))
+
+(defun rotation-z (a)
+  (let ((m (identity-mat)) (c (float (cos a) 1.0)) (s (float (sin a) 1.0)))
+    (setf (aref m 0) c (aref m 4) (- s) (aref m 1) s (aref m 5) c) m))
 
 (defun perspective (fovy aspect near far)
   "Right-handed, looking down -Z, depth 0 at NEAR to 1 at FAR (Metal's)."
@@ -145,6 +168,29 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
         (dolist (i '(0 1 2 0 2 3)) (push (+ n i) indices))
         (incf n 4)))
     (values (apply #'floats (nreverse verts)) (nreverse indices))))
+
+(defun egg-lines (&key (rx 0.75) (ry 1.0) (rz 0.85) (rings 3) (meridians 6) (steps 24))
+  "An egg-shaped head as line segments (pairs of points, three floats each): RINGS of latitude and MERIDIANS of
+   longitude round an ellipsoid of radii RX RY RZ, facing -Z."
+  (let ((pts '()))
+    (flet ((at (lat lon) (list (* rx (cos lat) (sin lon)) (* ry (sin lat)) (- (* rz (cos lat) (cos lon)))))
+           (seg (a b) (setf pts (append (reverse b) (reverse a) pts))))
+      (loop for r from 1 to rings
+            for lat = (- (* pi (/ r (1+ rings))) (/ pi 2))
+            do (dotimes (k steps)
+                 (seg (at lat (* 2 pi (/ k steps))) (at lat (* 2 pi (/ (1+ k) steps))))))
+      (dotimes (m meridians)
+        (let ((lon (* 2 pi (/ m meridians))))
+          (dotimes (k steps)
+            (seg (at (- (* pi (/ k steps)) (/ pi 2)) lon) (at (- (* pi (/ (1+ k) steps)) (/ pi 2)) lon))))))
+    (apply #'floats (nreverse pts))))
+
+(defun nose-lines ()
+  "A nose, and two eyes: which way the head faces."
+  (floats 0 -0.05 -0.84  0 -0.3 -1.55
+          0 -0.3 -1.55   0 -0.42 -0.8
+          -0.3 0.18 -0.78  -0.18 0.18 -0.82
+          0.3 0.18 -0.78   0.18 0.18 -0.82))
 
 (defun floor-mesh (size tiles)
   "A square of SIZE on y = 0, facing up, its texture repeated TILES times across."
@@ -203,6 +249,8 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   hud-rect (shape nil)
   ;; heard while another app is in front (a Mac's Game menu says); hidden or minimized, never
   (background-sound t) (app-state :active)
+  ;; THE HEAD, as the headphones report it, drawn as a wireframe in a corner: its pipeline and lines
+  line-pipeline egg egg-count nose nose-count
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -351,6 +399,41 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
 
 (defparameter *dusk* #x1d2a3c "The sky, and the fog the far things fade into.")
 
+(defun corner (scale ox oy)
+  "Clip space shrunk by SCALE and moved to OX OY (in -1..1): a small picture drawn in a corner of the view."
+  (let ((m (identity-mat)))
+    (setf (aref m 0) (float scale 1.0) (aref m 5) (float scale 1.0)
+          (aref m 12) (float ox 1.0) (aref m 13) (float oy 1.0))
+    m))
+
+(defvar *head-demo* nil "HELLO3D_HEAD_DEMO set: a head that sways by itself, with no headphones to follow.")
+
+(defun head-attitude (g)
+  "(values yaw pitch roll): the headphones', or the demo's sway, or NIL."
+  (if *head-demo*
+      (let ((a (game-angle g)))
+        (values (* 0.8 (sin (* 1.7 a))) (* 0.3 (sin (* 2.3 a))) (* 0.25 (sin (* 1.1 a)))))
+      (kiln-sound:spatial-head-attitude)))
+
+(defun draw-head (pass g w h)
+  "The listener's head, turned as the headphones say, seen from behind and above it, in the view's lower right."
+  (multiple-value-bind (yaw pitch roll) (head-attitude g)
+    (when (and yaw (game-line-pipeline g))
+      (let* ((model (mat* (rotation-y yaw) (mat* (rotation-x pitch) (rotation-z (- roll)))))
+             (view (mat* (translation 0 0 -4.4) (mat* (rotation-x 0.3) (rotation-y -1.0))))
+             (transform (mat* (corner 0.3 0.72 -0.6) (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view model))))
+             ;; 2.5 points wide: the half-width in pixels, then half the view
+             (params (list (* 1.25 (game-scale g)) (/ w 2.0) (/ h 2.0) 0)))
+        (kiln-gpu:gpu-depth pass :none)
+        (kiln-gpu:gpu-cull pass :none)
+        (kiln-gpu:gpu-use pass (game-line-pipeline g))
+        (kiln-gpu:gpu-bind pass (game-egg g) 0)
+        (kiln-gpu:gpu-constants pass (apply #'floats transform 0.85 0.92 1.0 1.0 params) 2)
+        (kiln-gpu:gpu-draw pass (* 3 (game-egg-count g)))
+        (kiln-gpu:gpu-bind pass (game-nose g) 0)
+        (kiln-gpu:gpu-constants pass (apply #'floats transform 1.0 0.62 0.25 1.0 params) 2)
+        (kiln-gpu:gpu-draw pass (* 3 (game-nose-count g)))))))
+
 (defun render (g)
   (multiple-value-bind (w h) (kiln-gpu:gpu-view-size (game-view g))
     (when (and (plusp w) (plusp h))
@@ -381,7 +464,9 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
           (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
                       (mat* (translation 0 (middle-height a) 0)
                             (mat* (rotation-y (* -0.5 a)) (scaling 1.8)))
-                      (floats 1.0 0.85 0.55 1)))))))
+                      (floats 1.0 0.85 0.55 1))
+          ;; over everything, while the head is followed: the head
+          (when (or (game-head g) *head-demo*) (draw-head pass g w h)))))))
 
 (defun set-spin (g on)
   "Spin on or off, shown wherever it is: the HUD's button, the menus' check marks."
@@ -572,6 +657,11 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     (let ((shader (kiln-gpu:gpu-shader *shader*)))
       (setf (game-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "world_vertex" "world_fragment"))))
     (unless (game-pipeline g) (error "hello3d: the shader or its pipeline did not build (see the log)"))
+    (let ((shader (kiln-gpu:gpu-shader *shader*)))
+      (setf (game-line-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "line_vertex" "line_fragment"))))
+    (let ((egg (egg-lines)) (nose (nose-lines)))
+      (setf (game-egg g) (kiln-gpu:gpu-buffer egg) (game-egg-count g) (floor (length egg) 3)
+            (game-nose g) (kiln-gpu:gpu-buffer nose) (game-nose-count g) (floor (length nose) 3)))
     (multiple-value-bind (v i) (cube-mesh)
       (setf (game-cube-vertices g) (kiln-gpu:gpu-buffer v) (game-cube-indices g) (kiln-gpu:gpu-indices i)))
     (multiple-value-bind (v i) (floor-mesh 120 60)
@@ -598,6 +688,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   "Hello, world in 3D: start, then a frame each time the screen refreshes.  TOUCH: a phone's two thumbs."
   (%sys 1002 0 (+ (%sys 1001 0 0 0) (* (%sys 1001 1 0 0) 65536)) *dusk*)   ; under the view, until it draws
   (%sys 1003 0 0 0)
+  (setf *head-demo* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_DEMO"))) (and v (plusp (length v)))))
   (let ((g (start :touch touch)) (last (get-internal-real-time)))
     (format t "~&hello3d: running~%")
     (loop
