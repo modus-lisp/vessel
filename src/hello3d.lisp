@@ -201,6 +201,8 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   ;; the HUD's pane, (x y w h) in points, and the pointer's shape as last set: the arrow over the pane, a crosshair
   ;; over the scene, where a click looks around
   hud-rect (shape nil)
+  ;; heard while another app is in front (a Mac's Game menu says); hidden or minimized, never
+  (background-sound t) (app-state :active)
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -388,8 +390,8 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (dolist (i (game-spin-items g)) (kiln-mac:menu-check i on)))
 
 (defun set-sound (g on)
-  (setf (game-sound g) on kiln-sound:*master* (if on 1.0 0.0))
-  (when (game-spatial g) (kiln-sound:spatial-volume (if on 1.0 0.0)))
+  (setf (game-sound g) on)
+  (hear-state g)
   (when (game-sound-button g) (kiln-swift:ui-set-text (game-sound-button g) (if on "sound: on" "sound: off")))
   (dolist (i (game-sound-items g)) (kiln-mac:menu-check i on)))
 
@@ -515,12 +517,30 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                                   (when (eql index 1) (kiln-notify:notify-ask (lambda (ok) (when ok (post)))))))
            (kiln-swift:ui-alert-present alert))))))
 
+(defun hear-state (g)
+  "Sound on or off as the app is: always while in front; behind another app only with Sound in Background; never
+   hidden."
+  (let ((heard (and (game-sound g)
+                    (case (game-app-state g)
+                      ((:active :shown) t)
+                      (:inactive (game-background-sound g))
+                      (t nil)))))
+    (setf kiln-sound:*master* (if heard 1.0 0.0))
+    (when (game-spatial g) (kiln-sound:spatial-volume (if heard 1.0 0.0)))))
+
 (defun make-menus (g)
   "A Mac's menus: Game in the menu bar -- spin, sound, following the head, faster, slower -- and a status item with
    the frame rate, whose menu has spin and sound.  The check marks follow the toggles wherever they are changed."
   (let ((m (kiln-mac:menu "Game")))
     (push (kiln-mac:menu-item m "Spin" (lambda () (set-spin g (not (game-spin g)))) :key "s") (game-spin-items g))
     (push (kiln-mac:menu-item m "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
+    (let ((bg nil))
+      (setf bg (kiln-mac:menu-item m "Sound in Background"
+                                   (lambda ()
+                                     (setf (game-background-sound g) (not (game-background-sound g)))
+                                     (kiln-mac:menu-check bg (game-background-sound g))
+                                     (hear-state g))))
+      (kiln-mac:menu-check bg (game-background-sound g)))
     (when (game-spatial g)
       (push (kiln-mac:menu-item m "Follow Your Head" (lambda () (toggle-head g))) (game-head-items g)))
     (kiln-mac:menu-separator m)
@@ -537,10 +557,9 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
   (dolist (i (game-head-items g)) (kiln-mac:menu-check i (game-head g)))
   ;; THE HUMS GO QUIET while the app is in the background, and come back with it (as sound is set, not forced on)
   (kiln-mac:on-app-state (lambda (state)
-                           (let ((heard (and (game-sound g) (member state '(:active :shown)))))
-                             (format t "~&hello3d: ~(~A~)~%" state) (finish-output)
-                             (setf kiln-sound:*master* (if heard 1.0 0.0))
-                             (when (game-spatial g) (kiln-sound:spatial-volume (if heard 1.0 0.0))))))
+                           (format t "~&hello3d: ~(~A~)~%" state) (finish-output)
+                           (setf (game-app-state g) state)
+                           (hear-state g)))
   (kiln-mac:on-quit (lambda () (format t "~&hello3d: quitting~%") (finish-output)))
   ;; A PICTURE dropped on the window, or opened with the app, becomes the cubes' faces
   (kiln-mac:on-drop (lambda (path) (on-picture g path)))
@@ -601,7 +620,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
             (kiln-swift:ui-set-text (game-fps-label g)
                                     (format nil "~D frames a second" (round (game-frames g) since)))
             (when (game-status g)
-              (kiln-mac:status-title (game-status g) (format nil " ~D fps" (round (game-frames g) since))))
+              (kiln-mac:status-title (game-status g) (format nil "~D fps" (round (game-frames g) since))))
             ;; the controller: said when one comes or goes, and its light the middle cube's colour
             (let ((n (kiln-pad:pad-count)))
               (unless (= n (game-pad-seen g))
