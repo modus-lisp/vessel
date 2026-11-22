@@ -453,6 +453,32 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
           (setf (game-head-button g) head)
           (kiln-swift:on-tap head (lambda (v h) (declare (ignore v h)) (toggle-head g))))))))
 
+(defun picture-texture (path &key (largest 512))
+  "The image at PATH (a JPEG, PNG, WebP ...) as a texture, scaled down to at most LARGEST pixels across (nearest);
+   NIL if it does not decode."
+  (let* ((bytes (with-open-file (in path :element-type '(unsigned-byte 8))
+                  (let ((b (make-array (file-length in) :element-type '(unsigned-byte 8)))) (read-sequence b in) b)))
+         (img (ignore-errors (pigment:decode-image-bytes bytes))))
+    (when (and img (plusp (pigment:img-w img)) (plusp (pigment:img-h img)))
+      (let* ((w (pigment:img-w img)) (h (pigment:img-h img)) (src (pigment:img-rgba img))
+             (k (max 1 (ceiling (max w h) largest)))
+             (tw (max 1 (floor w k))) (th (max 1 (floor h k)))
+             (px (make-array (* tw th 4) :element-type '(unsigned-byte 8))))
+        (dotimes (y th)
+          (dotimes (x tw)
+            (let ((s (* 4 (+ (* y k w) (* x k)))) (d (* 4 (+ (* y tw) x))))
+              (setf (aref px d) (aref src s) (aref px (+ d 1)) (aref src (+ s 1))
+                    (aref px (+ d 2)) (aref src (+ s 2)) (aref px (+ d 3)) 255))))
+        (kiln-gpu:gpu-texture px tw th)))))
+
+(defun on-picture (g path)
+  "A file dropped on the window (or opened with the app): an image becomes the cubes' faces."
+  (format t "~&hello3d: dropped ~A~%" path) (finish-output)
+  (let ((tex (ignore-errors (picture-texture path))))
+    (if tex
+        (setf (game-crate-texture g) tex)
+        (format t "~&hello3d: not a picture this can read~%"))))
+
 (defun make-menus (g)
   "A Mac's menus: Game in the menu bar -- spin, sound, following the head, faster, slower -- and a status item with
    the frame rate, whose menu has spin and sound.  The check marks follow the toggles wherever they are changed."
@@ -477,7 +503,10 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
                              (format t "~&hello3d: ~(~A~)~%" state) (finish-output)
                              (setf kiln-sound:*master* (if heard 1.0 0.0))
                              (when (game-spatial g) (kiln-sound:spatial-volume (if heard 1.0 0.0))))))
-  (kiln-mac:on-quit (lambda () (format t "~&hello3d: quitting~%") (finish-output))))
+  (kiln-mac:on-quit (lambda () (format t "~&hello3d: quitting~%") (finish-output)))
+  ;; A PICTURE dropped on the window, or opened with the app, becomes the cubes' faces
+  (kiln-mac:on-drop (lambda (path) (on-picture g path)))
+  (kiln-mac:on-open (lambda (path) (on-picture g path))))
 
 (defun start (&key touch)
   "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
