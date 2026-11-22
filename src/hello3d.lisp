@@ -429,7 +429,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (multiple-value-bind (yaw pitch roll) (head-attitude g)
     (when (and yaw (game-line-pipeline g))
       (let* ((model (mat* (rotation-y yaw) (mat* (rotation-x pitch) (rotation-z (- roll)))))
-             (view (mat* (translation 0 0.1 -5.2) (mat* (rotation-x 0.22) (rotation-y -0.35))))   ; behind, a little above and right
+             (view (mat* (translation 0 0.1 -5.2) (rotation-x 0.22)))   ; from behind and a little above
              (transform (mat* (corner 0.3 0.72 -0.6) (mat* (perspective (/ pi 4) (/ w h) 0.5 20.0) (mat* view model))))
              ;; 2.5 points wide: the half-width in pixels, then half the view
              (params (list (* 0.75 (game-scale g)) (/ w 2.0) (/ h 2.0) 0)))
