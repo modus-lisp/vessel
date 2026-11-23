@@ -211,19 +211,25 @@
 (defvar *t4-under-y* 0)
 (defvar *t4-under-pixels* (make-array 176 :initial-element 0))
 
+(defun %t4-desk-fb ()
+  "The desk's screen framebuffer, whichever desktop app.lisp made (glass.wm or glass.desk):
+   through its %KILN-DESK-FB.  GLASS.DESK:DESK-FB on a glass.wm desk reads the wrong slot -- the
+   window list -- and every pointer event failed on it."
+  (let ((d (and (boundp '*kiln-desk*) (symbol-value '*kiln-desk*))))   ; app.lisp's desk
+    (and d (if (fboundp '%kiln-desk-fb) (funcall '%kiln-desk-fb d) (glass.desk:desk-fb d)))))
+
 (defun %t4-desk-pixel (x y)
   "What the desk drew at screen (X, Y): the pointer's background."
-  (let ((d (and (boundp '*kiln-desk*) (symbol-value '*kiln-desk*))))   ; app.lisp's desk
-    (if (and d (< -1 x (glass:fb-width (glass.desk:desk-fb d))) (< -1 y (glass:fb-height (glass.desk:desk-fb d))))
-        (glass:fb-get (glass.desk:desk-fb d) x y)
+  (let ((fb (%t4-desk-fb)))
+    (if (and fb (< -1 x (glass:fb-width fb)) (< -1 y (glass:fb-height fb)))
+        (glass:fb-get fb x y)
         #x1E2530)))
 
 (defun %t4-pointer-hide ()
   "Put back what the desk drew under the pointer: its 11 x 16 patch, copied from the desk's
    framebuffer (the screen's own pixels are never read back)."
   (when *t4-under*
-    (let* ((d (and (boundp '*kiln-desk*) (symbol-value '*kiln-desk*)))
-           (fb (and d (glass.desk:desk-fb d))))
+    (let ((fb (%t4-desk-fb)))
       (if fb
           (let* ((fw (glass:fb-width fb)) (fh (glass:fb-height fb))
                  (x (max 0 *t4-under-x*)) (y (max 0 *t4-under-y*))
