@@ -4,7 +4,8 @@
 ;;;;
 ;;;; One API, a backend per platform, under the same call names: Metal on the phone and the Mac (modus's
 ;;;; host/ios/swift/GPU.swift, through the Swift bridge), WebGPU in a browser (the web build's bridge, answered in
-;;;; JavaScript).  Shaders are the one place they differ: Metal Shading Language here, WGSL there.
+;;;; JavaScript), Direct3D 11 on Windows (win-host.lisp).  Shaders are the one place they differ: Metal Shading
+;;;; Language, WGSL, HLSL -- (gpu-language) says which this platform takes.
 ;;;;
 ;;;;   (gpu-view x y w h)                       a view the GPU draws; a UI handle (UI-REMOVE removes it)
 ;;;;   (gpu-shader "msl source")                a shader module
@@ -32,7 +33,8 @@
   (:export #:gpu-view #:gpu-shader #:gpu-pipeline #:gpu-buffer #:gpu-write
            #:gpu-pass-begin #:gpu-pass-end #:with-gpu-pass #:gpu-use #:gpu-bind #:gpu-draw #:floats
            #:gpu-view-size #:gpu-depth #:gpu-cull #:gpu-constants #:gpu-texture #:gpu-bind-texture
-           #:gpu-indices #:gpu-draw-indexed #:gpu-print #:gpu-view-hdr #:gpu-headroom))
+           #:gpu-indices #:gpu-draw-indexed #:gpu-print #:gpu-view-hdr #:gpu-headroom
+           #:gpu-language))
 
 (in-package #:kiln-gpu)
 
@@ -48,6 +50,10 @@
   (let ((v (make-array (length xs) :element-type 'single-float)))
     (loop for x in xs for i from 0 do (setf (aref v i) (float x 1.0)))
     v))
+
+(defun gpu-language ()
+  "The shading language this platform's GPU takes: :MSL (Metal), :HLSL (Direct3D) or :WGSL (WebGPU)."
+  (case (ignore-errors (%call "gpu_language")) (1 :hlsl) (2 :wgsl) (t :msl)))
 
 (defun gpu-view (x y w h)
   (%call "gpu_view_new" x y w h))
