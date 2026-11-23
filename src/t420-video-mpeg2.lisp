@@ -168,8 +168,9 @@
       (let ((sq (t4g-breadcrumb vcs)))
         (t4v-submit vcs)
         (unless (t4g-wait vcs sq 500)
-          (error "t420 video: the engine did not finish an MPEG-2 picture (head ~X tail ~X)"
-                 (t4-gpu-reg #x12034) (t4-gpu-reg #x12030)))))))
+          (let ((head (t4-gpu-reg #x12034)) (tail (t4-gpu-reg #x12030)))
+            (t4v-reset)
+            (error "t420 video: an MPEG-2 picture hung the engine (head ~X tail ~X)" head tail)))))))
 
 (defun t4m-decode-bytes (bytes &optional (fn (lambda (d i s) (declare (ignore d i s)))))
   "Decode the MPEG-2 video elementary stream BYTES on the engine; FN gets (decoder index surface)
@@ -258,9 +259,9 @@
   "Decode the N-byte stream at LBA (H.264, MPEG-2 or VC-1) and compare each picture with the reference
    frames at REF-LBA.  Logs and returns, per picture, (max-diff-Y max-U max-V psnr-Y psnr-U psnr-V)."
   (let* ((bytes (t4v-disk-bytes lba n)) (rows '()))
-    (flet ((check (w h i s)
+    (flet ((check (w h i s &optional (cx 0) (cy 0))
              (when (< i max)
-               (let* ((got (t4v-read-planes s w h)) (fs (floor (* 3 w h) 2))
+               (let* ((got (t4v-read-planes s w h cx cy)) (fs (floor (* 3 w h) 2))
                       (ref (%t4v-disk-range ref-lba (* i fs) fs))
                       (offs (list 0 (* w h) (+ (* w h) (floor (* w h) 4))))
                       (r (let ((maxes '()) (psnrs '()))
@@ -280,7 +281,8 @@
             ((t4v-vc1-p bytes)
              (funcall 't4w-decode-bytes bytes
                       (lambda (d i s) (check (funcall 't4wd-width d) (funcall 't4wd-height d) i s))))
-            (t (t4v-decode-bytes bytes (lambda (d i p s) (declare (ignore p)) (check (t4vd-width d) (t4vd-height d) i s))))))
+            (t (t4v-decode-bytes bytes (lambda (d i p s) (declare (ignore p))
+                                         (check (t4vd-width d) (t4vd-height d) i s (t4vd-crop-x d) (t4vd-crop-y d)))))))
     (t4-log "cmp: ~D pictures" (length rows))
     (t4-log-flush)
     (nreverse rows)))
