@@ -224,7 +224,7 @@
   (if (zerop sse) 99.0 (* 10 (log (/ (* 255.0 255.0 n) sse) 10))))
 
 (defun t4v-compare (lba n ref-lba &key (max 1000))
-  "Decode the N-byte stream at LBA (H.264 or MPEG-2) and compare each picture with the reference
+  "Decode the N-byte stream at LBA (H.264, MPEG-2 or VC-1) and compare each picture with the reference
    frames at REF-LBA.  Logs and returns, per picture, (max-diff-Y max-U max-V psnr-Y psnr-U psnr-V)."
   (let* ((bytes (t4v-disk-bytes lba n)) (rows '()))
     (flet ((check (w h i s)
@@ -244,9 +244,12 @@
                  (push r rows)
                  (t4-log "cmp ~D: max ~D ~D ~D  psnr ~,1F ~,1F ~,1F" i
                          (first r) (second r) (third r) (fourth r) (fifth r) (sixth r))))))
-      (if (t4v-mpeg2-p bytes)
-          (t4m-decode-bytes bytes (lambda (d i s) (check (t4md-width d) (t4md-height d) i s)))
-          (t4v-decode-bytes bytes (lambda (d i p s) (declare (ignore p)) (check (t4vd-width d) (t4vd-height d) i s)))))
+      (cond ((t4v-mpeg2-p bytes)
+             (t4m-decode-bytes bytes (lambda (d i s) (check (t4md-width d) (t4md-height d) i s))))
+            ((t4v-vc1-p bytes)
+             (funcall 't4w-decode-bytes bytes
+                      (lambda (d i s) (check (funcall 't4wd-width d) (funcall 't4wd-height d) i s))))
+            (t (t4v-decode-bytes bytes (lambda (d i p s) (declare (ignore p)) (check (t4vd-width d) (t4vd-height d) i s))))))
     (t4-log "cmp: ~D pictures" (length rows))
     (t4-log-flush)
     (nreverse rows)))

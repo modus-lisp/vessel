@@ -569,8 +569,14 @@
   (and (> (length bytes) 4) (zerop (aref bytes 0)) (zerop (aref bytes 1)) (= 1 (aref bytes 2))
        (= #xB3 (aref bytes 3))))
 
+(defun t4v-vc1-p (bytes)
+  "VC-1: an Advanced elementary stream (00 00 01 0F) or an RCV file (0xC5 in its fourth byte)?"
+  (and (> (length bytes) 8)
+       (or (and (zerop (aref bytes 0)) (zerop (aref bytes 1)) (= 1 (aref bytes 2)) (= #x0F (aref bytes 3)))
+           (and (= #xC5 (aref bytes 3)) (zerop (aref bytes 5))))))
+
 (defun t4v-play (bytes &key (fps 25) (repeat 1))
-  "Play BYTES -- an H.264 Annex B stream, or MPEG-2 video -- full screen at FPS, REPEAT times or until a key or a click.
+  "Play BYTES -- an H.264 Annex B stream, MPEG-2 video, or VC-1 -- full screen at FPS, REPEAT times or until a key or a click.
    (pictures seconds late-frames)."
   (unless *t4g-rcs* (t4g-render-start))
   (unless *t4d*
@@ -597,13 +603,19 @@
                       (incf shown)
                       (when (%t4d-input-p) (throw 't4v-stop nil)))))
              (dotimes (rep repeat)
-               (if (t4v-mpeg2-p bytes)
+               (cond
+                 ((t4v-mpeg2-p bytes)
                    (funcall 't4m-decode-bytes bytes
                             (lambda (d i s) (declare (ignore i))
-                              (show (funcall 't4md-width d) (funcall 't4md-height d) s)))
+                              (show (funcall 't4md-width d) (funcall 't4md-height d) s))))
+                 ((t4v-vc1-p bytes)
+                   (funcall 't4w-decode-bytes bytes
+                            (lambda (d i s) (declare (ignore i))
+                              (show (funcall 't4wd-width d) (funcall 't4wd-height d) s))))
+                 (t
                    (t4v-decode-bytes bytes
                                      (lambda (d i p s) (declare (ignore i p))
-                                       (show (t4vd-width d) (t4vd-height d) s)))))))
+                                       (show (t4vd-width d) (t4vd-height d) s))))))))
       (t4-gpu-set #x7019C 0)
       (when *t4g-cursor* (t4g-cursor-on *t4-px* *t4-py*)))
     (list shown (float (/ (- (get-internal-real-time) t0) hz)) late)))
