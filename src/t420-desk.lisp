@@ -32,6 +32,7 @@
   ;; and no link; run at boot, as the r-t420n image did, it got DHCP.  No cable: the desk comes
   ;; up once DHCP's tries run out.
   (%t4-console-to-log t)                 ; the console ring on: the pipeline's own messages
+  (ignore-errors (t4-cmd-baseline))      ; commands written from now on run (t420.lisp)
   (let ((ip (handler-case
                 (progn (modus-int::run-net-pipeline)
                        (let ((s (modus-int::e1000-state-base)))
@@ -46,9 +47,14 @@
     (return-from kiln-t420-main :no-vbe))
   (t4-gpu-dump "bios")
   (let ((native (and *t4-native* (%t4-native-panel))))
+    (setf *t4-native-on* (and native t))
     (t4-log "kiln t420: screen ~Dx~D~:[ (VBE)~; (native, the panel fitter off)~]" *t4-w* *t4-h* native))
-  (t4-log "kiln t420: screen write-combining (~D pages)" (%t4-write-combining))
+  (setf *t4-wc-pages* (%t4-write-combining))
+  (t4-log "kiln t420: screen write-combining (~D pages)" *t4-wc-pages*)
   (%t4-mouse-init)
+  ;; USB keyboards and mice (t420-usb.lisp): the controllers the BIOS does not boot from
+  (when (fboundp 't4-usb-start)
+    (t4-log "kiln t420: usb ~A" (handler-case (funcall 't4-usb-start) (error (c) (princ-to-string c)))))
   (setf *t4-px* (floor *t4-w* 2) *t4-py* (floor *t4-h* 2))
   (t4-log "kiln t420: desk ~Dx~D, mouse ~:[off~;on~]" *t4-w* *t4-h* *t4-mouse-ok*)
   (t4-log-flush)

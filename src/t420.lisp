@@ -60,6 +60,8 @@
 ;;; stride for the wider rows, and the surface register rewritten to latch it.  Only when the GPU
 ;;; is Intel's, pipe A's active size is the EDID's, and the VBE mode is not already it.
 (defvar *t4-native* t)     ; switch to the panel's native size at boot
+(defvar *t4-native-on* nil) ; ... and whether it did (the Settings window shows it)
+(defvar *t4-wc-pages* nil)  ; framebuffer pages made write-combining, or NIL
 
 (defun %t4-native-panel ()
   "Switch an Intel GPU's pipe A to the panel's native size.  (W H) when it did, else NIL."
@@ -391,7 +393,9 @@
 (defvar *t4-events* nil)
 
 (defun %t4-poll ()
-  "Everything the 8042 holds, as queued events.  Bounded per call."
+  "Everything the 8042 holds, and what the USB keyboard and mouse reported (t420-usb.lisp), as
+   queued events.  Bounded per call."
+  (when (fboundp 't4-usb-poll) (funcall 't4-usb-poll))
   (dotimes (i 64)
     (let ((s (%t4-status)))
       (unless (logbitp 0 s) (return))
@@ -485,6 +489,16 @@
         (mem-ref #xC008 :u32) lba (mem-ref #xC00C :u32) 0)
   (and (modus-int::%pcbios-int #x13 #x4200 0 0 (logand (mem-ref #x58C :u32) #xFF) #xC000 0 0)
        (zerop (logand (modus-int::%pcbios-out 40) 1))))
+
+(defun t4-cmd-baseline ()
+  "Take the command channel's current sequence number as already done, at the desk's start: a
+   command written after this is new.  (Taken at the first idle poll instead, a command sent
+   while the desk was still starting was taken for the baseline and never run.)"
+  (when (and (modus-int::%pcbios-present-p) (%t4-disk-read *t4-cmd-lba* 1)
+             (= (mem-ref #x30000 :u8) 84) (= (mem-ref #x30004 :u8) 68))
+    (setq *t4-cmd-seq* (mem-ref #x30008 :u32)))
+  (t4-log "kiln t420: commands after ~D" (or *t4-cmd-seq* 0))
+  (unless *t4-cmd-seq* (setq *t4-cmd-seq* 0)))
 
 (defun %t4-cmd-poll ()
   "Run the command in the command sectors if it is new (at most once a second)."
