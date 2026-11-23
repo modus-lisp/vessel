@@ -435,6 +435,187 @@
                  (reel.h264::pic-poc pic) (t4-gpu-reg #x12034) (t4-gpu-reg #x12030)))))
     nil))
 
+;;; ---- showing a picture: NV12 -> RGB on the render engine ----------------------------------------
+;;; The display planes here scan out RGB only, so a decoded picture is drawn: one RECTLIST through
+;;; the 3D pipeline, whose pixel shader samples Y (R8) and interleaved UV (R8G8) from the
+;;; Y-tiled surface and converts with BT.601.  The shader is intel-vaapi-driver's gen 6 planar
+;;; kernel (src/shaders/render: exa_wm_src_affine + _src_sample_planar + _yuv_color_balance +
+;;; _yuv_rgb + _write, MIT), the pipeline state as t4g-render-copy's (igt's).  Its constants
+;;; (GRF 6..9): the NV12 flag and skip-colour-balance as shorts, colour balance at 4..7, the
+;;; YUV->RGB coefficients at 8..19.  Binding table: 0 the target, 1 and 2 Y, 3 and 4 UV;
+;;; samplers 0 (Y) and 2 (UV).
+
+(defparameter *t4v-ps-nv12*
+  '(
+    #x0060005a #x204077be #x00000140 #x008d0040 #x0060005a #x206077be #x00000140 #x008d0080
+    #x0060005a #x208077be #x00000150 #x008d0040 #x0060005a #x20a077be #x00000150 #x008d0080
+    #x03000010 #x20002d3c #x000000c0 #x00000000 #x00010020 #x34001c00 #x00001400 #x0000000e
+    #x00000201 #x20080061 #x00000000 #x0000e000 #x00600201 #x20200022 #x008d0000 #x00000000
+    #x02800031 #x22001cc9 #x00000020 #x0a2a0203 #x00000201 #x20080061 #x00000000 #x0000e000
+    #x00600201 #x20200022 #x008d0000 #x00000000 #x02800031 #x22401cc9 #x00000020 #x0a2a0405
+    #x00000020 #x34001c00 #x00001400 #x00000006 #x00000201 #x20080061 #x00000000 #x0000c000
+    #x00600201 #x20200022 #x008d0000 #x00000000 #x02800031 #x22001cc9 #x00000020 #x0a4a0203
+    #x00000201 #x20080061 #x00000000 #x0000e000 #x00600201 #x20200022 #x008d0000 #x00000000
+    #x02800031 #x21c01cc9 #x00000020 #x0a2a0001 #x01000010 #x20002d3c #x000000c2 #x00010001
+    #x00010020 #x34001c00 #x00001400 #x0000001a #x00800040 #x24007fbd #x008d01c0 #xbd808081
+    #x00800041 #x240077bd #x008d0400 #x000000d0 #x00800040 #x240077bd #x008d0400 #x000000d4
+    #x00800040 #x21c07fbd #x008d0400 #x3d808081 #x00800040 #x24807fbd #x008d0200 #xbf008084
+    #x00800040 #x24407fbd #x008d0240 #xbf008084 #x00800001 #x240003fc #x00000000 #x3f008084
+    #x00800048 #x240077bc #x008d0440 #x000000dc #x00800048 #x220077bd #x008d0480 #x000000d8
+    #x00000041 #x20dc7fbd #x000000dc #xbf800000 #x00800001 #x240003fc #x00000000 #x3f008084
+    #x00800048 #x240077bc #x008d0480 #x000000dc #x00800048 #x224077bd #x008d0440 #x000000d8
+    #x00800040 #x22c077bd #x008d01c0 #x000000ec #x00800040 #x230077bd #x008d0200 #x000000fc
+    #x00800040 #x234077bd #x008d0240 #x0000010c #x00800041 #x240077bc #x008d02c0 #x000000e0
+    #x00800048 #x240077bc #x008d0300 #x000000e4 #x80800048 #x21c077bd #x008d0340 #x000000e8
+    #x00800041 #x240077bc #x008d02c0 #x000000f0 #x00800048 #x240077bc #x008d0300 #x000000f4
+    #x80800048 #x220077bd #x008d0340 #x000000f8 #x00800041 #x240077bc #x008d02c0 #x00000100
+    #x00800048 #x240077bc #x008d0300 #x00000104 #x80800048 #x224077bd #x008d0340 #x00000108
+    #x00800001 #x228003fd #x00000000 #x3f800000 #x00600001 #x204003be #x008d01c0 #x00000000
+    #x00600001 #x206003be #x008d01e0 #x00000000 #x00600001 #x208003be #x008d0200 #x00000000
+    #x00600001 #x20a003be #x008d0220 #x00000000 #x00600001 #x20c003be #x008d0240 #x00000000
+    #x00600001 #x20e003be #x008d0260 #x00000000 #x00600001 #x210003be #x008d0280 #x00000000
+    #x00600001 #x212003be #x008d02a0 #x00000000 #x05800031 #x24001cc8 #x00000040 #x90019000
+    #x0000007e #x00000000 #x00000000 #x00000000 #x0000007e #x00000000 #x00000000 #x00000000
+    #x0000007e #x00000000 #x00000000 #x00000000 #x0000007e #x00000000 #x00000000 #x00000000
+    #x0000007e #x00000000 #x00000000 #x00000000 #x0000007e #x00000000 #x00000000 #x00000000
+    #x0000007e #x00000000 #x00000000 #x00000000 #x0000007e #x00000000 #x00000000 #x00000000))
+
+(defparameter *t4v-bt601*                  ; i965_yuv_coefs.c, yuv_to_rgb_bt601
+  '(1.164 0.0 1.596 -0.06275  1.164 -0.392 -0.813 -0.50196  1.164 2.017 0.0 -0.50196))
+
+(defvar *t4v-rbatch* nil "(gpu . cpu): the NV12 draw's 8 KB batch.")
+
+(defun %t4v-rw (off v) (t4g-w (+ (cdr *t4v-rbatch*) off) v))
+
+(defun %t4v-ss (off gpu w h pitch format tiled)
+  "A SURFACE_STATE at OFF: 2D, FORMAT, W x H, PITCH bytes, Y-tiled when TILED."
+  (%t4v-rw off (logior (ash 1 29) (ash format 18) (ash 1 13)))
+  (%t4v-rw (+ off 4) gpu)
+  (%t4v-rw (+ off 8) (logior (ash (- w 1) 6) (ash (- h 1) 19)))
+  (%t4v-rw (+ off 12) (logior (ash (- pitch 1) 3) (if tiled 3 0)))
+  (%t4v-rw (+ off 16) 0) (%t4v-rw (+ off 20) 0))
+
+(defun t4v-draw (s width height dst dx dy dw dh)
+  "Draw the WIDTH x HEIGHT picture in surface S onto t4g-surface DST at (DX,DY), scaled to
+   DW x DH.  The render engine's breadcrumb."
+  (unless *t4v-rbatch*
+    (multiple-value-bind (g c) (t4g-alloc 8192) (setq *t4v-rbatch* (cons g c)))
+    (dotimes (i 2048) (%t4v-rw (* 4 i) 0))
+    (loop for d in *t4v-ps-nv12* for o from 4096 by 4 do (%t4v-rw o d))
+    (dotimes (i 4)                                                ; samplers: linear, clamp
+      (%t4v-rw (+ 2304 (* 16 i)) (logior (ash 1 14) (ash 1 17)))
+      (%t4v-rw (+ 2304 (* 16 i) 4) (logior 2 (ash 2 3) (ash 2 6))))
+    (%t4v-rw 2400 #xF99A130C) (%t4v-rw 2404 #x799A130C)           ; CC viewport
+    (%t4v-rw 2432 (logior #x11 (ash 1 5) (ash 1 31))) (%t4v-rw 2436 3)   ; blend: off
+    (%t4v-rw 3072 #x00010001)                                     ; NV12, skip colour balance
+    (loop for f in '(1.0 0.0 1.0 0.0) for o from 3088 by 4 do (%t4v-rw o (t4g-f32 f)))
+    (loop for f in *t4v-bt601* for o from 3104 by 4 do (%t4v-rw o (t4g-f32 f))))
+  (let* ((b (car *t4v-rbatch*)) (p 0) (uv (+ (t4vs-gpu s) (* (t4vs-pitch s) (t4vs-h32 s)))))
+    ;; binding table and surfaces
+    (loop for i below 5 do (%t4v-rw (+ 2048 (* 4 i)) (+ 2112 (* 32 i))))
+    (%t4v-ss 2112 (t4s-gpu dst) (t4s-w dst) (t4s-h dst) (t4s-pitch dst) #x0C0 nil)
+    (%t4v-ss 2144 (t4vs-gpu s) width height (t4vs-pitch s) #x140 t)
+    (%t4v-ss 2176 (t4vs-gpu s) width height (t4vs-pitch s) #x140 t)
+    (%t4v-ss 2208 uv (ash width -1) (ash height -1) (t4vs-pitch s) #x106 t)
+    (%t4v-ss 2240 uv (ash width -1) (ash height -1) (t4vs-pitch s) #x106 t)
+    (flet ((out (&rest ds) (dolist (d ds) (%t4v-rw p d) (incf p 4))))
+      (out #x69040000)                                            ; PIPELINE_SELECT 3D
+      (out (logior #x790D0000 1) 0 0)                             ; MULTISAMPLE
+      (out #x78180000 1)                                          ; SAMPLE_MASK
+      (out (logior #x61010000 8) 0 (logior b 1) (logior b 1) 0 (logior b 1) 0 1 0 1)   ; STATE_BASE_ADDRESS
+      (out #x61020000 0)                                          ; STATE_SIP
+      (out (logior #x78050000 1) 24 0)                            ; URB
+      (out (logior #x780D0000 (ash 1 12) 2) 0 0 2400)             ; VIEWPORT_STATE_POINTERS (CC)
+      (out (logior #x78150000 3) 0 0 0 0)                         ; CONSTANT_VS
+      (out (logior #x78100000 4) 0 0 0 0 0)                       ; VS: pass-through
+      (out (logior #x78160000 3) 0 0 0 0)                         ; CONSTANT_GS
+      (out (logior #x78110000 5) 0 0 0 0 0 0)                     ; GS
+      (out (logior #x78120000 2) 0 0 0)                           ; CLIP
+      (out (logior #x78170000 (ash 1 12) 3) (logior 3072 3) 0 0 0)   ; CONSTANT_PS: 4 registers
+      (out (logior #x79050000 5) (logior (ash 7 29) (ash 1 18)) 0 0 0 0 0)   ; null depth
+      (out #x79100000 0)                                          ; CLEAR_PARAMS
+      (out (logior #x79000000 2) 0 (logior (ash (- (t4s-h dst) 1) 16) (- (t4s-w dst) 1)) 0)
+      (out (logior #x780E0000 2) (logior 2432 1) (logior 2560 1) (logior 2560 1))   ; CC_STATE_POINTERS
+      (out (logior #x78020000 (ash 1 12) 2) 0 0 2304)             ; SAMPLER_STATE_POINTERS (PS)
+      (out (logior #x78130000 18) (logior (ash 1 22) (ash 1 11) (ash 1 4)) 0 (ash 1 29) (ash 2 25)
+           0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)                           ; SF
+      (out (logior #x78140000 7) 4096 (logior (ash 1 27) (ash 5 18)) 0 (ash 6 16)
+           (logior (ash 39 25) (ash 1 19) (ash 1 1)) (logior (ash 1 20) (ash 1 10)) 0 0)   ; WM
+      (out (logior #x78090000 5)                                  ; VERTEX_ELEMENTS: pad, x y, u v
+           (logior (ash 1 25) (ash #x000 16)) (logior (ash 2 28) (ash 2 24) (ash 2 20) (ash 2 16))
+           (logior (ash 1 25) (ash #x0F6 16)) (logior (ash 1 28) (ash 1 24) (ash 3 20) (ash 3 16))
+           (logior (ash 1 25) (ash #x085 16) 4) (logior (ash 1 28) (ash 1 24) (ash 2 20) (ash 2 16)))
+      (out (logior #x78010000 (ash 1 12) 2) 0 0 2048)             ; BINDING_TABLE_POINTERS (PS)
+      (out (logior #x78080000 3) 12 b (+ b 2047) 0)               ; VERTEX_BUFFERS: pitch 12
+      (let ((vstart (* 12 (ceiling (+ p 32) 12))))
+        (out (logior #x7B000000 (ash #x0F 10) 4) 3 (/ vstart 12) 1 0 0)   ; RECTLIST
+        (out (ash #x0A 23) 0)                                     ; BATCH_BUFFER_END
+        (loop for (x y u v) in (list (list (+ dx dw) (+ dy dh) #x3F800000 #x3F800000)
+                                     (list dx (+ dy dh) 0 #x3F800000)
+                                     (list dx dy 0 0))
+              for o from vstart by 12
+              do (%t4v-rw o (logior (ash y 16) x)) (%t4v-rw (+ o 4) u) (%t4v-rw (+ o 8) v)))))
+  (let ((r *t4g-rcs*))
+    (t4g-render-invalidate r)
+    (t4g-emit r (list (ash #x31 23) (car *t4v-rbatch*)))
+    (let ((seq (t4g-render-breadcrumb r)))
+      (t4g-submit r)
+      seq)))
+
+;;; ---- a player: the whole screen, until a key -------------------------------------------------
+
+(defun t4v-play (bytes &key (fps 25) (repeat 1))
+  "Play the Annex B stream BYTES full screen at FPS, REPEAT times or until a key or a click.
+   (pictures seconds late-frames)."
+  (unless *t4g-rcs* (t4g-render-start))
+  (unless *t4d*
+    (setq *t4d* (list (t4g-surface-new 1366 768) (t4g-surface-new 1366 768) (t4g-surface-new 1366 768))))
+  (let* ((a (first *t4d*)) (b (second *t4d*)) (back a) (shown 0) (late 0)
+         (hz internal-time-units-per-second) (t0 (get-internal-real-time)))
+    (%t4d-input-p)
+    (when *t4g-cursor* (t4-gpu-set #x70080 0) (t4-gpu-set #x70084 *t4g-cursor*))
+    (dolist (sf (list a b)) (t4g-wait *t4g-blt* (t4g-blt-clear sf 0) 100))
+    (unwind-protect
+         (catch 't4v-stop
+           (dotimes (rep repeat)
+             (t4v-decode-bytes
+              bytes
+              (lambda (d i p s)
+                (declare (ignore i p))
+                (let* ((w (t4vd-width d)) (h (t4vd-height d))
+                       (scale (min (/ 1366 w) (/ 768 h)))
+                       (dw (floor (* w scale))) (dh (floor (* h scale))))
+                  (unless (t4g-wait *t4g-rcs* (t4v-draw s w h back (floor (- 1366 dw) 2) (floor (- 768 dh) 2) dw dh) 200)
+                    (error "t420 video: the render engine did not finish a picture"))
+                  ;; pace: show picture SHOWN at t0 + SHOWN/FPS
+                  (let ((due (+ t0 (floor (* shown hz) fps))))
+                    (if (< (get-internal-real-time) due)
+                        (loop while (< (get-internal-real-time) due))
+                        (incf late)))
+                  (%t4d-flip back)
+                  (setq back (if (eq back a) b a))
+                  (incf shown)
+                  (when (%t4d-input-p) (throw 't4v-stop nil)))))))
+      (t4-gpu-set #x7019C 0)
+      (when *t4g-cursor* (t4g-cursor-on *t4-px* *t4-py*)))
+    (list shown (float (/ (- (get-internal-real-time) t0) hz)) late)))
+
+;; the rig's test clip: the gadget disk holds it past the image (a 12 s 640x360 Mandelbrot zoom,
+;; main profile, B frames); NIL for none
+(defvar *t4v-clip* '(144000 . 693507) "(LBA . BYTES) of the clip the desk's Video action plays.")
+
+(defun %t4v-on-desk (desk dw dh)
+  "app.lisp's desk-setup hook: Video on the root menu."
+  (declare (ignore dw dh))
+  (%kiln-desk-register-action
+   desk "Video"
+   (lambda ()
+     (when *t4v-clip*
+       (let ((r (t4v-play (t4v-disk-bytes (car *t4v-clip*) (cdr *t4v-clip*)))))
+         (t4-log "video: ~D pictures in ~,1F s, ~D late" (first r) (second r) (third r)))))))
+
+(pushnew '%t4v-on-desk *kiln-desk-setup-hooks*)
+
 ;;; ---- checking against the host ------------------------------------------------------------------
 ;;; A test stream sits on the boot disk at some LBA (the rig writes it past the image).  Each
 ;;; picture out is hashed plane by plane (FNV-1a, Y U V, cropped) for comparing with what the host
