@@ -24,12 +24,14 @@
   (or *t4g-aperture*
       (setq *t4g-aperture* (logand (modus-int::pci-config-read 0 2 0 #x18) (lognot #xF)))))
 
-(defun t4g-alloc (bytes &key (align 4096))
+(defun t4g-alloc (bytes &key (align 4096) (map t))
   "BYTES of GPU memory from the pool: (values gpu-address cpu-address).  The CPU address is an
-   uncached mapping of the aperture (one 32-bit access at a time: T4G-W / T4G-R)."
+   uncached mapping of the aperture (one 32-bit access at a time: T4G-W / T4G-R), or NIL with MAP
+   NIL -- for what only the GPU touches (a depth buffer, a back buffer): the MMIO window the
+   mappings come from is 4 MB, and one 1366x768 surface is more."
   (unless *t4g-next* (setq *t4g-next* *t4g-pool*))
   (let* ((gpu (* align (ceiling *t4g-next* align)))
-         (cpu (modus-int::pc-mmio-map (+ (%t4g-aperture) gpu) bytes)))
+         (cpu (and map (modus-int::pc-mmio-map (+ (%t4g-aperture) gpu) bytes))))
     (setq *t4g-next* (+ gpu bytes))
     (values gpu cpu)))
 
@@ -352,3 +354,230 @@
        (t4g-submit r)
        seq)))
  
+
+;;; ---- floats for the GPU -----------------------------------------------------------------------------
+(defvar *t4g-f32-cell* (make-array 1 :element-type 'single-float :initial-element 0.0)
+  "One single-float lane, for T4G-F32 to read a float's bits back out of.")
+
+(defun t4g-f32 (x)
+  "IEEE single bits of X (any real): what a vertex or a state word holds.  Stored into a
+   single-float vector and its lane read back (on i386 a vector's data is at its word - 5): ~14 us
+   a float through INTEGER-DECODE-FLOAT was 20 ms of a demo frame."
+  (let ((v *t4g-f32-cell*))
+    (setf (aref v 0) (coerce x 'single-float))
+    (mem-ref (- (modus-int::%val->word v) 5) :u32)))
+
+;;; ---- the EU: our own pixel shaders ----------------------------------------------------------------
+;;; A gen 6 EU instruction is four dwords.  The two the shaders below use, with the fields that vary
+;;; as parameters and the rest exactly as intel-gpu-tools' verified render-copy kernel has them:
+;;;   PLN (8 lanes)  dst MRF DST <- the plane equation at GRF REG.SUB (floats a b - c, from setup)
+;;;                  evaluated at the barycentrics in GRF BARY: one half of a SIMD16 channel.
+;;;                  DW1 holds the destination register in bits 28:21, DW2 the plane's register in
+;;;                  12:5 and its byte offset in 4:0, DW3 the barycentric register likewise.
+;;;   SEND           render-target write, SIMD16, 8 message registers from m2 (R G B A, two each),
+;;;                  binding table entry 0, end of thread.
+(defun t4g-eu-pln (dst reg sub bary)
+  (list #x0060005a (logior #x20000000 (ash dst 21) #x77be) (logior (ash reg 5) sub)
+        (logior #x008d0000 (ash bary 5))))
+
+(defparameter +t4g-eu-rt-write+ '(#x05800031 #x24001cc8 #x00000040 #x90019000))
+(defparameter +t4g-eu-nop+ '(#x0000007e 0 0 0))
+
+(defun t4g-ps-gouraud ()
+  "A SIMD16 pixel shader: the one vertex attribute (a colour) interpolated across the triangle and
+   written to render target 0.  The setup data starts at g6 (3DSTATE_WM's dispatch GRF 6): a
+   channel's plane is 4 floats, so R at g6.0, G at g6.4, B at g7.0, A at g7.4; the barycentrics
+   of the two halves at g2 and g4."
+  (append
+   (loop for (reg sub) in '((6 0) (6 16) (7 0) (7 16))
+         for m from 2 by 2
+         append (append (t4g-eu-pln m reg sub 2) (t4g-eu-pln (+ m 1) reg sub 4)))
+   +t4g-eu-rt-write+
+   (loop repeat 8 append +t4g-eu-nop+)))          ; the EU prefetches past the end
+
+;;; ---- surfaces ----------------------------------------------------------------------------------------
+(defstruct (t4g-surface (:conc-name t4s-)) gpu cpu w h pitch)
+
+(defun t4g-surface-new (w h &key (align #x40000))
+  "A W x H 32-bit surface in GPU memory (not mapped for the CPU), rows padded to 128 bytes (a Y tile's width: the depth
+   buffer is Y-tiled), the height to 32 rows; 256 KB aligned (a display surface may be scanned out)."
+  (let* ((pitch (* 128 (ceiling (* 4 w) 128))) (rows (* 32 (ceiling h 32))))
+    (multiple-value-bind (gpu cpu) (t4g-alloc (* pitch rows) :align align :map nil)
+      (make-t4g-surface :gpu gpu :cpu cpu :w w :h h :pitch pitch))))
+
+(defun t4g-blt-clear (s value)
+  "Fill surface S with VALUE on the blitter: every byte of every padded row (a constant fill is
+   the same in any tiling, so it clears the Y-tiled depth buffer too).  The breadcrumb."
+  (t4g-blt-fill (t4s-gpu s) (t4s-pitch s) 0 0 (floor (t4s-pitch s) 4) (* 32 (ceiling (t4s-h s) 32)) value)
+  (let ((seq (t4g-breadcrumb *t4g-blt*))) (t4g-submit *t4g-blt*) seq))
+
+;;; ---- triangles ----------------------------------------------------------------------------------------
+;;; A vertex is 8 floats: position (x y z w) in SCREEN pixels with z in [0,1] (the clipper and the
+;;; viewport transform are off: the CPU projects), then a colour (r g b a) in [0,1].  The VUE the
+;;; pass-through VS writes is header, position, colour; SF reads the colour (offset 1, length 1).
+
+(defparameter +t4g-tri-batch+ 65536)
+(defvar *t4g-tri* nil "The triangle batch: (gpu . cpu).")
+
+(defun t4g-draw-triangles (rt depth verts n &key (cull 1))
+  "Draw N triangles (VERTS: a list of 8-float vertices, 3N of them) into surface RT, depth-tested
+   against surface DEPTH (or none, NIL).  CULL is SF's cull mode (1 none, 3 back).  The breadcrumb."
+  (unless *t4g-tri*
+    (multiple-value-bind (g c) (t4g-alloc +t4g-tri-batch+) (setq *t4g-tri* (cons g c))))
+  (let* ((b (car *t4g-tri*)) (cpu (cdr *t4g-tri*)) (p 0)
+         (bt 1088) (ss 1120) (kern 1216) (vp 1600) (blend 1664) (ds 1728) (cc 1792) (vbase 4096)
+         (ps (t4g-ps-gouraud)))
+    (flet ((w (off v) (t4g-w (+ cpu off) v)))
+      ;; state
+      (w bt ss)
+      (w ss (logior (ash 1 29) (ash #x0C0 18) (ash 1 13)))
+      (w (+ ss 4) (t4s-gpu rt))
+      (w (+ ss 8) (logior (ash (- (t4s-w rt) 1) 6) (ash (- (t4s-h rt) 1) 19)))
+      (w (+ ss 12) (ash (- (t4s-pitch rt) 1) 3)) (w (+ ss 16) 0) (w (+ ss 20) 0)
+      (loop for d in ps for o from kern by 4 do (w o d))
+      (w vp #xF99A130C) (w (+ vp 4) #x799A130C)
+      (w blend 0) (w (+ blend 4) 3)                                  ; no blending; clamp
+      (w ds 0) (w (+ ds 4) 0)
+      (w (+ ds 8) (if depth (logior (ash 1 31) (ash 2 27) (ash 1 26)) 0))   ; LESS, test + write
+      (dotimes (i 6) (w (+ cc (* 4 i)) 0))
+      ;; vertices
+      (let ((o vbase))
+        (dolist (v verts)
+          (dolist (f v) (w o (t4g-f32 f)) (incf o 4))))
+      ;; commands
+      (flet ((out (&rest ds) (dolist (d ds) (w p d) (incf p 4))))
+        (out #x69040000)                                             ; PIPELINE_SELECT 3D
+        (out (logior #x790D0000 1) 0 0)                              ; MULTISAMPLE: 1 sample
+        (out #x78180000 1)                                           ; SAMPLE_MASK
+        (out (logior #x61010000 8) 0 (logior b 1) (logior b 1) 0 (logior b 1) 0 1 0 1)
+        (out #x61020000 0)                                           ; SIP
+        (out (logior #x78050000 1) 24 0)                             ; URB
+        (out (logior #x780D0000 (ash 1 12) 2) 0 0 vp)
+        (out (logior #x78150000 3) 0 0 0 0) (out (logior #x78100000 4) 0 0 0 0 0)
+        (out (logior #x78160000 3) 0 0 0 0) (out (logior #x78110000 5) 0 0 0 0 0 0)
+        (out (logior #x78120000 2) 0 0 0)                            ; CLIP: pass-through
+        (out (logior #x78170000 3) 0 0 0 0)
+        ;; the depth buffer, after the flushes gen 6 wants before it (Mesa: depth stall, depth
+        ;; cache flush, depth stall, each after the post-sync-nonzero pair)
+        (out +pc4+ (logior (ash 1 20) (ash 1 1)) 0 0)
+        (out +pc4+ (ash 1 14) (logior *t4g-scratch* 4) 0)
+        (out +pc4+ (ash 1 13) 0 0) (out +pc4+ 1 0 0) (out +pc4+ (ash 1 13) 0 0)
+        (if depth
+            (out (logior #x79050000 5)
+                 (logior (- (t4s-pitch depth) 1) (ash 1 18) (ash 1 26) (ash 1 27) (ash 1 29))
+                 (t4s-gpu depth)
+                 (logior (ash (- (t4s-w depth) 1) 6) (ash (- (t4s-h depth) 1) 19)) 0 0 0)
+            (out (logior #x79050000 5) (logior (ash 7 29) (ash 1 18)) 0 0 0 0 0))
+        (out #x79100000 0)                                           ; CLEAR_PARAMS
+        (out (logior #x79000000 2) 0 (logior (ash (- (t4s-h rt) 1) 16) (- (t4s-w rt) 1)) 0)
+        (out (logior #x780E0000 2) (logior blend 1) (logior ds 1) (logior cc 1))
+        (out (logior #x78020000 (ash 1 12) 2) 0 0 0)                 ; no samplers
+        (out (logior #x78130000 18) (logior (ash 1 22) (ash 1 11) (ash 1 4)) 0 (ash cull 29) (ash 2 25)
+             0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)                          ; SF
+        (out (logior #x78140000 7) kern (ash 1 18) 0 (ash 6 16)
+             (logior (ash 39 25) (ash 1 19) (ash 1 1)) (logior (ash 1 20) (ash 1 10)) 0 0)   ; WM
+        (out (logior #x78090000 5)                                   ; header, position, colour
+             (ash 1 25) (logior (ash 2 28) (ash 2 24) (ash 2 20) (ash 2 16))
+             (ash 1 25) (logior (ash 1 28) (ash 1 24) (ash 1 20) (ash 1 16))
+             (logior (ash 1 25) 16) (logior (ash 1 28) (ash 1 24) (ash 1 20) (ash 1 16)))
+        (out (logior #x78010000 (ash 1 12) 2) 0 0 bt)
+        (out (logior #x78080000 3) 32 (+ b vbase) (+ b +t4g-tri-batch+ -1) 0)   ; VB: pitch 32
+        (out (logior #x7B000000 (ash #x04 10) 4) (* 3 n) 0 1 0 0)   ; 3DPRIMITIVE TRILIST
+        (out (ash #x0A 23) 0)))                                      ; BATCH_BUFFER_END
+    (let ((r *t4g-rcs*))
+      (t4g-render-invalidate r)
+      (t4g-emit r (list (ash #x31 23) b))
+      (let ((seq (t4g-render-breadcrumb r))) (t4g-submit r) seq))))
+
+;;; ---- the demo: spinning cubes, all on the GPU --------------------------------------------------------
+;;; Five RGB cubes -- one in the middle, four orbiting on a tilted ring so they pass in front of it,
+;;; behind it, and through each other -- drawn each frame by the render engine into a back buffer,
+;;; depth-tested, Gouraud-shaded by our own pixel shader; the blitter clears colour and depth; the
+;;; display flips to the finished buffer at vertical blank (DSPASURF latches there; DSPASURFLIVE
+;;; says when it has).  The CPU only turns and projects 40 corners a frame.  The desk's screen,
+;;; surface 0, is not touched: leaving flips back to it.
+
+(defvar *t4d* nil "The demo's surfaces: (front back depth).")
+(defparameter *t4d-faces* '((0 2 6 4) (1 5 7 3) (0 4 5 1) (2 3 7 6) (0 1 3 2) (4 6 7 5)))
+
+(defun %t4d-cube (tris cx cy cz size ax ay az)
+  "TRIS with a cube's 12 triangles pushed on: centre (CX CY CZ), half-size SIZE, turned by AX AY AZ
+   (radians), projected to the screen (focal 900, near 1, far 60).  Corner I is (x y z) = bits of I,
+   and its colour is the same bits: the RGB cube."
+  (let* ((sx (sin ax)) (cxa (cos ax)) (sy (sin ay)) (cya (cos ay)) (sz (sin az)) (cza (cos az))
+         (pts (make-array 8)))
+    (dotimes (i 8)
+      (let* ((x (if (logbitp 0 i) size (- size))) (y (if (logbitp 1 i) size (- size)))
+             (z (if (logbitp 2 i) size (- size))))
+        ;; around x, then y, then z
+        (psetq y (- (* y cxa) (* z sx)) z (+ (* y sx) (* z cxa)))
+        (psetq x (+ (* x cya) (* z sy)) z (- (* z cya) (* x sy)))
+        (psetq x (- (* x cza) (* y sz)) y (+ (* x sz) (* y cza)))
+        (let ((wx (+ x cx)) (wy (+ y cy)) (wz (+ z cz)))
+          (setf (aref pts i)
+                (list (+ 683 (/ (* 900 wx) wz)) (- 384 (/ (* 900 wy) wz)) (/ (- wz 1) 59) 1.0
+                      (if (logbitp 0 i) 1.0 0.15) (if (logbitp 1 i) 1.0 0.15)
+                      (if (logbitp 2 i) 1.0 0.15) 1.0)))))
+    (dolist (f *t4d-faces* tris)
+      (destructuring-bind (a b c d) f
+        (push (aref pts a) tris) (push (aref pts b) tris) (push (aref pts c) tris)
+        (push (aref pts a) tris) (push (aref pts c) tris) (push (aref pts d) tris)))))
+
+(defun %t4d-scene (s)
+  "The vertices of the scene at S seconds."
+  (let ((tris (%t4d-cube nil 0 0 9 1.5 (* s 0.7) (* s 1.1) (* s 0.3))))
+    (dotimes (k 4 tris)
+      (let ((a (+ (* s 0.8) (* k (/ pi 2)))))
+        (setq tris (%t4d-cube tris (* 3.4 (cos a)) (* 1.2 (sin a)) (+ 9 (* 3.4 (sin a))) 0.7
+                              (* s (+ 1.3 (* 0.2 k))) (* s 0.9) (* s (- 0.5 (* 0.1 k)))))))))
+
+(defun %t4d-flip (s)
+  "Scan out surface S from the next vertical blank; wait for it (at most 50 ms)."
+  (t4-gpu-set #x7019C (t4s-gpu s))
+  (let ((end (+ (get-internal-real-time) (floor internal-time-units-per-second 20))))
+    (loop until (or (= (t4-gpu-reg #x701AC) (t4s-gpu s)) (>= (get-internal-real-time) end)))))
+
+(defun %t4d-input-p ()
+  "A key or a button pressed since the last call?  Drains the input queue."
+  (%t4-poll)
+  (let ((hit nil))
+    (dolist (e *t4-events*)
+      (let ((type (logand (floor e 1099511627776) #xFF)))
+        (when (or (= type 4) (and (= type 12) (plusp (logand (ash e -48) 7)))) (setq hit t))))
+    (setf *t4-events* nil)
+    hit))
+
+(defun t4g-demo (&key seconds)
+  "Run the demo until a key or a click (or for SECONDS).  (frames seconds), and the screen is the
+   desk's again."
+  (unless *t4g-rcs* (t4g-render-start))
+  (unless *t4d*
+    (setq *t4d* (list (t4g-surface-new 1366 768) (t4g-surface-new 1366 768) (t4g-surface-new 1366 768))))
+  (destructuring-bind (a b depth) *t4d*
+    (let* ((t0 (get-internal-real-time)) (hz internal-time-units-per-second)
+           (frames 0) (back a) (bg #x0B1020) (one (t4g-f32 1.0)))
+      (%t4d-input-p)
+      (when *t4g-cursor* (t4-gpu-set #x70080 0) (t4-gpu-set #x70084 *t4g-cursor*))   ; no pointer
+      (unwind-protect
+           (loop
+             (let ((s (/ (- (get-internal-real-time) t0) hz)))
+               (when (or (and seconds (>= s seconds)) (and (not seconds) (%t4d-input-p)))
+                 (return (list frames (float s))))
+               (t4g-blt-clear back bg)
+               (t4g-wait *t4g-blt* (t4g-blt-clear depth one) 100)
+               (let ((verts (%t4d-scene s)))
+                 (t4g-wait *t4g-rcs* (t4g-draw-triangles back depth verts (floor (length verts) 3)) 100))
+               (%t4d-flip back)
+               (setq back (if (eq back a) b a))
+               (incf frames)))
+        ;; back to the desk: its surface, its pointer
+        (t4-gpu-set #x7019C 0)
+        (when *t4g-cursor* (t4g-cursor-on *t4-px* *t4-py*))))))
+
+(defun %t4d-on-desk (desk dw dh)
+  "app.lisp's desk-setup hook: the demo on the root menu."
+  (declare (ignore dw dh))
+  (%kiln-desk-register-action desk "GPU demo"
+                              (lambda () (let ((r (t4g-demo))) (t4-log "gpu demo: ~D frames in ~,1F s" (first r) (second r))))))
+
+(pushnew '%t4d-on-desk *kiln-desk-setup-hooks*)
