@@ -543,8 +543,7 @@
 
 (defun t4w-vc1-p (bytes)
   "An Advanced-profile VC-1 elementary stream (it opens with a sequence header, 00 00 01 0F)?"
-  (and (> (length bytes) 4) (zerop (aref bytes 0)) (zerop (aref bytes 1)) (= 1 (aref bytes 2))
-       (= #x0F (aref bytes 3))))
+  (eql #x0F (%t4v-first-code bytes)))
 
 (defun t4w-rcv-p (bytes)
   "An RCV file (Simple/Main VC-1: 0xC5 in its fourth byte, then struct C's length, 4 or more)?"

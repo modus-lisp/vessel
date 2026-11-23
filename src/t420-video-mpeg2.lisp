@@ -12,7 +12,9 @@
 ;;;;
 ;;;; reel's MPEG-2 headers do the parsing.  Display order is MPEG-2's own: a B picture is shown as
 ;;;; soon as it is decoded; an I or P picture is shown when the next I or P arrives (or at the end).
-;;;; Frame pictures only (reel's software decoder has the same limit); MPEG-1 streams are refused.
+;;;; Field pictures too: a field that opens a frame takes a surface, the opposite field that follows
+;;;; decodes into it (as the bottom or top rows the engine is told), and the frame is shown and
+;;;; retired when both are done.  MPEG-1 streams are refused.
 
 (defconstant +mfx-mpeg2-pic+ #x73000000)   ; MFX(2,3,0,0)
 (defconstant +mfx-mpeg2-qm+  #x73010000)   ; MFX(2,3,0,1)
@@ -21,6 +23,8 @@
 (defstruct (t4m-dec (:conc-name t4md-))
   seq ph
   cur                           ; the surface being decoded into
+  half                          ; a field picture's frame with only its first field decoded: (type . structure)
+  first-p                       ; is the open picture the first field of its frame
   last next                     ; the reference surfaces: the older and the newer
   (slices '())                  ; (offset size mb-bit-offset row column qscale-code), in order
   (fill 0)                      ; bytes used in the bitstream buffer
@@ -72,25 +76,47 @@
 (defun %t4m-free (s) (when s (push s *t4v-pool*)))
 
 (defun %t4m-end-picture (d)
-  "Decode the open picture; then show and retire as MPEG-2's display order says."
+  "Decode the open picture (a frame, or one field); then, once its frame is whole, show and retire
+   as MPEG-2's display order says -- by the coding type of the frame's first field."
   (when (and (t4md-cur d) (t4md-slices d))
     (%t4m-decode d)
-    (let ((cur (t4md-cur d)))
-      (if (= (reel.mpeg2::ph-coding-type (t4md-ph d)) reel.mpeg2::+pic-b+)
-          (progn (%t4m-show d cur) (%t4m-free cur))
-          (progn (%t4m-show d (t4md-next d))
-                 (%t4m-free (t4md-last d))
-                 (setf (t4md-last d) (t4md-next d) (t4md-next d) cur)))))
-  (setf (t4md-cur d) nil (t4md-slices d) '() (t4md-fill d) 0))
+    (let* ((cur (t4md-cur d)) (ph (t4md-ph d)) (st (reel.mpeg2::ph-structure ph)))
+      (if (and (/= st 3) (t4md-first-p d))
+          (setf (t4md-half d) (cons (reel.mpeg2::ph-coding-type ph) st))   ; wait for the pair
+          (let ((type (if (/= st 3) (car (t4md-half d)) (reel.mpeg2::ph-coding-type ph))))
+            (setf (t4md-half d) nil)
+            (if (= type reel.mpeg2::+pic-b+)
+                (progn (%t4m-show d cur) (%t4m-free cur))
+                (progn (%t4m-show d (t4md-next d))
+                       (%t4m-free (t4md-last d))
+                       (setf (t4md-last d) (t4md-next d) (t4md-next d) cur)))
+            (setf (t4md-cur d) nil)))))
+  (unless (t4md-half d) (setf (t4md-cur d) nil))
+  (setf (t4md-slices d) '() (t4md-fill d) 0))
 
 (defun %t4m-decode (d)
   (let* ((vcs (t4v-start)) (ring (%t4v-batch)) (seq (t4md-seq d)) (ph (t4md-ph d))
          (cur (t4md-cur d)) (mbw (t4md-mbw d)) (mbh (t4md-mbh d)) (rows (%t4m-rows mbw))
          (type (reel.mpeg2::ph-coding-type ph))
+         (st (reel.mpeg2::ph-structure ph)) (field (/= st 3)) (second (and field (not (t4md-first-p d))))
          (fwd (if (= type reel.mpeg2::+pic-b+) (t4md-last d) (t4md-next d)))
          (bwd (if (= type reel.mpeg2::+pic-b+) (t4md-next d) fwd))
-         (f (reel.mpeg2::ph-f-code ph)))
-    (when (and (/= type reel.mpeg2::+pic-i+) (null fwd))
+         (f (reel.mpeg2::ph-f-code ph))
+         (tff (if field
+                  (if (eq (not second) (= st 1)) 1 0)
+                  (if (reel.mpeg2::ph-top-field-first ph) 1 0)))
+         ;; the four frame-store slots (intel-vaapi-driver mpeg2_set_reference_surfaces): 0-1 the
+         ;; references a top field is predicted from, 2-3 a bottom field's; a P picture's second
+         ;; field may be predicted from its own frame's first field, the opposite parity
+         (slots (flet ((half (own-parity)
+                         (let ((l (cond ((= type reel.mpeg2::+pic-b+) (list fwd bwd))
+                                        ((= type reel.mpeg2::+pic-p+)
+                                         (append (and second (= st own-parity) (list cur)) (list fwd)))
+                                        (t nil))))
+                           (list (or (first l) (first l)) (or (second l) (first l))))))
+                  (append (half 2) (if (and (not field) (reel.mpeg2::ph-frame-pred-frame-dct ph))
+                                       (half 2) (half 1))))))
+    (when (and (/= type reel.mpeg2::+pic-i+) (null fwd) (not (and second (= type reel.mpeg2::+pic-p+))))
       (error "t420 video: a ~A picture with no reference" (reel.mpeg2::picture-type-name type)))
     (flet ((out (&rest ds) (t4g-emit ring ds))
            (gpu (s) (if s (t4vs-gpu s) 0))
@@ -104,20 +130,20 @@
       ;; references: frame-store 0 forward, 1 backward (P: forward again); 2 and 3 the same, as
       ;; the bottom fields' (a frame picture with field prediction reads them there)
       (apply #'out (logior +mfx-pipe-buf+ 22) (t4vs-gpu cur) 0 0 0 0 0
-             (append (list (gpu fwd) (gpu bwd) (gpu fwd) (gpu bwd)) (make-list 13 :initial-element 0)))
+             (append (mapcar #'gpu slots) (make-list 13 :initial-element 0)))
       (out (logior +mfx-bsp-buf+ 2) (third rows) 0 0)
       (out (logior +mfx-mpeg2-pic+ 2)
            (logior (ash (aref f 1 1) 28) (ash (aref f 1 0) 24) (ash (aref f 0 1) 20) (ash (aref f 0 0) 16)
                    (ash (reel.mpeg2::ph-intra-dc-precision ph) 14)
-                   (ash (reel.mpeg2::ph-structure ph) 12)
-                   (ash (b01 (reel.mpeg2::ph-top-field-first ph)) 11)
+                   (ash st 12)
+                   (ash tff 11)
                    (ash (b01 (reel.mpeg2::ph-frame-pred-frame-dct ph)) 10)
                    (ash (b01 (reel.mpeg2::ph-concealment-motion-vectors ph)) 9)
                    (ash (b01 (reel.mpeg2::ph-q-scale-type ph)) 8)
                    (ash (b01 (reel.mpeg2::ph-intra-vlc-format ph)) 7)
                    (ash (b01 (reel.mpeg2::ph-alternate-scan ph)) 6))
            (ash type 9)
-           (logior (ash mbh 16) mbw))
+           (logior (ash (ceiling (t4md-height d) 16) 16) mbw))
       (loop for m in (list (reel.mpeg2::seq-intra-matrix seq) (reel.mpeg2::seq-non-intra-matrix seq))
             for i from 0
             do (apply #'out (logior +mfx-mpeg2-qm+ 16) i
@@ -128,7 +154,8 @@
       (loop for (s . rest) on (t4md-slices d)
             do (destructuring-bind (off size mbo row col q) s
                  (let* ((next (first rest))
-                        (row1 (if next (fourth next) mbh)) (col1 (if next (fifth next) 0))
+                        (row1 (if next (fourth next) (if field (floor (ceiling (t4md-height d) 16) 2) mbh)))
+                        (col1 (if next (fifth next) 0))
                         (count (- (+ (* row1 mbw) col1) (+ (* row mbw) col)))
                         (last (if next 0 1)))
                    (out (logior +mfd-mpeg2-bsd+ 3)
@@ -172,17 +199,21 @@
                                        (reel.mpeg2::make-br bytes :start payload :end next))))
                    ((= code #xB7) (%t4m-end-picture d))
                    ((<= 1 code #xAF)
-                    (unless (t4md-cur d)
+                    (when (null (t4md-slices d))                    ; a picture's first slice
                       (let ((seq (t4md-seq d)) (ph (t4md-ph d)))
                         (unless (and seq ph (reel.mpeg2::ph-mpeg2-p ph))
                           (error "t420 video: MPEG-1, or a slice before its headers"))
-                        (unless (= 3 (reel.mpeg2::ph-structure ph))
-                          (error "t420 video: field pictures are not done yet"))
                         (setf (t4md-width d) (reel.mpeg2::seq-width seq)
                               (t4md-height d) (reel.mpeg2::seq-height seq)
                               (t4md-mbw d) (reel.mpeg2::seq-mb-width seq)
-                              (t4md-mbh d) (reel.mpeg2::seq-mb-height seq)
-                              (t4md-cur d) (t4v-surface-new (t4md-mbw d) (t4md-mbh d)))))
+                              (t4md-mbh d) (reel.mpeg2::seq-mb-height seq))
+                        (let ((st (reel.mpeg2::ph-structure ph)) (half (t4md-half d)))
+                          (cond ((and half (/= st 3) (/= st (cdr half)))      ; the pair's second field
+                                 (setf (t4md-first-p d) nil))
+                                (t (when half                                  ; an unpaired field: drop it
+                                     (%t4m-free (t4md-cur d)) (setf (t4md-half d) nil))
+                                   (setf (t4md-first-p d) (/= st 3)
+                                         (t4md-cur d) (t4v-surface-new (t4md-mbw d) (t4md-mbh d))))))))
                     (multiple-value-bind (mbo q col) (%t4m-slice-header bytes i next)
                       (setf (t4md-slices d)
                             (append (t4md-slices d)

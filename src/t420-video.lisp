@@ -564,16 +564,21 @@
 
 ;;; ---- a player: the whole screen, until a key -------------------------------------------------
 
+(defun %t4v-first-code (bytes)
+  "The byte after the stream's first 00 00 01 (streams may open with zero padding), or NIL."
+  (loop for i from 0 below (min 64 (- (length bytes) 3))
+        do (cond ((and (zerop (aref bytes i)) (zerop (aref bytes (1+ i))) (= 1 (aref bytes (+ i 2))))
+                  (return (aref bytes (+ i 3))))
+                 ((/= 0 (aref bytes i)) (return nil)))))
+
 (defun t4v-mpeg2-p (bytes)
   "Does BYTES open as an MPEG-2 video elementary stream (a sequence header)?"
-  (and (> (length bytes) 4) (zerop (aref bytes 0)) (zerop (aref bytes 1)) (= 1 (aref bytes 2))
-       (= #xB3 (aref bytes 3))))
+  (eql #xB3 (%t4v-first-code bytes)))
 
 (defun t4v-vc1-p (bytes)
   "VC-1: an Advanced elementary stream (00 00 01 0F) or an RCV file (0xC5 in its fourth byte)?"
-  (and (> (length bytes) 8)
-       (or (and (zerop (aref bytes 0)) (zerop (aref bytes 1)) (= 1 (aref bytes 2)) (= #x0F (aref bytes 3)))
-           (and (= #xC5 (aref bytes 3)) (zerop (aref bytes 5))))))
+  (or (eql #x0F (%t4v-first-code bytes))
+      (and (> (length bytes) 8) (= #xC5 (aref bytes 3)) (zerop (aref bytes 5)))))
 
 (defun t4v-play (bytes &key (fps 25) (repeat 1))
   "Play BYTES -- an H.264 Annex B stream, MPEG-2 video, or VC-1 -- full screen at FPS, REPEAT times or until a key or a click.
