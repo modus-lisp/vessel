@@ -227,9 +227,13 @@
         (glass:fb-get fb x y)
         #x1E2530)))
 
+(defvar *t4-hw-pointer* nil
+  "A function of (X Y) that moves a hardware cursor (t420-gpu.lisp T4G-CURSOR-MOVE), or NIL for
+   the pointer drawn into the screen here.")
+
 (defun %t4-pointer-hide ()
   "Put back what the desk drew under the pointer: its 11 x 16 patch, copied from the desk's
-   framebuffer (the screen's own pixels are never read back)."
+   framebuffer (the screen's own pixels are never read back).  Nothing with a hardware cursor."
   (when *t4-under*
     (let ((fb (%t4-desk-fb)))
       (if fb
@@ -248,6 +252,9 @@
     (setf *t4-under* nil)))
 
 (defun %t4-pointer-show ()
+  (when *t4-hw-pointer*                     ; the display engine draws it: one register write
+    (funcall *t4-hw-pointer* *t4-px* *t4-py*)
+    (return-from %t4-pointer-show nil))
   (let ((x *t4-px*) (y *t4-py*))
     (dotimes (r 16)
       (let ((line (nth r *t4-arrow*)))

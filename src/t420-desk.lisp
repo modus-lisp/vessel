@@ -11,12 +11,31 @@
 
 (defvar *t4-ip* nil "The address the network pipeline got at boot (four octets), or why not.")
 
+(defvar *t4-beam-waits* 0 "Blits that waited for the scanout to leave their rows.")
+
+(defun %t4-beam-clear (y rows)
+  "TEAR-FREE: wait while the display is scanning rows Y .. Y+ROWS-1 (pipe A's scanline,
+   PIPEADSL).  The copy that follows writes a row in a few microseconds and the scanout takes
+   20.8 us a line, so a copy begun above or below the beam finishes before the beam reaches what
+   it changed: the screen never shows half of a change.  At most a frame (a full-screen copy
+   waits for vertical blank).  Intel display engine only (the native panel)."
+  (when *t4-native-on*
+    (let ((end (+ (get-internal-real-time) (floor internal-time-units-per-second 50))) (waited nil))
+      (loop
+        (let ((line (logand (t4-gpu-reg #x70000) #x1FFF)))
+          (when (or (< line y) (>= line (+ y rows))
+                    (>= (get-internal-real-time) end))
+            (return))
+          (setq waited t)))
+      (when waited (incf *t4-beam-waits*)))))
+
 (defun %kiln-blit-region (big k x0 y0 x y w h)
   "Show desk rectangle (X,Y,W,H), already magnified by K into BIG, at screen offset (X0,Y0)."
   (let* ((bw (glass:fb-width big)) (px (glass:fb-pixels big))
          (sx0 (+ x0 (* x k))) (sy0 (+ y0 (* y k)))
          (cols (min (* w k) (- *t4-w* sx0))) (rows (min (* h k) (- *t4-h* sy0))))
     (when (and (> cols 0) (> rows 0))
+      (%t4-beam-clear sy0 rows)
       (%t4-copy px bw (* x k) (* y k) cols rows sx0 sy0)
       ;; the pointer, if the copy went over it
       (when (and *t4-under*
@@ -56,6 +75,18 @@
   (when (fboundp 't4-usb-start)
     (t4-log "kiln t420: usb ~A" (handler-case (funcall 't4-usb-start) (error (c) (princ-to-string c)))))
   (setf *t4-px* (floor *t4-w* 2) *t4-py* (floor *t4-h* 2))
+  ;; the hardware cursor (t420-gpu.lisp), where there is an Intel display engine: the pointer
+  ;; is then a plane the display blends, not pixels written into the screen and put back
+  (when (and (fboundp 't4g-cursor-on) *t4-native-on*
+             (ignore-errors (funcall 't4g-cursor-on *t4-px* *t4-py*)))
+    (setf *t4-hw-pointer* (symbol-function 't4g-cursor-move))
+    (t4-log "kiln t420: hardware cursor")
+    ;; the blitter (t420-gpu.lisp): window moves copied on the screen by the GPU.  Only with the
+    ;; hardware cursor -- a pointer drawn into the screen would be copied along with the window
+    (if (ignore-errors (funcall 't4g-blitter-start))
+        (progn (setf *kiln-show-move* (symbol-function 't4g-show-move))
+               (t4-log "kiln t420: blitter ring running; window moves on the GPU"))
+        (t4-log "kiln t420: no blitter")))
   (t4-log "kiln t420: desk ~Dx~D, mouse ~:[off~;on~]" *t4-w* *t4-h* *t4-mouse-ok*)
   (t4-log-flush)
   (unwind-protect
