@@ -53,6 +53,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     float sky = 0.5 + 0.5 * n.y;                                   // light from above, a little from everywhere
     float3 base = picture.sample(s, in.uv).rgb * object.tint.rgb;
     float3 colour = base * (0.18 + 0.22 * sky + 0.75 * sun);
+    colour *= object.tint.a;                                       // a glow: past 1 is brighter than white (HDR)
     float d = distance(in.world, frame.eye.xyz);
     float fog = clamp((d - frame.fog.x) / (frame.fog.y - frame.fog.x), 0.0, 1.0);
     return float4(mix(colour, frame.fog_colour.rgb, fog), 1.0);
@@ -302,6 +303,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   map-window map-view map-arrow (map-shown nil)
   ;; the field of view, which a trackpad's pinch narrows and widens (radians)
   (fov (/ pi 3))
+  ;; HDR: whether the view draws extended range, and how much brighter than white the screen can go now
+  (hdr nil) (headroom 1.0)
   ;; THE LIGHT, the way it travels (toward the ground): a fixed afternoon, or the real sun's from where you are
   (light (list -0.5 -1.0 -0.35)) sun-label
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
@@ -686,7 +689,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
           (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
                       (mat* (translation 0 (middle-height a) 0)
                             (mat* (rotation-x (flip-turn g 8)) (mat* (rotation-y (* -0.5 a)) (scaling 1.8))))
-                      (floats 1.0 0.85 0.55 1))
+                      ;; glowing, on an HDR screen: brighter than white and back, as far as the screen goes
+                      (floats 1.0 0.85 0.55 (+ 1 (* (- (glow-peak g) 1) (+ 0.5 (* 0.5 (sin (* 2 a))))))))
           ;; over everything, while the head is followed: the head
           (when (or (game-head g) *head-demo*) (draw-head pass g w h))
           ;; and beside it, on a phone, the phone
@@ -936,10 +940,18 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (kiln-mac:on-drop (lambda (path) (on-picture g path)))
   (kiln-mac:on-open (lambda (path) (on-picture g path))))
 
+(defvar *glow* nil "HELLO3D_GLOW: the middle cube's peak, times SDR white, whatever the screen says its headroom is.")
+
+(defun glow-peak (g)
+  "How bright the middle cube gets at its brightest: the screen's headroom, or HELLO3D_GLOW's."
+  (if (game-hdr g) (or *glow* (game-headroom g)) 1.0))
+
 (defun start (&key touch)
   "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
   (let ((g (make-game :touch touch :scale (max 1 (%sys 1001 2 0 0)))))
-    (setf (game-view g) (kiln-gpu:gpu-view 0 0 0 0))
+    (setf (game-view g) (kiln-gpu:gpu-view 0 0 0 0)
+          (game-hdr g) (kiln-gpu:gpu-view-hdr (game-view g)))
+    (format t "~&hello3d: ~:[standard~;high~] dynamic range~%" (game-hdr g))
     (let ((shader (kiln-gpu:gpu-shader *shader*)))
       (setf (game-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "world_vertex" "world_fragment"))))
     (unless (game-pipeline g) (error "hello3d: the shader or its pipeline did not build (see the log)"))
@@ -983,6 +995,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (%sys 1003 0 0 0)
   (setf *head-demo* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_DEMO"))) (and v (plusp (length v)))))
   (setf *head-log* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_LOG"))) (and v (plusp (length v)))))
+  (setf *glow* (let ((v (modus-int::%cli-getenv "HELLO3D_GLOW")))
+                 (and v (plusp (length v)) (ignore-errors (let ((*read-eval* nil)) (float (read-from-string v) 1.0))))))
   (let ((g (start :touch touch)) (last (get-internal-real-time)))
     (format t "~&hello3d: running~%")
     (loop
@@ -1006,6 +1020,12 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
         (incf (game-frames g))
         (let ((since (/ (- now (game-fps-at g)) internal-time-units-per-second)))
           (when (>= since 0.5)
+            ;; the headroom changes as a TV goes into its HDR mode, or a Mac's window moves to another screen
+            (when (game-hdr g)
+              (let ((h (kiln-gpu:gpu-headroom)))
+                (unless (= h (game-headroom g))
+                  (format t "~&hello3d: headroom ~,2F~%" h) (finish-output)
+                  (setf (game-headroom g) h))))
             (kiln-swift:ui-set-text (game-fps-label g)
                                     (format nil "~D frames a second~:[~*~;  ·  watch~@[ ♥ ~D~]~]"
                                             (round (game-frames g) since) (watch-fresh-p g)
