@@ -417,16 +417,20 @@
 ;;; pass-through VS writes is header, position, colour; SF reads the colour (offset 1, length 1).
 
 (defparameter +t4g-tri-batch+ 65536)
-(defvar *t4g-tri* nil "The triangle batch: (gpu . cpu).")
+(defvar *t4g-tri* (vector nil nil) "Triangle batches, (gpu . cpu): one per draw queued at a time.")
 
-(defun t4g-draw-triangles (rt depth verts n &key (cull 1))
+(defun t4g-draw-triangles (rt depth verts n &key (cull 1) texture (batch 0))
   "Draw N triangles (VERTS: a list of 8-float vertices, 3N of them) into surface RT, depth-tested
-   against surface DEPTH (or none, NIL).  CULL is SF's cull mode (1 none, 3 back).  The breadcrumb."
-  (unless *t4g-tri*
-    (multiple-value-bind (g c) (t4g-alloc +t4g-tri-batch+) (setq *t4g-tri* (cons g c))))
-  (let* ((b (car *t4g-tri*)) (cpu (cdr *t4g-tri*)) (p 0)
-         (bt 1088) (ss 1120) (kern 1216) (vp 1600) (blend 1664) (ds 1728) (cc 1792) (vbase 4096)
-         (ps (t4g-ps-gouraud)))
+   against surface DEPTH (or none, NIL).  A vertex is a position and one attribute: a colour
+   (Gouraud), or with TEXTURE (a surface) the coordinates (u v - -) it is sampled at, bilinearly
+   (igt's sampling kernel).  CULL is SF's cull mode (1 none, 3 back).  BATCH picks the batch
+   buffer, so two draws can be queued at once.  The breadcrumb."
+  (unless (aref *t4g-tri* batch)
+    (multiple-value-bind (g c) (t4g-alloc +t4g-tri-batch+) (setf (aref *t4g-tri* batch) (cons g c))))
+  (let* ((b (car (aref *t4g-tri* batch))) (cpu (cdr (aref *t4g-tri* batch))) (p 0)
+         (bt 1088) (ss 1120) (ss2 1152) (kern 1216) (vp 1600) (blend 1664) (ds 1728) (cc 1792)
+         (sampler 1856) (vbase 4096)
+         (ps (if texture (append *t4g-ps-copy* (loop repeat 8 append +t4g-eu-nop+)) (t4g-ps-gouraud))))
     (flet ((w (off v) (t4g-w (+ cpu off) v)))
       ;; state
       (w bt ss)
@@ -434,6 +438,15 @@
       (w (+ ss 4) (t4s-gpu rt))
       (w (+ ss 8) (logior (ash (- (t4s-w rt) 1) 6) (ash (- (t4s-h rt) 1) 19)))
       (w (+ ss 12) (ash (- (t4s-pitch rt) 1) 3)) (w (+ ss 16) 0) (w (+ ss 20) 0)
+      (when texture                                                  ; B8G8R8X8: alpha reads as 1
+        (w (+ bt 4) ss2)
+        (w ss2 (logior (ash 1 29) (ash #x0E9 18)))
+        (w (+ ss2 4) (t4s-gpu texture))
+        (w (+ ss2 8) (logior (ash (- (t4s-w texture) 1) 6) (ash (- (t4s-h texture) 1) 19)))
+        (w (+ ss2 12) (ash (- (t4s-pitch texture) 1) 3)) (w (+ ss2 16) 0) (w (+ ss2 20) 0)
+        ;; bilinear, clamped (TEXCOORDMODE_CLAMP 2), GL's LOD preclamp
+        (w sampler (logior (ash 1 28) (ash 1 14) (ash 1 17)))
+        (w (+ sampler 4) (logior 2 (ash 2 3) (ash 2 6))) (w (+ sampler 8) 0) (w (+ sampler 12) 0))
       (loop for d in ps for o from kern by 4 do (w o d))
       (w vp #xF99A130C) (w (+ vp 4) #x799A130C)
       (w blend 0) (w (+ blend 4) 3)                                  ; no blending; clamp
@@ -471,10 +484,10 @@
         (out #x79100000 0)                                           ; CLEAR_PARAMS
         (out (logior #x79000000 2) 0 (logior (ash (- (t4s-h rt) 1) 16) (- (t4s-w rt) 1)) 0)
         (out (logior #x780E0000 2) (logior blend 1) (logior ds 1) (logior cc 1))
-        (out (logior #x78020000 (ash 1 12) 2) 0 0 0)                 ; no samplers
+        (out (logior #x78020000 (ash 1 12) 2) 0 0 (if texture sampler 0))
         (out (logior #x78130000 18) (logior (ash 1 22) (ash 1 11) (ash 1 4)) 0 (ash cull 29) (ash 2 25)
              0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)                          ; SF
-        (out (logior #x78140000 7) kern (ash 1 18) 0 (ash 6 16)
+        (out (logior #x78140000 7) kern (if texture (logior (ash 1 27) (ash 2 18)) (ash 1 18)) 0 (ash 6 16)
              (logior (ash 39 25) (ash 1 19) (ash 1 1)) (logior (ash 1 20) (ash 1 10)) 0 0)   ; WM
         (out (logior #x78090000 5)                                   ; header, position, colour
              (ash 1 25) (logior (ash 2 28) (ash 2 24) (ash 2 20) (ash 2 16))
@@ -498,15 +511,16 @@
 ;;; surface 0, is not touched: leaving flips back to it.
 
 (defvar *t4d* nil "The demo's surfaces: (front back depth).")
+(defvar *t4d-desk* nil "The desk's own screen as a texture: surface 0.")
 (defparameter *t4d-faces* '((0 2 6 4) (1 5 7 3) (0 4 5 1) (2 3 7 6) (0 1 3 2) (4 6 7 5)))
 
-(defun %t4d-cube (tris cx cy cz size ax ay az)
-  "TRIS with a cube's 12 triangles pushed on: centre (CX CY CZ), half-size SIZE, turned by AX AY AZ
-   (radians), projected to the screen (focal 900, near 1, far 60).  Corner I is (x y z) = bits of I,
-   and its colour is the same bits: the RGB cube."
+(defun %t4d-corners (cx cy cz size ax ay az)
+  "A cube's 8 corners, centre (CX CY CZ), half-size SIZE, turned by AX AY AZ (radians) and
+   projected to the screen (focal 900, near 1, far 60): a vector of (x y z w).  Corner I is
+   (x y z) = the bits of I."
   (let* ((sx (sin ax)) (cxa (cos ax)) (sy (sin ay)) (cya (cos ay)) (sz (sin az)) (cza (cos az))
          (pts (make-array 8)))
-    (dotimes (i 8)
+    (dotimes (i 8 pts)
       (let* ((x (if (logbitp 0 i) size (- size))) (y (if (logbitp 1 i) size (- size)))
              (z (if (logbitp 2 i) size (- size))))
         ;; around x, then y, then z
@@ -515,17 +529,31 @@
         (psetq x (- (* x cza) (* y sz)) y (+ (* x sz) (* y cza)))
         (let ((wx (+ x cx)) (wy (+ y cy)) (wz (+ z cz)))
           (setf (aref pts i)
-                (list (+ 683 (/ (* 900 wx) wz)) (- 384 (/ (* 900 wy) wz)) (/ (- wz 1) 59) 1.0
-                      (if (logbitp 0 i) 1.0 0.15) (if (logbitp 1 i) 1.0 0.15)
-                      (if (logbitp 2 i) 1.0 0.15) 1.0)))))
-    (dolist (f *t4d-faces* tris)
-      (destructuring-bind (a b c d) f
-        (push (aref pts a) tris) (push (aref pts b) tris) (push (aref pts c) tris)
-        (push (aref pts a) tris) (push (aref pts c) tris) (push (aref pts d) tris)))))
+                (list (+ 683 (/ (* 900 wx) wz)) (- 384 (/ (* 900 wy) wz)) (/ (- wz 1) 59) 1.0)))))))
+
+(defun %t4d-cube (tris cx cy cz size ax ay az)
+  "TRIS with a cube's 12 triangles pushed on, each corner coloured by its bits: the RGB cube."
+  (let ((pts (%t4d-corners cx cy cz size ax ay az)))
+    (flet ((v (i) (append (aref pts i)
+                          (list (if (logbitp 0 i) 1.0 0.15) (if (logbitp 1 i) 1.0 0.15)
+                                (if (logbitp 2 i) 1.0 0.15) 1.0))))
+      (dolist (f *t4d-faces* tris)
+        (destructuring-bind (a b c d) f
+          (push (v a) tris) (push (v b) tris) (push (v c) tris)
+          (push (v a) tris) (push (v c) tris) (push (v d) tris))))))
+
+(defun %t4d-cube-textured (cx cy cz size ax ay az)
+  "A cube's 12 triangles, each face carrying texture coordinates over the whole texture."
+  (let ((pts (%t4d-corners cx cy cz size ax ay az)) (tris nil))
+    (flet ((v (i u vv) (append (aref pts i) (list u vv 0.0 0.0))))
+      (dolist (f *t4d-faces* tris)
+        (destructuring-bind (a b c d) f
+          (push (v a 0.0 1.0) tris) (push (v b 1.0 1.0) tris) (push (v c 1.0 0.0) tris)
+          (push (v a 0.0 1.0) tris) (push (v c 1.0 0.0) tris) (push (v d 0.0 0.0) tris))))))
 
 (defun %t4d-scene (s)
-  "The vertices of the scene at S seconds."
-  (let ((tris (%t4d-cube nil 0 0 9 1.5 (* s 0.7) (* s 1.1) (* s 0.3))))
+  "The Gouraud vertices of the scene at S seconds (the four orbiting cubes)."
+  (let ((tris nil))
     (dotimes (k 4 tris)
       (let ((a (+ (* s 0.8) (* k (/ pi 2)))))
         (setq tris (%t4d-cube tris (* 3.4 (cos a)) (* 1.2 (sin a)) (+ 9 (* 3.4 (sin a))) 0.7
@@ -553,6 +581,7 @@
   (unless *t4g-rcs* (t4g-render-start))
   (unless *t4d*
     (setq *t4d* (list (t4g-surface-new 1366 768) (t4g-surface-new 1366 768) (t4g-surface-new 1366 768))))
+  (setq *t4d-desk* (make-t4g-surface :gpu 0 :cpu nil :w *t4-w* :h *t4-h* :pitch *t4-pitch*))
   (destructuring-bind (a b depth) *t4d*
     (let* ((t0 (get-internal-real-time)) (hz internal-time-units-per-second)
            (frames 0) (back a) (bg #x0B1020) (one (t4g-f32 1.0)))
@@ -565,8 +594,11 @@
                  (return (list frames (float s))))
                (t4g-blt-clear back bg)
                (t4g-wait *t4g-blt* (t4g-blt-clear depth one) 100)
-               (let ((verts (%t4d-scene s)))
-                 (t4g-wait *t4g-rcs* (t4g-draw-triangles back depth verts (floor (length verts) 3)) 100))
+               ;; the orbiting cubes, Gouraud; the middle one wears the desk (surface 0) as a texture
+               (let ((verts (%t4d-scene s))
+                     (box (%t4d-cube-textured 0 0 9 1.5 (* s 0.7) (* s 1.1) (* s 0.3))))
+                 (t4g-draw-triangles back depth verts (floor (length verts) 3))
+                 (t4g-wait *t4g-rcs* (t4g-draw-triangles back depth box 12 :texture *t4d-desk* :batch 1) 100))
                (%t4d-flip back)
                (setq back (if (eq back a) b a))
                (incf frames)))
