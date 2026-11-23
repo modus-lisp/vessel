@@ -208,3 +208,147 @@
             (apply '%kiln-blit-region fb 1 0 0 b))
           (incf *t4g-moves*)
           t)))))
+
+;;; ---- stage 3: the render engine ----------------------------------------------------------------------
+;;; The 3D pipeline, first drawn on the T420 2026-11-23: a 256x128 texture onto the screen through
+;;; vertex fetch, a pass-through VS, setup (SF), the windower (WM), a pixel shader and the sampler --
+;;; intel-gpu-tools' gen 6 render copy (lib/rendercopy_gen6.c), command for command.
+;;;
+;;; THE RING'S SETUP is Linux 5.4's for gen 6 (init_render_ring, gen6_init_clock_gating): MI_MODE,
+;;; GFX_MODE, CACHE_MODE_0, INSTPM, the 3D chickens, GT_MODE's WIZ hashing, the unit clock gating.
+;;; Masked registers: the high half says which bits the low half writes.
+;;;
+;;; PIPE_CONTROL ON GEN 6 needs its workarounds (Linux gen6_emit_post_sync_nonzero_flush): a CS stall
+;;; at the scoreboard, then a post-sync write, before any flush with a post-sync operation; the
+;;; writes go to a scratch page.  The breadcrumb is a flushing PIPE_CONTROL that writes the sequence
+;;; number into the status page.
+;;;
+;;; A BATCH is one GPU page set: commands from 0, the state the commands point at from 1088
+;;; (binding table, surface states, the kernel, the sampler, the CC viewport, the blend state --
+;;; STATE_BASE_ADDRESS makes every pointer an offset into the batch), the RECTLIST's three vertices
+;;; after the commands, and offset 1024 left zero for the depth-stencil and colour-calc states.  It
+;;; is started from the ring with MI_BATCH_BUFFER_START through the global GTT (no PPGTT here, so
+;;; not the "non-secure" form Linux uses).
+;;;
+;;; THE PIXEL SHADER is intel-gpu-tools' ps_kernel_nomask_affine (MIT licence, Intel): interpolate
+;;; (u,v), sample, write the render target.  Writing our own kernels needs an EU assembler: next.
+
+ ;; ---- the render engine (RCS, base #x2000): gen 6 setup, as Linux 5.4's init_render_ring and
+ ;; gen6_init_clock_gating program it.  Masked registers: the high half says which bits to write.
+ (defun %t4r-masked (on off) (logior (ash (logior on off) 16) on))
+ (defun t4g-render-setup ()
+   (t4-gpu-set #x209C (%t4r-masked (logior (ash 1 6) (ash 1 14)) 0))     ; MI_MODE: VS timer, no async-flip perf
+   (t4-gpu-set #x2520 (%t4r-masked (ash 1 13) 0))                        ; GFX_MODE: explicit TLB invalidation
+   (t4-gpu-set #x2120 (%t4r-masked 0 (logior (ash 1 5) 1)))              ; CACHE_MODE_0: no LRA, no RC op flush
+   (t4-gpu-set #x20C0 (%t4r-masked (ash 1 7) 0))                         ; INSTPM: force ordering
+   (t4-gpu-set #x2084 (%t4r-masked (ash 1 10) 0))                        ; _3D_CHICKEN: no HiZ with MSAA 4x
+   (t4-gpu-set #x20D0 (logior (ash (logior (ash 1 9) (ash 1 7)) 16) (ash 1 9)))   ; GT_MODE: WIZ hashing 16x4
+   (t4-gpu-set #x9400 (logior (t4-gpu-reg #x9400) (ash 1 5) (ash 1 7)))  ; UCGCTL1
+   (t4-gpu-set #x9404 (logior (ash 1 12) (ash 1 11)))                    ; UCGCTL2
+   (t4-gpu-set #x2090 (%t4r-masked (logior (ash 1 5) (ash 1 1)) 0)))     ; _3D_CHICKEN3
+ (defvar *t4g-rcs* nil)
+ (defvar *t4g-scratch* nil)
+ (defun t4g-render-start ()
+   (t4g-forcewake)
+   (t4g-render-setup)
+   (setq *t4g-scratch* (t4g-alloc 4096))
+   (setq *t4g-rcs* (t4g-ring-start #x2000 "render")))
+ ;; ---- PIPE_CONTROL, with the gen 6 workarounds (Linux: gen6_emit_post_sync_nonzero_flush)
+ (defconstant +pc4+ #x7A000002)   ; GFX_OP_PIPE_CONTROL(4)
+ (defun %t4r-pc (r flags addr data)
+   (t4g-emit r (list +pc4+ flags addr data)))
+ (defun %t4r-post-sync-nonzero (r)
+   (%t4r-pc r (logior (ash 1 20) (ash 1 1)) 0 0)                          ; CS stall + stall at scoreboard
+   (%t4r-pc r (ash 1 14) (logior *t4g-scratch* 4) 0))                     ; QW write to scratch (global GTT)
+ (defun t4g-render-invalidate (r)
+   (%t4r-post-sync-nonzero r)
+   (%t4r-pc r (logior (ash 1 18) (ash 1 11) (ash 1 10) (ash 1 4) (ash 1 3) (ash 1 2) (ash 1 14) (ash 1 20))
+            (logior *t4g-scratch* 4) 0))
+ (defun t4g-render-breadcrumb (r)
+   (let ((seq (incf (t4r-seq r))))
+     (%t4r-post-sync-nonzero r)
+     (%t4r-pc r (logior (ash 1 12) (ash 1 0) (ash 1 5) (ash 1 14) (ash 1 20))
+              (logior (+ (t4r-hws r) (* 4 #x20)) 4) seq)
+     seq))
+ ;; ---- a batch: commands from 0, state from 1088, vertices after the commands
+ (defvar *t4g-batch* nil) (defvar *t4g-batch-cpu* nil)
+ (defparameter +t4b-size+ 8192)
+ (defun %bw (off v) (t4g-w (+ *t4g-batch-cpu* off) v))
+ (defparameter *t4g-ps-copy*        ; igt-gpu-tools lib/rendercopy_gen6.c ps_kernel_nomask_affine (MIT)
+   '(#x0060005a #x204077be #x000000c0 #x008d0040  #x0060005a #x206077be #x000000c0 #x008d0080
+     #x0060005a #x208077be #x000000d0 #x008d0040  #x0060005a #x20a077be #x000000d0 #x008d0080
+     #x00000201 #x20080061 #x00000000 #x00000000  #x00600001 #x20200022 #x008d0000 #x00000000
+     #x02800031 #x21c01cc9 #x00000020 #x0a8a0001  #x00600001 #x204003be #x008d01c0 #x00000000
+     #x00600001 #x206003be #x008d01e0 #x00000000  #x00600001 #x208003be #x008d0200 #x00000000
+     #x00600001 #x20a003be #x008d0220 #x00000000  #x00600001 #x20c003be #x008d0240 #x00000000
+     #x00600001 #x20e003be #x008d0260 #x00000000  #x00600001 #x210003be #x008d0280 #x00000000
+     #x00600001 #x212003be #x008d02a0 #x00000000  #x05800031 #x24001cc8 #x00000040 #x90019000))
+ (defun %t4r-surface (off gpu w h pitch)
+   (%bw off (logior (ash 1 29) (ash #x0C0 18) (ash 1 13)))   ; 2D, B8G8R8A8_UNORM, colour blend
+   (%bw (+ off 4) gpu)
+   (%bw (+ off 8) (logior (ash (- w 1) 6) (ash (- h 1) 19)))
+   (%bw (+ off 12) (ash (- pitch 1) 3))
+   (%bw (+ off 16) 0) (%bw (+ off 20) 0))
+ (defun t4g-render-copy (src sw sh spitch dst dw dh dpitch dx dy)
+   "SRC (SW x SH) onto DST at (DX,DY), through the 3D pipeline.  The breadcrumb."
+   (unless *t4g-batch*
+     (multiple-value-bind (g c) (t4g-alloc +t4b-size+) (setq *t4g-batch* g *t4g-batch-cpu* c)))
+   (dotimes (i (/ +t4b-size+ 4)) (%bw (* 4 i) 0))
+   (let* ((b *t4g-batch*) (bt 1088) (ss-dst 1120) (ss-src 1152) (kern 1216)
+          (sampler (+ kern (* 4 (length *t4g-ps-copy*)))) (vp (+ sampler 32)) (blend 1728)
+          (p 0))
+     ;; state
+     (%bw bt ss-dst) (%bw (+ bt 4) ss-src)
+     (%t4r-surface ss-dst dst dw dh dpitch)
+     (%t4r-surface ss-src src sw sh spitch)
+     (loop for d in *t4g-ps-copy* for o from kern by 4 do (%bw o d))
+     (%bw sampler (logior (ash 1 28) (ash 1 29))) (%bw (+ sampler 4) (logior 4 (ash 4 3) (ash 4 6)))
+     (%bw vp #xF99A130C) (%bw (+ vp 4) #x799A130C)
+     (%bw blend (logior #x11 (ash 1 5) (ash 1 31))) (%bw (+ blend 4) 3)
+     ;; commands
+     (flet ((out (&rest ds) (dolist (d ds) (%bw p d) (incf p 4))))
+       (out #x69040000)                                           ; PIPELINE_SELECT 3D
+       (out (logior #x790D0000 1) 0 0)                            ; 3DSTATE_MULTISAMPLE
+       (out #x78180000 1)                                         ; 3DSTATE_SAMPLE_MASK
+       (out (logior #x61010000 8) 0 (logior b 1) (logior b 1) 0 (logior b 1) 0 1 0 1)   ; STATE_BASE_ADDRESS
+       (out #x61020000 0)                                         ; STATE_SIP
+       (out (logior #x78050000 1) 24 0)                           ; 3DSTATE_URB: 24 VS entries
+       (out (logior #x780D0000 (ash 1 12) 2) 0 0 vp)              ; VIEWPORT_STATE_POINTERS (CC)
+       (out (logior #x78150000 3) 0 0 0 0)                        ; CONSTANT_VS
+       (out (logior #x78100000 4) 0 0 0 0 0)                      ; 3DSTATE_VS: pass-through
+       (out (logior #x78160000 3) 0 0 0 0)                        ; CONSTANT_GS
+       (out (logior #x78110000 5) 0 0 0 0 0 0)                    ; 3DSTATE_GS
+       (out (logior #x78120000 2) 0 0 0)                          ; 3DSTATE_CLIP
+       (out (logior #x78170000 3) 0 0 0 0)                        ; CONSTANT_PS
+       (out (logior #x79050000 5) (logior (ash 7 29) (ash 1 18)) 0 0 0 0 0)   ; null depth buffer
+       (out #x79100000 0)                                         ; CLEAR_PARAMS
+       (out (logior #x79000000 2) 0 (logior (ash (- dh 1) 16) (- dw 1)) 0)   ; DRAWING_RECTANGLE
+       (out (logior #x780E0000 2) (logior blend 1) (logior 1024 1) (logior 1024 1))   ; CC_STATE_POINTERS
+       (out (logior #x78020000 (ash 1 12) 2) 0 0 sampler)         ; SAMPLER_STATE_POINTERS (PS)
+       (out (logior #x78130000 18) (logior (ash 1 22) (ash 1 11) (ash 1 4)) 0 (ash 1 29) (ash 2 25)
+            0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)                          ; 3DSTATE_SF
+       (out (logior #x78140000 7) kern (logior (ash 1 27) (ash 2 18)) 0 (ash 6 16)
+            (logior (ash 39 25) (ash 1 19) (ash 1 1)) (logior (ash 1 20) (ash 1 10)) 0 0)   ; 3DSTATE_WM
+       (out (logior #x78090000 5)                                 ; VERTEX_ELEMENTS: pad, x y, u v
+            (logior (ash 1 25) (ash #x000 16)) (logior (ash 2 28) (ash 2 24) (ash 2 20) (ash 2 16))
+            (logior (ash 1 25) (ash #x0F6 16)) (logior (ash 1 28) (ash 1 24) (ash 3 20) (ash 3 16))
+            (logior (ash 1 25) (ash #x085 16) 4) (logior (ash 1 28) (ash 1 24) (ash 2 20) (ash 2 16)))
+       (out (logior #x78010000 (ash 1 12) 2) 0 0 bt)              ; BINDING_TABLE_POINTERS (PS)
+       (out (logior #x78080000 3) (logior 12) b (+ b +t4b-size+ -1) 0)   ; VERTEX_BUFFERS: pitch 12
+       (let ((vstart (* 12 (ceiling (+ p 32) 12))))               ; after the primitive and BB_END
+         (out (logior #x7B000000 (ash #x0F 10) 4) 3 (/ vstart 12) 1 0 0)   ; 3DPRIMITIVE RECTLIST
+         (out (ash #x0A 23) 0)                                    ; MI_BATCH_BUFFER_END
+         ;; three corners: (x,y) as two int16, then (u,v)
+         (loop for (x y u v) in (list (list (+ dx sw) (+ dy sh) #x3F800000 #x3F800000)
+                                      (list dx (+ dy sh) 0 #x3F800000)
+                                      (list dx dy 0 0))
+               for o from vstart by 12
+               do (%bw o (logior (ash y 16) x)) (%bw (+ o 4) u) (%bw (+ o 8) v)))))
+   ;; submit: invalidate, the batch, breadcrumb
+   (let ((r *t4g-rcs*))
+     (t4g-render-invalidate r)
+     (t4g-emit r (list (ash #x31 23) *t4g-batch*))   ; MI_BATCH_BUFFER_START: global GTT (no PPGTT here)
+     (let ((seq (t4g-render-breadcrumb r)))
+       (t4g-submit r)
+       seq)))
+ 
