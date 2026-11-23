@@ -272,6 +272,11 @@
   (*wait-object* "kernel32.dll" "WaitForSingleObjectEx")
   (*get-raw-input* "user32.dll" "GetRawInputData")
   (*register-raw-input* "user32.dll" "RegisterRawInputDevices")
+  (*co-initialize* "ole32.dll" "CoInitializeEx")
+  (*co-create* "ole32.dll" "CoCreateInstance")
+  (*create-event* "kernel32.dll" "CreateEventW")
+  (*set-thread-priority* "kernel32.dll" "SetThreadPriority")
+  (*wait-single* "kernel32.dll" "WaitForSingleObject")
   (*set-process-info* "kernel32.dll" "SetProcessInformation" :optional)
   (*current-process* "kernel32.dll" "GetCurrentProcess")
   (*get-message* "user32.dll" "GetMessageW")
@@ -935,7 +940,7 @@
     (setf *timers* (remove-if (lambda (tm) (when (<= (car tm) now) (push (cdr tm) due) t)) *timers*))
     (dolist (fn due) (ignore-errors (funcall fn)))))
 
-(defvar *speaker* nil "The speaker (W32-AUDIO-OPEN's), once opened.")
+(defvar *speaker* nil "The speaker: :WASAPI, or W32-AUDIO-OPEN's waveOut speaker, once opened.")
 
 (defun feed-speaker ()
   "Top the speaker up (sound.lisp's SOUND-PUMP), if the app has one."
@@ -1773,48 +1778,177 @@
                             (modus-int::wrt-release ctx pos))))))))))))
 
 ;;; ---- the speaker -----------------------------------------------------------------------------------------------------
+;;;
+;;; THE APP KEEPS A RING FED, A NATIVE THREAD KEEPS THE DEVICE FED -- modus's host/macos/modus-audio.c, on WASAPI.
+;;; 1011 only copies samples into a ring in native memory; a thread of native code written here (no Lisp) waits on the
+;;; device's event, asks how much room it has (GetCurrentPadding), and copies that much from the ring (GetBuffer /
+;;; ReleaseBuffer).  Nothing on the app's thread calls the audio system, so a slow frame or a collection costs the
+;;; speaker nothing while the ring holds out, and the device's own clock sets the pace.  Shared mode, 16-bit 48 kHz
+;;; stereo as sound.lisp mixes it; Windows converts to the device's own format (AUTOCONVERTPCM).  If WASAPI will not
+;;; start, waveOut (net/win32-audio.lisp) as before.
+;;;
+;;; The block: +#x00 WaitForSingleObject  +#x08 memcpy  +#x10 the event  +#x18 IAudioClient  +#x20 IAudioRenderClient
+;;; +#x28 the device buffer's frames  +#x30 the ring  +#x38 its size - 1  +#x40 bytes ever written (dword, the app's)
+;;; +#x48 bytes ever read (dword, the thread's)  +#x50 the device's padding (frames)  +#x58 underruns: times the device
+;;; was empty with nothing in the ring, once sound had begun  +#x68 a padding cell  +#x70 a buffer pointer cell
+;;; +#x78 frames being copied  +#x80 stop  +#x100 the code.  The two counters are dwords, so each side reads and
+;;; writes them whole, and wrap with the ring (its size divides 2^32).
+;;; IAudioClient 3 Initialize, 4 GetBufferSize, 6 GetCurrentPadding, 10 Start, 13 SetEventHandle, 14 GetService;
+;;; IAudioRenderClient 3 GetBuffer, 4 ReleaseBuffer; IMMDeviceEnumerator 4 GetDefaultAudioEndpoint; IMMDevice 3 Activate.
 
-(defvar *speaker* nil)
+(defvar *speaker* nil "The speaker: :WASAPI, or W32-AUDIO-OPEN's waveOut speaker, once opened.")
+(defvar *wa* 0 "The WASAPI block.")
+(defconstant +ring-bytes+ (ash 1 20))
 (defvar *pcm* nil)
+
+(defun wasapi-code ()
+  (let ((jne '(#x0F #x85)) (je '(#x0F #x84)) (js '(#x0F #x88)) (jle '(#x0F #x8E)) (jbe '(#x0F #x86)) (jmp '(#xE9)))
+    (assemble
+     `(#x53 #x56 #x57 #x48 #x83 #xEC #x30          ; push rbx/rsi/rdi; sub rsp,0x30
+       #x48 #x89 #xCB                              ; mov rbx,rcx    the block
+       (:label :loop)
+       #x48 #x83 #xBB #x80 #x00 #x00 #x00 #x00 (:j ,jne :out)    ; stop?
+       #x48 #x8B #x4B #x10 #xBA #x64 #x00 #x00 #x00 #xFF #x13    ; WaitForSingleObject(event, 100)
+       #x48 #x8B #x4B #x18 #x48 #x8D #x53 #x68     ; rcx client, rdx &padding
+       #x48 #x8B #x01 #xFF #x50 #x30               ; GetCurrentPadding
+       #x85 #xC0 (:j ,js :loop)
+       #x8B #x43 #x68 #x48 #x89 #x43 #x50          ; padding -> +0x50
+       #x48 #x8B #x73 #x28 #x48 #x29 #xC6 (:j ,jle :loop)        ; rsi = room (frames)
+       #x8B #x7B #x40 #x2B #x7B #x48 #xC1 #xEF #x02              ; edi = frames in the ring
+       #x85 #xFF (:j ,jne :have)
+       #x48 #x83 #x7B #x50 #x00 (:j ,jne :loop)    ; the device still has some: not a gap
+       #x83 #x7B #x40 #x00 (:j ,je :loop)          ; nothing ever written: not begun
+       #x48 #xFF #x43 #x58 (:j ,jmp :loop)         ; an underrun
+       (:label :have)
+       #x48 #x39 #xFE (:j ,jbe :keep) #x48 #x89 #xFE   ; rsi = min(room, ring)
+       (:label :keep)
+       #x48 #x89 #x73 #x78                         ; frames -> +0x78
+       #x48 #x8B #x4B #x20 #x89 #xF2 #x4C #x8D #x43 #x70   ; rcx render, edx frames, r8 &data
+       #x48 #x8B #x01 #xFF #x50 #x18               ; GetBuffer
+       #x85 #xC0 (:j ,js :loop)
+       #x48 #x8B #x73 #x78 #x48 #xC1 #xE6 #x02     ; rsi = bytes
+       #x8B #x43 #x48 #x48 #x23 #x43 #x38          ; rax = read offset in the ring
+       #x48 #x8B #x7B #x38 #x48 #xFF #xC7 #x48 #x29 #xC7   ; rdi = ring size - offset
+       #x48 #x39 #xF7 (:j ,jbe :first) #x48 #x89 #xF7      ; rdi = min(that, bytes)
+       (:label :first)
+       #x48 #x8B #x4B #x70 #x48 #x8B #x53 #x30 #x48 #x01 #xC2 #x49 #x89 #xF8 #xFF #x53 #x08   ; memcpy(data, ring+off, rdi)
+       #x49 #x89 #xF0 #x49 #x29 #xF8 (:j ,je :copied)      ; the rest, from the ring's start
+       #x48 #x8B #x4B #x70 #x48 #x01 #xF9 #x48 #x8B #x53 #x30 #xFF #x53 #x08
+       (:label :copied)
+       #x01 #x73 #x48                              ; read += bytes (dword)
+       #x48 #x8B #x4B #x20 #x8B #x53 #x78 #x45 #x31 #xC0   ; rcx render, edx frames, r8 0
+       #x48 #x8B #x01 #xFF #x50 #x20               ; ReleaseBuffer
+       (:j ,jmp :loop)
+       (:label :out)
+       #x48 #x83 #xC4 #x30 #x5F #x5E #x5B #x31 #xC0 #xC3))))
+
+(defun wasapi-open (rate channels)
+  "WASAPI on the default output, its feeding thread started; T, or NIL (and why) if it cannot be."
+  (c *co-initialize* 0 0)                                            ; this thread in the multithreaded apartment
+  (flet ((fail (why) (format t "~&vessel-windows: WASAPI: ~A; waveOut instead~%" why) (return-from wasapi-open nil))
+         (ok (hr) (not (failed-p hr))))
+    (let ((g1 (area 1)) (g2 (area 2)) (enum 0) (dev 0) (client 0) (render 0))
+      (modus-int::w32-put-guid g1 "BCDE0395-E52F-467C-8E3D-C4579291692E")
+      (modus-int::w32-put-guid g2 "A95664D2-9614-4F35-A746-DE8DB63617E6")
+      (unless (ok (c *co-create* g1 0 23 g2 (out0))) (fail "no device enumerator"))
+      (setf enum (peek64 (cell 0)))
+      (unless (ok (m enum 4 0 0 (out0))) (release enum) (fail "no default output"))    ; eRender, eConsole
+      (setf dev (peek64 (cell 0)))
+      (release enum)
+      (modus-int::w32-put-guid g1 "1CB9AD4C-DBFA-4C32-B178-C2F568A703B2")
+      (unless (ok (m dev 3 g1 23 0 (out0))) (release dev) (fail "no audio client"))
+      (setf client (peek64 (cell 0)))
+      (release dev)
+      (let ((wf (area 0)))                                               ; WAVEFORMATEX: PCM, 16-bit
+        (zero wf 20)
+        (poke16 wf 1) (poke16 (+ wf 2) channels) (poke32 (+ wf 4) rate) (poke32 (+ wf 8) (* rate channels 2))
+        (poke16 (+ wf 12) (* channels 2)) (poke16 (+ wf 14) 16)
+        ;; shared; EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY; a 30 ms device buffer
+        (unless (ok (m client 3 0 #x88040000 300000 0 wf 0)) (release client) (fail "Initialize refused")))
+      (let ((event (c *create-event* 0 0 0 0)))
+        (m client 13 event)                                              ; SetEventHandle
+        (poke32 (cell 1) 0)
+        (m client 4 (cell 1))                                            ; GetBufferSize
+        (modus-int::w32-put-guid g1 "F294ACFC-3146-4483-A7BF-ADDCA7C260E2")
+        (unless (ok (m client 14 g1 (out0))) (release client) (fail "no render client"))
+        (setf render (peek64 (cell 0)))
+        (let ((block (modus-int::w32-alloc #x1000 t)) (ring (modus-int::w32-alloc +ring-bytes+)))
+          (poke64 block *wait-single*) (poke64 (+ block 8) *memcpy*) (poke64 (+ block #x10) event)
+          (poke64 (+ block #x18) client) (poke64 (+ block #x20) render) (poke64 (+ block #x28) (peek32 (cell 1)))
+          (poke64 (+ block #x30) ring) (poke64 (+ block #x38) (- +ring-bytes+ 1))
+          (loop for b in (wasapi-code) for i from 0 do (poke8 (+ block #x100 i) b))
+          (setf *wa* block)
+          (let ((thread (c *create-thread* 0 0 (+ block #x100) block 0 0)))
+            (c *set-thread-priority* thread 2))                          ; THREAD_PRIORITY_HIGHEST
+          (unless (ok (m client 10)) (fail "Start refused"))             ; Start
+          (format t "~&vessel-windows: speaker: WASAPI, a ~D-frame device buffer, fed by its own thread~%"
+                  (peek32 (cell 1)))
+          t)))))
 
 (defun audio-open (rate channels)
   (unless *speaker*
-    (setf *speaker* (modus-int::w32-audio-open rate (max 1 channels)))
-    nil)
+    (setf *speaker* (or (and (not (equal (modus-int::%cli-getenv "VESSEL_WAVEOUT") "1"))
+                             (ignore-errors (wasapi-open rate (max 1 channels)))
+                             :wasapi)
+                        (modus-int::w32-audio-open rate (max 1 channels))))
+    (when (and *speaker* (not (eq *speaker* :wasapi)) (not (= *wa* 0))) nil))
   (if *speaker* 0 -1))
 
-;;; GAPS, COUNTED (1013, as the Mac's AUDIO-UNDERRUNS): a write that finds nothing queued, once sound has begun,
-;;; means the speaker ran dry and played silence -- a gap someone hears.  A write that finds every buffer still
-;;; playing is dropped.  Both are counted, and a line logged each second either grows.
+(defun wasapi-p () (eq *speaker* :wasapi))
+
+(defun ring-filled () (logand (- (peek32 (+ *wa* #x40)) (peek32 (+ *wa* #x48))) #xFFFFFFFF))
+
+;;; GAPS, COUNTED (1013, as the Mac's AUDIO-UNDERRUNS).  WASAPI: the feeding thread counts each time the device was
+;;; empty with nothing in the ring.  waveOut: a write that finds nothing queued, once sound has begun.  A write that
+;;; finds no room is dropped.  Both are counted, and a line logged each second either grows.
 
 (defvar *audio-started* nil)
-(defvar *audio-gaps* 0 "Writes that found the speaker dry: each a gap heard.")
-(defvar *audio-dropped* 0 "Writes dropped: every buffer was still playing.")
+(defvar *audio-gaps* 0 "waveOut: writes that found the speaker dry.")
+(defvar *audio-dropped* 0 "Writes dropped: no room.")
 (defvar *audio-said* (list 0 0))
 (defvar *audio-least* nil "The fewest frames found queued at a write this second.")
 (defvar *audio-seams* 0 "Chunk boundaries this second where a channel jumped more than 1/16 of full scale: a click.")
 (defvar *audio-last* (list 0 0) "The last chunk's last left and right samples.")
 
+(defun audio-gap-count () (if (wasapi-p) (peek64 (+ *wa* #x58)) *audio-gaps*))
+
 (defun audio-write (src n)
   "N samples from SRC, a simple-vector of fixnums as modus stores them (value<<1 a word)."
-  (if (null *speaker*)
-      -1
-      (progn
-        (let ((q (modus-int::w32-audio-queued *speaker*)))
-          (when (and *audio-started* (zerop q)) (incf *audio-gaps*))
-          (setf *audio-least* (if *audio-least* (min *audio-least* q) q)))
-        (unless (and *pcm* (= (length *pcm*) n)) (setf *pcm* (make-array n :initial-element 0)))
-        (dotimes (i n)
-          (setf (aref *pcm* i) (ash (s32 (peek32 (+ src (* 8 i)))) -1)))
-        (when (>= n 2)
-          (when (or (> (abs (- (aref *pcm* 0) (first *audio-last*))) 2048)
-                    (> (abs (- (aref *pcm* 1) (second *audio-last*))) 2048))
-            (incf *audio-seams*))
-          (setf *audio-last* (list (aref *pcm* (- n 2)) (aref *pcm* (- n 1)))))
-        (if (modus-int::w32-audio-write *speaker* *pcm*)
-            (progn (setf *audio-started* t) n)
-            (progn (incf *audio-dropped*) 0)))))
-
+  (cond
+    ((null *speaker*) -1)
+    ((wasapi-p)
+     (let* ((wr (peek32 (+ *wa* #x40))) (ring (peek64 (+ *wa* #x30))) (mask (- +ring-bytes+ 1))
+            (q (floor (+ (ring-filled) (* 4 (peek64 (+ *wa* #x50)))) 4)))
+       (setf *audio-least* (if *audio-least* (min *audio-least* q) q))
+       (if (> (+ (ring-filled) (* 2 n)) +ring-bytes+)
+           (progn (incf *audio-dropped*) 0)
+           (let ((l0 0) (r0 0) (l 0) (r 0))
+             ;; a stereo frame a dword: left low, right high
+             (loop for i from 0 below n by 2
+                   do (setf l (ash (s32 (peek32 (+ src (* 8 i)))) -1)
+                            r (ash (s32 (peek32 (+ src (* 8 (+ i 1))))) -1))
+                      (when (= i 0) (setf l0 l r0 r))
+                      (poke32 (+ ring (logand (+ wr (* 2 i)) mask)) (logior (logand l #xFFFF) (ash (logand r #xFFFF) 16))))
+             (when (or (> (abs (- l0 (first *audio-last*))) 2048) (> (abs (- r0 (second *audio-last*))) 2048))
+               (incf *audio-seams*))
+             (setf *audio-last* (list l r))
+             (poke32 (+ *wa* #x40) (logand (+ wr (* 2 n)) #xFFFFFFFF))   ; written, after the samples
+             n))))
+    (t
+     (let ((q (modus-int::w32-audio-queued *speaker*)))
+       (when (and *audio-started* (zerop q)) (incf *audio-gaps*))
+       (setf *audio-least* (if *audio-least* (min *audio-least* q) q)))
+     (unless (and *pcm* (= (length *pcm*) n)) (setf *pcm* (make-array n :initial-element 0)))
+     (dotimes (i n)
+       (setf (aref *pcm* i) (ash (s32 (peek32 (+ src (* 8 i)))) -1)))
+     (when (>= n 2)
+       (when (or (> (abs (- (aref *pcm* 0) (first *audio-last*))) 2048)
+                 (> (abs (- (aref *pcm* 1) (second *audio-last*))) 2048))
+         (incf *audio-seams*))
+       (setf *audio-last* (list (aref *pcm* (- n 2)) (aref *pcm* (- n 1)))))
+     (if (modus-int::w32-audio-write *speaker* *pcm*)
+         (progn (setf *audio-started* t) n)
+         (progn (incf *audio-dropped*) 0)))))
 
 ;;; STATS, once a second: frames drawn, the longest frame (from one frame clock tick to the next), and the speaker's
 ;;; gaps, drops and least queued.  Logged every second with VESSEL_STATS set; otherwise only a second with a gap or a
@@ -1822,7 +1956,7 @@
 
 
 (defun stats-report ()
-  (let ((gaps (- *audio-gaps* (first *audio-said*))) (drops (- *audio-dropped* (second *audio-said*))))
+  (let ((gaps (- (audio-gap-count) (first *audio-said*))) (drops (- *audio-dropped* (second *audio-said*))))
     (when (or *stats* (plusp gaps) (plusp drops) (plusp *audio-seams*))
       (format t "~&vessel-windows: ~D fps, ~D shown twice (DXGI), longest work ~D ms (to Present), ~D ms (with it), wait ~D ms, messages ~D ms; ~D collection~:P~@[; audio: ~A~]~%"
               *stat-frames* *stat-repeats* (round (* 1000 *stat-work*) internal-time-units-per-second)
@@ -1832,14 +1966,18 @@
               (- (modus-int::%gc-count) (or *stat-gcs* (modus-int::%gc-count)))
               (and *speaker*
                    (format nil "~D gap~:P, ~D dropped, ~D jump~:P, least queued ~D ms (~D gaps in all)"
-                           gaps drops *audio-seams* (if *audio-least* (round (* 1000 *audio-least*) 48000) 0) *audio-gaps*)))
+                           gaps drops *audio-seams* (if *audio-least* (round (* 1000 *audio-least*) 48000) 0) (audio-gap-count))))
       (finish-output))
-    (setf *audio-said* (list *audio-gaps* *audio-dropped*) *audio-least* nil *stat-frames* 0 *stat-longest* 0
+    (setf *audio-said* (list (audio-gap-count) *audio-dropped*) *audio-least* nil *stat-frames* 0 *stat-longest* 0
           *audio-seams* 0 *stat-wait* 0 *stat-pump* 0 *stat-late* 0 *stat-early* 0 *stat-work* 0 *stat-repeats* 0
           *stat-gcs* (modus-int::%gc-count)))
   (after 1 #'stats-report))
 
-(defun audio-queued () (if *speaker* (* 2 (modus-int::w32-audio-queued *speaker*)) 0))
+(defun audio-queued ()
+  "Samples queued and not yet played: the ring's and the device's (WASAPI), or waveOut's."
+  (cond ((null *speaker*) 0)
+        ((wasapi-p) (+ (floor (ring-filled) 2) (* 2 (peek64 (+ *wa* #x50)))))
+        (t (* 2 (modus-int::w32-audio-queued *speaker*)))))
 
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
@@ -2074,7 +2212,7 @@
     (1010 (audio-open a b))
     (1011 (audio-write a b))
     (1012 (audio-queued))
-    (1013 *audio-gaps*)
+    (1013 (audio-gap-count))
     (1060 (swift a))
     (t -38)))
 
