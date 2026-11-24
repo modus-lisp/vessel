@@ -31,6 +31,8 @@
 ;;;;   speech            SAPI 5: an SpVoice speaks (aloud, or into a WAV), the in-process recognizer dictates (from
 ;;;;                     the microphone, or a WAV)
 ;;;;   now playing       the System Media Transport Controls: the media overlay and the media keys
+;;;;   the camera        Media Foundation: frames as BGRA, a preview, a JPEG (WIC), video (H.264, MPEG-4; no sound)
+;;;;                     -- UNTESTED: written on a PC with no camera
 ;;;;   not on a PC       head tracking, the phone's motion, the watch's link: each answers that it is not here
 ;;;;
 ;;;; THE ONE THREAD.  The window is made by, and its messages are pumped on, the thread that runs the app (Win32
@@ -257,6 +259,16 @@
   (*memcpy* "ntdll.dll" "memcpy")
   (*memset* "ntdll.dll" "memset")
   (*co-task-mem-free* "ole32.dll" "CoTaskMemFree")
+  (*get-dc* "user32.dll" "GetDC")
+  (*release-dc* "user32.dll" "ReleaseDC")
+  (*create-directory* "kernel32.dll" "CreateDirectoryW")
+  ;; Media Foundation: absent on Windows' N editions without the Media Feature Pack
+  (*mf-startup* "mfplat.dll" "MFStartup" :optional)
+  (*mf-create-attributes* "mfplat.dll" "MFCreateAttributes" :optional)
+  (*mf-create-media-type* "mfplat.dll" "MFCreateMediaType" :optional)
+  (*mf-enum-device-sources* "mf.dll" "MFEnumDeviceSources" :optional)
+  (*mf-create-source-reader* "mfreadwrite.dll" "MFCreateSourceReaderFromMediaSource" :optional)
+  (*mf-create-sink-writer* "mfreadwrite.dll" "MFCreateSinkWriterFromURL" :optional)
   (*d3d11-create-device* "d3d11.dll" "D3D11CreateDevice")
   (*create-dc* "gdi32.dll" "CreateDCW")
   (*delete-dc* "gdi32.dll" "DeleteDC")
@@ -999,6 +1011,7 @@
   (setf *stat-last-tick* (get-internal-real-time))
   (when *loopback* (loopback-poll))
   (when *np* (np-poll))
+  (when *cameras* (cam-tick))
   (run-timers)
   0)
 
@@ -2888,6 +2901,394 @@
         (unless (zerop sender) (modus-int::wrt-release ctx sender))
         (unless (zerop args) (modus-int::wrt-release ctx args))))))
 
+;;; ---- the camera (cam_*: vessel's camera.lisp) ------------------------------------------------------------------------
+;;;
+;;; What Camera.swift is on Apple, on Media Foundation.  A camera is a device source (MFEnumDeviceSources, video
+;;; capture) read by a source reader with video processing on, so whatever the camera sends (MJPG, YUY2, NV12)
+;;; arrives as 32-bit BGRA.  A thread of native code (CAM-CODE) calls ReadSample, which blocks until the next frame,
+;;; and copies each frame into one of two native buffers, the other one being the latest whole frame -- so Lisp
+;;; never waits on the camera, and copies a frame with one memcpy (cam_frame).  A preview is a child window the
+;;; frame tick paints from that buffer (StretchDIBits): no frame passes through Lisp to be seen.  A photo is the
+;;; latest frame through WIC's JPEG encoder; a recording is a sink writer (H.264 in an MPEG-4 file) the same thread
+;;; hands each sample to, its time measured from the first.  VIDEO ONLY: the Mac records the microphone too.
+;;; The block: +#x08 memcpy  +#x10 IMFSourceReader  +#x18 stop  +#x20 / +#x28 the two frame buffers  +#x30 their
+;;; size  +#x38 frames delivered (the thread's)  +#x40..#x58 ReadSample's cells (stream, flags, time, sample)
+;;; +#x60..#x78 the buffer's cells (buffer, data, max, length)  +#x80 the sink writer, 0 when not recording
+;;; +#x88 its stream  +#x90 the first frame's time (-1 before it)  +#x98 frames written  +#xA0 ReadSample's HRESULT
+;;; +#xA8 1 = stop recording (Lisp), 2 = stopped (the thread)  +#xB0 the thread has ended  +#xB8 the last flags
+;;; +#x100 the code.
+;;; Slots (the SDK's mfobjects.h, mfreadwrite.h, mfidl.h, wincodec.h): IMFAttributes 7 GetUINT32, 8 GetUINT64,
+;;; 13 GetAllocatedString, 21 SetUINT32, 22 SetUINT64, 24 SetGUID; IMFActivate 33 ActivateObject; IMFSourceReader
+;;; 6 GetCurrentMediaType, 7 SetCurrentMediaType, 9 ReadSample; IMFSample 36 SetSampleTime, 41
+;;; ConvertToContiguousBuffer; IMFMediaBuffer 3 Lock, 4 Unlock; IMFSinkWriter 3 AddStream, 4 SetInputMediaType,
+;;; 5 BeginWriting, 6 WriteSample, 11 Finalize; IMFMediaSource 12 Shutdown; IWICImagingFactory 8 CreateEncoder,
+;;; 14 CreateStream, 20 CreateBitmapFromMemory; IWICStream 15 InitializeFromFilename; IWICBitmapEncoder 3
+;;; Initialize, 10 CreateNewFrame, 11 Commit; IWICBitmapFrameEncode 3 Initialize, 4 SetSize, 6 SetPixelFormat,
+;;; 11 WriteSource, 12 Commit.
+
+(defvar *cameras* '() "Open cameras' handles.")
+(defvar *mf-started* nil)
+
+(defparameter +mf-vidcap-type+ "C60AC5FE-252A-478F-A0EF-BC8FA5F7CAD3")
+(defparameter +mf-vidcap-guid+ "8AC3587A-4AE7-42D8-99E0-0A6013EEF90F")
+(defparameter +mf-friendly-name+ "60D0E559-52F8-4FA2-BBCE-ACDB34A8EC01")
+(defparameter +mf-video-processing+ "FB394F3D-CCF1-42EE-BBB3-F9B845D5681D")
+(defparameter +mf-major-type+ "48EBA18E-F8C9-4687-BF11-0A74C9F96A8F")
+(defparameter +mf-subtype+ "F7E34C9A-42E8-4714-B74B-CB29D72C35E5")
+(defparameter +mf-video+ "73646976-0000-0010-8000-00AA00389B71")
+(defparameter +mf-argb32+ "00000015-0000-0010-8000-00AA00389B71")
+(defparameter +mf-rgb32+ "00000016-0000-0010-8000-00AA00389B71")
+(defparameter +mf-h264+ "34363248-0000-0010-8000-00AA00389B71")
+(defparameter +mf-frame-size+ "1652C33D-D6B2-4012-B834-72030849A37D")
+(defparameter +mf-frame-rate+ "C459A2E8-3D2C-4E44-B132-FEE5156C7BB0")
+(defparameter +mf-stride+ "644B4E48-1E02-4516-B0EB-C01CA9D49AC6")
+(defparameter +mf-bitrate+ "20332624-FB0D-4D9E-BD0D-CBF6786C102E")
+(defparameter +mf-interlace+ "E2724BB8-E676-4806-B4B2-A8D6EFB44CCD")
+(defparameter +mf-aspect+ "C6376A1E-8D0A-4027-BE45-6D9A0AD39BB6")
+(defparameter +mf-container+ "150FF23F-4ABC-478B-AC4F-E1916FBA1CCA")
+(defparameter +mf-mpeg4+ "DC6CD05D-B9D0-40EF-BD35-FA622C1AB28A")
+(defparameter +mf-hardware+ "A634A91C-822B-41B9-A494-4DE4643612B0")
+(defconstant +first-video+ #xFFFFFFFC)
+
+(defun guid-at (a text) (modus-int::w32-put-guid a text) a)
+
+(defun cam-code ()
+  (let ((jne '(#x0F #x85)) (je '(#x0F #x84)) (js '(#x0F #x88)) (jbe '(#x0F #x86)) (jmp '(#xE9)))
+    (assemble
+     `(#x53 #x56 #x57 #x48 #x83 #xEC #x40          ; push rbx rsi rdi; sub rsp,0x40
+       #x48 #x89 #xCB                              ; mov rbx,rcx
+       (:label :loop)
+       #x48 #x83 #xBB #xA8 #x00 #x00 #x00 #x01 (:j ,jne :norq)    ; asked to stop recording?
+       #x48 #xC7 #x83 #x80 #x00 #x00 #x00 #x00 #x00 #x00 #x00     ; no writer
+       #x48 #xC7 #x83 #xA8 #x00 #x00 #x00 #x02 #x00 #x00 #x00     ; stopped
+       (:label :norq)
+       #x48 #x83 #x7B #x18 #x00 (:j ,jne :out)     ; stop?
+       #x48 #xC7 #x43 #x58 #x00 #x00 #x00 #x00     ; sample = 0
+       #x48 #x8D #x43 #x48 #x48 #x89 #x44 #x24 #x20   ; &flags
+       #x48 #x8D #x43 #x50 #x48 #x89 #x44 #x24 #x28   ; &time
+       #x48 #x8D #x43 #x58 #x48 #x89 #x44 #x24 #x30   ; &sample
+       #x48 #x8B #x4B #x10 #xBA #xFC #xFF #xFF #xFF #x45 #x31 #xC0 #x4C #x8D #x4B #x40   ; reader, video, 0, &stream
+       #x48 #x8B #x01 #xFF #x50 #x48               ; ReadSample (waits for a frame)
+       #x89 #x83 #xA0 #x00 #x00 #x00
+       #x85 #xC0 (:j ,js :out)
+       #x8B #x43 #x48 #x89 #x83 #xB8 #x00 #x00 #x00
+       #xA8 #x03 (:j ,jne :out)                    ; an error, or the end of the stream
+       #x48 #x8B #x73 #x58 #x48 #x85 #xF6 (:j ,je :loop)   ; a gap: no sample
+       #x48 #xC7 #x43 #x60 #x00 #x00 #x00 #x00
+       #x48 #x89 #xF1 #x48 #x8D #x53 #x60 #x48 #x8B #x01 #xFF #x90 #x48 #x01 #x00 #x00   ; ConvertToContiguousBuffer
+       #x85 #xC0 (:j ,js :write)
+       #x48 #x8B #x7B #x60
+       #x48 #x89 #xF9 #x48 #x8D #x53 #x68 #x4C #x8D #x43 #x70 #x4C #x8D #x4B #x78
+       #x48 #x8B #x01 #xFF #x50 #x18               ; Lock
+       #x85 #xC0 (:j ,js :unlocked)
+       #x48 #x8B #x43 #x38 #x48 #xFF #xC0 #xA8 #x01   ; the buffer the next frame goes in: (frames + 1) & 1
+       #x48 #x8B #x4B #x20 (:j ,je :dst)
+       #x48 #x8B #x4B #x28
+       (:label :dst)
+       #x48 #x8B #x53 #x68 #x44 #x8B #x43 #x78     ; data, length
+       #x4C #x3B #x43 #x30 (:j ,jbe :len) #x4C #x8B #x43 #x30   ; at most the buffer
+       (:label :len)
+       #xFF #x53 #x08                              ; memcpy
+       #x48 #xFF #x43 #x38                         ; frames + 1: that buffer is the latest
+       #x48 #x89 #xF9 #x48 #x8B #x01 #xFF #x50 #x20   ; Unlock
+       (:label :unlocked)
+       #x48 #x89 #xF9 #x48 #x8B #x01 #xFF #x50 #x10   ; Release the buffer
+       (:label :write)
+       #x48 #x83 #xBB #x80 #x00 #x00 #x00 #x00 (:j ,je :release)   ; recording?
+       #x48 #x83 #xBB #x90 #x00 #x00 #x00 #xFF (:j ,jne :t0)
+       #x48 #x8B #x43 #x50 #x48 #x89 #x83 #x90 #x00 #x00 #x00     ; the first frame's time
+       (:label :t0)
+       #x48 #x8B #x53 #x50 #x48 #x2B #x93 #x90 #x00 #x00 #x00     ; time since it
+       #x48 #x89 #xF1 #x48 #x8B #x01 #xFF #x90 #x20 #x01 #x00 #x00   ; SetSampleTime
+       #x48 #x8B #x8B #x80 #x00 #x00 #x00 #x8B #x93 #x88 #x00 #x00 #x00 #x49 #x89 #xF0
+       #x48 #x8B #x01 #xFF #x50 #x30               ; WriteSample
+       #x48 #xFF #x83 #x98 #x00 #x00 #x00
+       (:label :release)
+       #x48 #x89 #xF1 #x48 #x8B #x01 #xFF #x50 #x10   ; Release the sample
+       (:j ,jmp :loop)
+       (:label :out)
+       #x48 #xC7 #x83 #xB0 #x00 #x00 #x00 #x01 #x00 #x00 #x00     ; ended
+       #x48 #x83 #xC4 #x40 #x5F #x5E #x5B #x31 #xC0 #xC3))))
+
+(defun mf-start ()
+  (unless *mf-started*
+    (when (or (zerop *mf-startup*) (zerop *mf-enum-device-sources*) (zerop *mf-create-source-reader*))
+      (return-from mf-start nil))
+    (c *co-initialize* 0 0)
+    (setf *mf-started* (not (failed-p (c *mf-startup* #x20070 0)))))           ; MF_VERSION, MFSTARTUP_FULL
+  *mf-started*)
+
+(defun mf-attributes (n)
+  (if (failed-p (c *mf-create-attributes* (out0) n)) 0 (peek64 (cell 0))))
+
+(defun cam-activates ()
+  "The video capture devices: a list of IMFActivate, which the caller releases."
+  (when (mf-start)
+    (let ((attrs (mf-attributes 1)))
+      (unless (zerop attrs)
+        (m attrs 24 (guid-at (area 1) +mf-vidcap-type+) (guid-at (area 2) +mf-vidcap-guid+))   ; SetGUID
+        (poke32 (cell 1) 0)
+        (let ((hr (c *mf-enum-device-sources* attrs (out0) (cell 1))))
+          (release attrs)
+          (unless (failed-p hr)
+            (let ((arr (peek64 (cell 0))) (n (peek32 (cell 1))))
+              (prog1 (loop for i below n collect (peek64 (+ arr (* 8 i))))
+                (unless (zerop arr) (c *co-task-mem-free* arr))))))))))
+
+(defun cam-devices ()
+  (let ((acts (cam-activates)))
+    (prog1 (format nil "~{~A~^~%~}"
+                   (loop for a in acts
+                         collect (progn (poke32 (cell 1) 0)
+                                        (if (failed-p (m a 13 (guid-at (area 1) +mf-friendly-name+) (out0) (cell 1)))
+                                            "Camera"
+                                            (let ((p (peek64 (cell 0))))
+                                              (prog1 (or (modus-int::w32-wstr p) "Camera") (c *co-task-mem-free* p)))))))
+      (mapc #'release acts))))
+
+(defun vector-data (arr)
+  "The address of ARR's first byte (a simple octet vector), good until Lisp next allocates."
+  (+ (modus-int::%gc-word-of arr (cell 30)) 7))
+
+(defun cam-open (index)
+  (let* ((acts (cam-activates)) (act (nth index acts)) (h 0))
+    (flet ((done (ok why)
+             (unless ok (format t "~&vessel-windows: camera: ~A~%" why))
+             (mapc #'release acts)
+             (unless (zerop h) (ui-event (list :camera h (if ok 1 0))))
+             (return-from cam-open h)))
+      (unless act (setf h 0) (done nil "no such camera"))
+      (setf h (new-handle (make-ctl :kind :camera)))
+      (let ((hr (m act 33 (guid-at (area 1) "279A808D-AEC7-40C8-9C6B-A6B492C78A66") (out0))))   ; ActivateObject
+        (when (failed-p hr)
+          (done nil (if (= (logand hr #xFFFFFFFF) #x80070005)
+                        "Windows does not let this app use it (Settings > Privacy & security > Camera)"
+                        (format nil "it would not start (#x~8,'0X)" (logand hr #xFFFFFFFF))))))
+      (let* ((source (peek64 (cell 0))) (ra (mf-attributes 1)) (reader 0))
+        (m ra 21 (guid-at (area 1) +mf-video-processing+) 1)                   ; SetUINT32: convert to RGB
+        (let ((hr (c *mf-create-source-reader* source ra (out0))))
+          (release ra)
+          (when (failed-p hr) (m source 12) (release source) (done nil "no source reader")))
+        (setf reader (peek64 (cell 0)))
+        ;; BGRA: ARGB32 (alpha set), else RGB32
+        (unless (loop for sub in (list +mf-argb32+ +mf-rgb32+)
+                      thereis (progn (c *mf-create-media-type* (out0))
+                                     (let ((mt (peek64 (cell 0))))
+                                       (m mt 24 (guid-at (area 1) +mf-major-type+) (guid-at (area 2) +mf-video+))
+                                       (m mt 24 (guid-at (area 1) +mf-subtype+) (guid-at (area 2) sub))
+                                       (prog1 (not (failed-p (m reader 7 +first-video+ 0 mt))) (release mt)))))
+          (release reader) (m source 12) (release source) (done nil "it does not convert to RGB"))
+        (m reader 6 +first-video+ (out0))                                      ; GetCurrentMediaType
+        (let* ((mt (peek64 (cell 0)))
+               (size (progn (poke64 (cell 1) 0) (m mt 8 (guid-at (area 1) +mf-frame-size+) (cell 1)) (peek64 (cell 1))))
+               (w (ash size -32)) (fh (logand size #xFFFFFFFF))
+               (stride (progn (poke32 (cell 2) (* 4 w))
+                              (m mt 7 (guid-at (area 1) +mf-stride+) (cell 2)) (s32 (peek32 (cell 2)))))
+               (rate (progn (poke64 (cell 3) (logior (ash 30 32) 1)) (m mt 8 (guid-at (area 1) +mf-frame-rate+) (cell 3))
+                            (peek64 (cell 3))))
+               (bytes (* (abs stride) fh))
+               (block (modus-int::w32-alloc #x1000 t))
+               (bmi (modus-int::w32-alloc 64)))
+          (release mt)
+          (when (zerop bytes) (release reader) (m source 12) (release source) (done nil "no frame size"))
+          (zero bmi 40)
+          (poke32 bmi 40) (poke32 (+ bmi 4) (floor (abs stride) 4))                ; BITMAPINFOHEADER, 32-bit
+          (poke32 (+ bmi 8) (if (minusp stride) fh (- fh)))                        ; top-down unless the rows go up
+          (poke16 (+ bmi 12) 1) (poke16 (+ bmi 14) 32)
+          (poke64 (+ block 8) *memcpy*) (poke64 (+ block #x10) reader)
+          (poke64 (+ block #x20) (modus-int::w32-alloc bytes)) (poke64 (+ block #x28) (modus-int::w32-alloc bytes))
+          (poke64 (+ block #x30) bytes)
+          (loop for b in (cam-code) for i from 0 do (poke8 (+ block #x100 i) b))
+          (setf (ctl-data (ctl-of h))
+                (list :block block :reader reader :source source :w w :h fh :stride stride :rate rate :bmi bmi
+                      :read 0 :painted 0 :previews '() :writer 0 :path nil))
+          (c *create-thread* 0 0 (+ block #x100) block 0 0)
+          (push h *cameras*)
+          (format t "~&vessel-windows: camera ~D: ~Dx~D~%" index w fh)
+          (done t nil))))))
+
+(defun cam (h) (let ((ctl (gethash h *ctls*))) (and ctl (eq (ctl-kind ctl) :camera) (ctl-data ctl))))
+(defun cam-get (h key) (getf (cam h) key))
+(defun cam-set (h key v) (setf (getf (ctl-data (ctl-of h)) key) v))
+
+(defun cam-latest (d)
+  "The buffer holding the latest whole frame, and how many frames there have been."
+  (let* ((block (getf d :block)) (n (peek64 (+ block #x38))))
+    (values (peek64 (+ block (if (evenp n) #x20 #x28))) n)))
+
+(defun cam-frame-size (h)
+  (let ((d (cam h)))
+    (if (or (null d) (zerop (nth-value 1 (cam-latest d)))) 0 (logior (getf d :w) (ash (getf d :h) 16)))))
+
+(defun cam-frame (h buf cap)
+  "The latest frame into BUF, top-down BGRA rows: its bytes, or 0 when none has come since the last read."
+  (let ((d (cam h)) (arr (token-array buf)))
+    (when (or (null d) (null arr)) (return-from cam-frame 0))
+    (multiple-value-bind (src n) (cam-latest d)
+      (let* ((w (getf d :w)) (fh (getf d :h)) (stride (getf d :stride)) (row (* 4 w)) (need (* row fh)))
+        (when (or (= n (getf d :read)) (> need (min cap (length arr)))) (return-from cam-frame 0))
+        (let ((dst (vector-data arr)))                                          ; no allocation from here on
+          (if (= stride row)
+              (c *memcpy* dst src need)
+              (dotimes (y fh)
+                (c *memcpy* (+ dst (* y row))
+                   (+ src (* (abs stride) (if (minusp stride) (- fh 1 y) y))) row))))
+        ;; lapped while copying: that buffer was being written, so wait for the next
+        (if (> (- (peek64 (+ (getf d :block) #x38)) n) 1)
+            0
+            (progn (cam-set h :read n) need))))))
+
+(defun cam-preview-new (h x y w hh)
+  (let ((hwnd (child "STATIC" "" 0 x y w hh)))
+    (when (cam h) (cam-set h :previews (cons (list hwnd (px w) (px hh)) (cam-get h :previews))))
+    (new-handle (make-ctl :kind :label :hwnd hwnd))))
+
+(defun cam-tick ()
+  "Each preview of a camera with a new frame, painted from the frame's buffer."
+  (dolist (h *cameras*)
+    (let ((d (cam h)))
+      (when (and d (getf d :previews))
+        (multiple-value-bind (src n) (cam-latest d)
+          (unless (or (zerop n) (= n (getf d :painted)))
+            (cam-set h :painted n)
+            (dolist (p (getf d :previews))
+              (destructuring-bind (hwnd pw ph) p
+                (let ((dc (c *get-dc* hwnd)))
+                  (unless (zerop dc)
+                    (c *set-stretch-mode* dc 4)                                ; HALFTONE
+                    (c *stretch-dibits* dc 0 0 pw ph 0 0 (getf d :w) (getf d :h) src (getf d :bmi) 0 #x00CC0020)
+                    (c *release-dc* hwnd dc)))))))))))
+
+(defun cam-photo (h path)
+  "The latest frame as a JPEG at PATH (WIC), then :photo with the path, or \"\"."
+  (let ((d (cam h)) (ok nil))
+    (when d
+      (multiple-value-bind (src n) (cam-latest d)
+        (when (plusp n)
+          (let* ((w (getf d :w)) (fh (getf d :h)) (stride (getf d :stride)) (row (* 4 w))
+                 (copy (modus-int::w32-alloc (* row fh)))
+                 (wic (co-make "CACAF262-9370-4615-A13B-9F5539DA4C0A" "EC5EC8A9-C395-4314-9C77-54D7A935FF70")))
+            ;; a still copy, top-down (WIC wants a positive stride)
+            (dotimes (y fh)
+              (c *memcpy* (+ copy (* y row)) (+ src (* (abs stride) (if (minusp stride) (- fh 1 y) y))) row))
+            (unless (zerop wic)
+              (let ((fmt (guid-at (area 3) "6FDDC324-4E03-4BFE-B185-3D77768DC90F")) (bmp 0) (stream 0) (enc 0) (frame 0))
+                (when (and (not (failed-p (m wic 20 w fh fmt row (* row fh) copy (out0))))   ; CreateBitmapFromMemory
+                           (plusp (setf bmp (peek64 (cell 0))))
+                           (not (failed-p (m wic 14 (out0)))) (plusp (setf stream (peek64 (cell 0))))
+                           (not (failed-p (m stream 15 (wide1 (substitute #\\ #\/ path)) #x40000000)))
+                           (not (failed-p (m wic 8 (guid-at (area 4) "19E4A5AA-5662-4FC5-A0C0-1758028E1057") 0 (out0))))
+                           (plusp (setf enc (peek64 (cell 0))))
+                           (not (failed-p (m enc 3 stream 2)))                 ; WICBitmapEncoderNoCache
+                           (progn (poke64 (cell 1) 0)
+                                  (not (failed-p (m enc 10 (out0) (cell 1)))))
+                           (plusp (setf frame (peek64 (cell 0)))))
+                  (let ((props (peek64 (cell 1))))
+                    (setf ok (and (not (failed-p (m frame 3 props)))
+                                  (not (failed-p (m frame 4 w fh)))
+                                  (progn (guid-at (area 3) "6FDDC324-4E03-4BFE-B185-3D77768DC90F")
+                                         (m frame 6 (area 3)) t)              ; it answers what JPEG takes
+                                  (not (failed-p (m frame 11 bmp 0)))         ; WriteSource converts
+                                  (not (failed-p (m frame 12)))
+                                  (not (failed-p (m enc 11)))))
+                    (release props)))
+                (dolist (o (list frame enc stream bmp)) (release o))
+                (release wic)))
+            (modus-int::w32-free copy (* row fh))))))
+    (unless ok (format t "~&vessel-windows: camera: no photo at ~A~%" path))
+    (ui-event (list :photo h (if ok path "")))
+    0))
+
+(defun media-type (pairs)
+  "A new IMFMediaType from PAIRS: (:guid KEY VALUE) (:u32 KEY V) (:u64 KEY V)."
+  (c *mf-create-media-type* (out0))
+  (let ((mt (peek64 (cell 0))))
+    (dolist (p pairs mt)
+      (destructuring-bind (kind key v) p
+        (ecase kind
+          (:guid (m mt 24 (guid-at (area 1) key) (guid-at (area 2) v)))
+          (:u32 (m mt 21 (guid-at (area 1) key) v))
+          (:u64 (m mt 22 (guid-at (area 1) key) v)))))))
+
+(defun cam-record (h path)
+  "Recording CAM to PATH (H.264 in an MPEG-4 file, whatever its extension), then :recording with the path."
+  (let ((d (cam h)))
+    (when (or (null d) (plusp (getf d :writer)) (zerop *mf-create-sink-writer*)) (return-from cam-record 0))
+    (let* ((w (getf d :w)) (fh (getf d :h)) (rate (getf d :rate)) (attrs (mf-attributes 2)) (writer 0))
+      (m attrs 24 (guid-at (area 1) +mf-container+) (guid-at (area 2) +mf-mpeg4+))
+      (m attrs 21 (guid-at (area 1) +mf-hardware+) 1)
+      (let ((hr (c *mf-create-sink-writer* (wide1 (substitute #\\ #\/ path)) 0 attrs (out0))))
+        (release attrs)
+        (when (failed-p hr)
+          (format t "~&vessel-windows: camera: no recording to ~A (#x~8,'0X)~%" path (logand hr #xFFFFFFFF))
+          (ui-event (list :recorded h ""))
+          (return-from cam-record 0)))
+      (setf writer (peek64 (cell 0)))
+      (let ((out (media-type `((:guid ,+mf-major-type+ ,+mf-video+) (:guid ,+mf-subtype+ ,+mf-h264+)
+                               (:u32 ,+mf-bitrate+ 8000000) (:u32 ,+mf-interlace+ 2)
+                               (:u64 ,+mf-frame-size+ ,(logior (ash w 32) fh)) (:u64 ,+mf-frame-rate+ ,rate)
+                               (:u64 ,+mf-aspect+ ,(logior (ash 1 32) 1)))))
+            (ok nil))
+        (poke32 (cell 4) 0)
+        (when (not (failed-p (m writer 3 out (cell 4))))                         ; AddStream
+          (m (getf d :reader) 6 +first-video+ (out0))                            ; the frames as they come
+          (let ((in (peek64 (cell 0))))
+            (setf ok (and (not (failed-p (m writer 4 (peek32 (cell 4)) in 0)))  ; SetInputMediaType
+                          (not (failed-p (m writer 5)))))                        ; BeginWriting
+            (release in)))
+        (release out)
+        (if (not ok)
+            (progn (release writer)
+                   (format t "~&vessel-windows: camera: the encoder refused the frames~%")
+                   (ui-event (list :recorded h "")))
+            (let ((block (getf d :block)))
+              (poke64 (+ block #x88) (peek32 (cell 4))) (poke64 (+ block #x90) -1) (poke64 (+ block #x98) 0)
+              (poke64 (+ block #xA8) 0)
+              (poke64 (+ block #x80) writer)                                     ; last: the thread may write now
+              (cam-set h :writer writer) (cam-set h :path path)
+              (ui-event (list :recording h path))))))
+    0))
+
+(defun cam-stop (h)
+  "The recording ends: once the thread lets go of the writer, Finalize, then :recorded."
+  (let ((d (cam h)))
+    (when (and d (plusp (getf d :writer)))
+      (let ((block (getf d :block)) (writer (getf d :writer)) (path (getf d :path)))
+        (poke64 (+ block #xA8) 1)
+        (labels ((look ()
+                   (if (and (/= (peek64 (+ block #xA8)) 2) (zerop (peek64 (+ block #xB0))))
+                       (after 0.03 #'look)
+                       (let ((ok (not (failed-p (m writer 11)))))             ; Finalize
+                         (release writer)
+                         (poke64 (+ block #x80) 0) (poke64 (+ block #xA8) 0)
+                         (cam-set h :writer 0)
+                         (ui-event (list :recorded h (if ok path "")))))))
+          (look)))))
+  0)
+
+(defun cam-close (h)
+  (let ((d (cam h)))
+    (when d
+      (when (plusp (getf d :writer)) (cam-stop h))
+      (let ((block (getf d :block)))
+        (poke64 (+ block #x18) 1)
+        (setf *cameras* (remove h *cameras*))
+        (dolist (p (getf d :previews)) (u *destroy-window* (first p)))
+        (cam-set h :previews '())
+        ;; the thread ends after its frame in hand; then the reader and the camera go
+        (labels ((look ()
+                   (if (zerop (peek64 (+ block #xB0)))
+                       (after 0.05 #'look)
+                       (progn (release (getf d :reader)) (m (getf d :source) 12) (release (getf d :source))))))
+          (look)))))
+  0)
+
+(defun app-folder ()
+  "The app's own folder, as a Mac's in Application Support: %LOCALAPPDATA%\\Vessel, made if need be."
+  (let ((dir (format nil "~A\\Vessel" (or (modus-int::%cli-getenv "LOCALAPPDATA") (modus-int::%cli-getenv "TEMP") "C:"))))
+    (c *create-directory* (wide1 dir) 0)
+    dir))
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -3026,6 +3427,18 @@
 (defswift "np_artwork_data" (a n) (np-artwork-data a n))
 (defswift "np_times" (duration position playing) (np-show duration position (eql playing 1)))
 (defswift "np_clear" () (np-clear))
+
+;; the camera: Media Foundation
+(defswift "cam_devices" (buf cap) (answer-text (cam-devices) buf cap))
+(defswift "cam_open" (index) (cam-open index))
+(defswift "cam_preview_new" (cam x y w h) (cam-preview-new cam x y w h))
+(defswift "cam_frame_size" (cam) (cam-frame-size cam))
+(defswift "cam_frame" (cam buf cap) (cam-frame cam buf cap))
+(defswift "cam_photo" (cam a n) (cam-photo cam (utf8-text a n)))
+(defswift "cam_record" (cam a n) (cam-record cam (utf8-text a n)))
+(defswift "cam_stop" (cam) (cam-stop cam))
+(defswift "cam_close" (cam) (cam-close cam))
+(defswift "files_documents" (buf cap) (answer-text (app-folder) buf cap))
 
 ;; the phone's motion and the watch's link: neither is here (a PC)
 (defswift "device_motion" (on) 0)
