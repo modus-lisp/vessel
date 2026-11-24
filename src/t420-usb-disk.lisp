@@ -168,8 +168,18 @@
       (%t4d-mark 2)
       (dotimes (try 4)
         (setq *t4-usb-devices* nil *t4u-next-addr* 1)
+        ;; a retry starts the controller over: at the desk's start the BIOS's handler runs AFTER
+        ;; the handoff (the SMI on OS-ownership change) and undoes the setup -- measured, walk 0:
+        ;; USBCMD 10030 (stopped), CONFIGFLAG 0, every PORTSC with bit 13 (handed to companion
+        ;; controllers the T420 has none of); the reset that follows it sticks (walk 1: 4 devices)
+        (when (plusp try)
+          (let ((again (apply #'%t4u-take *t4d-controller*))) (when again (setq *t4-usb* again)))
+          (%t4u-sleep 200))
         (dotimes (p (getf *t4-usb* :ports)) (ignore-errors (%t4u-root-port (+ p 1))))
-        (t4-log "disk: walk ~D found ~D device~:P" try (length *t4-usb-devices*))
+        (t4-log "disk: walk ~D found ~D device~:P; PORTSC ~{~8,'0X~^ ~}; USBCMD ~8,'0X USBSTS ~8,'0X CONFIGFLAG ~X"
+                try (length *t4-usb-devices*)
+                (loop for p from 1 to (getf *t4-usb* :ports) collect (%t4u-r (%t4u-portsc p)))
+                (%t4u-opr 0) (%t4u-opr 4) (%t4u-opr #x40))
         (when (some (lambda (d) (and (/= (getf d :class) 9) (ignore-errors (%t4d-msc-scan d)))) *t4-usb-devices*)
           (return))
         (%t4u-sleep 500))
