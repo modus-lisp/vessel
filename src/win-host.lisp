@@ -13,9 +13,9 @@
 ;;;;   the GPU           Direct3D 11 (gpu_*): vertex pulling from raw buffers, as Metal's shaders do; the shaders are
 ;;;;                     HLSL (GPU-LANGUAGE answers :HLSL), compiled at run time by d3dcompiler_47; a swap chain per
 ;;;;                     view, so a second window (window_new, hello3d's Map) draws too; printing (gpu_view_print)
-;;;;                     reads a frame back and sends it through the print dialog.  STANDARD RANGE ONLY: HDR on
-;;;;                     Windows wants a flip-model FP16 swap chain in scRGB, which this blit-model one (under child
-;;;;                     windows) is not; gpu_view_hdr answers no, and the headroom is 1.0
+;;;;                     reads a frame back and sends it through the print dialog.  HDR (gpu_view_hdr): a half-float
+;;;;                     scRGB swap chain, the extended sRGB a pass draws converted before each Present; the headroom
+;;;;                     is the display's peak over Windows' SDR white while Windows' HDR is on
 ;;;;   trackpad          a pinch is Ctrl+wheel to a Win32 window, and arrives as a :pinch gesture (type 15)
 ;;;;   controls          labels, buttons and a slider as Win32 child windows; a panel (glass_new) of the window's
 ;;;;                     own class, rounded, so its children's notifications reach the same ring
@@ -49,7 +49,7 @@
 
 (defpackage #:vessel-windows
   (:use #:cl)
-  (:export #:open-window #:host-init #:install-bridge #:*dpi* #:*hwnd*))
+  (:export #:open-window #:host-init #:install-bridge #:load-widgets #:*dpi* #:*hwnd*))
 
 (in-package #:vessel-windows)
 
@@ -115,6 +115,17 @@
               (dotimes (i (min (length arr) (floor n 4))) (poke32 (+ *stage* (* 4 i)) (fbits (aref arr i))))
               (dotimes (i (min (length arr) n)) (poke8 (+ *stage* i) (aref arr i))))
           *stage*))))
+
+(defun term-arg (a n)
+  "The term (net/term.lisp: a list of titles, of row plists ...) in the N bytes A names -- a token for the byte
+   vector the bridge encoded it into, or an address."
+  (let ((arr (token-array a)))
+    (cond ((not (plusp n)) nil)
+          ;; INSTALL-BRIDGE's %TERM-OCTETS: the term itself, in a vector of one
+          ((and arr (simple-vector-p arr) (= (length arr) 1)) (aref arr 0))
+          (t (let ((addr (native-of a n)))
+               (setf (cl-user::mem-ref (cl-user::decode-ptr-addr) :u64) addr)
+               (cl-user::term-decode-step))))))
 
 (defun put-floats (a vals)
   "VALS into the single-float vector A names (a token), or at the address A."
@@ -262,6 +273,9 @@
   (*memset* "ntdll.dll" "memset")
   (*co-task-mem-free* "ole32.dll" "CoTaskMemFree")
   (*dwm-set-attribute* "dwmapi.dll" "DwmSetWindowAttribute")
+  (*display-config-sizes* "user32.dll" "GetDisplayConfigBufferSizes")
+  (*query-display-config* "user32.dll" "QueryDisplayConfig")
+  (*display-config-info* "user32.dll" "DisplayConfigGetDeviceInfo")
   (*reg-get-value* "advapi32.dll" "RegGetValueW")
   (*open-clipboard* "user32.dll" "OpenClipboard")
   (*empty-clipboard* "user32.dll" "EmptyClipboard")
@@ -397,6 +411,14 @@
        #x48 #x89 #x8B #x58 #x01 #x00 #x00    ; mov [rbx+0x158],rcx
        #x4C #x89 #x83 #x60 #x01 #x00 #x00    ; mov [rbx+0x160],r8
        #x4C #x89 #x8B #x68 #x01 #x00 #x00    ; mov [rbx+0x168],r9
+       ;; WM_NOTIFY: its NMHDR is on the sender's stack, gone by the time Lisp reads the ring, so record what is
+       ;; in it now -- (WM_NOTIFY hwnd the-control's-hwnd the-code)
+       #x83 #xFA #x4E (:j ,jne :rec-go)       ; cmp edx,WM_NOTIFY
+       #x49 #x8B #x01                        ; mov rax,[r9]        hwndFrom
+       #x48 #x89 #x83 #x60 #x01 #x00 #x00    ; mov [rbx+0x160],rax
+       #x41 #x8B #x41 #x10                   ; mov eax,[r9+16]     code
+       #x48 #x89 #x83 #x68 #x01 #x00 #x00    ; mov [rbx+0x168],rax
+       (:label :rec-go)
        (:j ,call :record)
        #x48 #x8B #x4C #x24 #x40              ; the arguments back
        #x8B #x54 #x24 #x48
@@ -478,7 +500,7 @@
        #x48 #x83 #xC4 #x28 #xC3))))          ; add rsp,0x28; ret
 
 (defparameter *recorded*
-  (append '(#x05 #x07 #x08 #x10 #x1A #x1C #x111 #x114 #x233)
+  (append '(#x05 #x07 #x08 #x10 #x1A #x1C #x4E #x111 #x114 #x115 #x233)
           (loop for m from #x100 to #x10F collect m)
           (loop for m from #x200 to #x20E collect m))
   "The messages the ring keeps: size, focus, close, the app's activation, a command (a menu, a button), a
@@ -742,8 +764,8 @@
   (poke64 (+ *page* #x10) *hwnd*)
   (when (plusp *get-dpi-for-window*) (setf *dpi* (logand (c *get-dpi-for-window* *hwnd*) #xFFFF)))
   (setf *font* (c *create-font* (- (px 14)) 0 0 0 400 0 0 0 1 0 0 5 0 (wide1 "Segoe UI")))
-  (let ((icc (area 1)))                                    ; the slider's class
-    (poke32 icc 8) (poke32 (+ icc 4) 4)
+  (let ((icc (area 1)))                                    ; every common control's class (ICC_*: all of them)
+    (poke32 icc 8) (poke32 (+ icc 4) #xFFFF)
     (c *init-common-controls* icc))
   (u *show-window* *hwnd* 5)
   (u *update-window* *hwnd*)
@@ -910,7 +932,32 @@
           (ui-event (list :dropped 0 (modus-int::w32-wstr buf len))))))
     (c *drag-finish* hdrop)))
 
+;;; EXTENSION POINTS, for the widget files (win-ui-*.lisp) that load after this one.  Each is keyed by a control's
+;;; KIND (CTL-KIND) or is a list of functions; none of them is needed by a program that makes only this file's own
+;;; controls.
+;;;   *MESSAGE-HOOKS*       (fn msg hwnd wp lp) -> true if it took the message: called first, for every message the
+;;;                         ring holds (WM_COMMAND, WM_NOTIFY as (#x4E parent control-hwnd code), WM_HSCROLL,
+;;;                         WM_VSCROLL, the mouse's messages to a panel ...)
+;;;   *ADD-HANDLERS*        kind -> (fn parent child): ui_add into a parent of that kind (a stack lays it out)
+;;;   *SET-VALUE-HANDLERS*  kind -> (fn handle value)       ui_set_value
+;;;   *SET-TEXT-HANDLERS*   kind -> (fn handle text)        ui_set_text
+;;;   *TEXT-VALUE-HANDLERS* kind -> (fn handle) -> string   ui_text_value
+;;;   *TICK-HOOKS*          (fn): once a frame (WAIT-FRAME), for what is polled or animated
+;;;   *REMOVE-HANDLERS*     kind -> (fn handle): ui_remove, before the control's own window goes (its other windows)
+;;;   *FRAME-HANDLERS*      kind -> (fn handle x y w h): ui_set_frame, in points, instead of moving the one window
+
+(defvar *message-hooks* '())
+(defvar *add-handlers* (make-hash-table))
+(defvar *set-value-handlers* (make-hash-table))
+(defvar *set-text-handlers* (make-hash-table))
+(defvar *text-value-handlers* (make-hash-table))
+(defvar *tick-hooks* '())
+(defvar *remove-handlers* (make-hash-table))
+(defvar *frame-handlers* (make-hash-table))
+
 (defun handle-message (msg hwnd wp lp)
+  (dolist (f *message-hooks*)
+    (when (funcall f msg hwnd wp lp) (return-from handle-message nil)))
   (let* ((main (= hwnd *hwnd*))
          (other (and (not main) (gethash hwnd *by-hwnd*))))
     (cond
@@ -1064,6 +1111,7 @@
   (when *np* (np-poll))
   (when *cameras* (cam-tick))
   (when *ble* (ble-poll))
+  (dolist (f *tick-hooks*) (funcall f))
   (run-timers)
   0)
 
@@ -1111,14 +1159,28 @@
 (defun set-text (h addr n)
   "A control's text, set on the windows' thread without waiting for it (SetWindowTextW from another thread is a
    SendMessage, which waits until that thread answers)."
-  (let ((ctl (ctl-of h)) (text (utf8-text addr n)))
+  (let* ((ctl (ctl-of h)) (text (utf8-text addr n)) (f (gethash (ctl-kind ctl) *set-text-handlers*)))
+    (when f (funcall f h text) (return-from set-text 0))
     (unless (zerop (ctl-hwnd ctl))
       (ui-post *set-window-text* (list (ctl-hwnd ctl) (lambda (mem) (wide-at mem text)))
                (lambda (r mem) r mem) (* 4 (+ 1 (length text)))))
     0))
 
+(defun text-value (h)
+  "A control's text: its kind's handler's, else the window's own text (GetWindowTextW, on the windows' thread)."
+  (let* ((ctl (ctl-of h)) (f (gethash (ctl-kind ctl) *text-value-handlers*)))
+    (cond (f (funcall f h))
+          ((zerop (ctl-hwnd ctl)) "")
+          (t (let ((n (u *send-message* (ctl-hwnd ctl) #x0E 0 0)))                     ; WM_GETTEXTLENGTH
+               (if (zerop n)
+                   ""
+                   (let ((buf (modus-int::w32-alloc (* 2 (+ n 1)))))
+                     (u *send-message* (ctl-hwnd ctl) #x0D (+ n 1) buf)                      ; WM_GETTEXT
+                     (prog1 (or (modus-int::w32-wstr buf) "") (modus-int::w32-free buf (* 2 (+ n 1)))))))))))
+
 (defun set-value (h v)
-  (let ((ctl (ctl-of h)))
+  (let* ((ctl (ctl-of h)) (f (gethash (ctl-kind ctl) *set-value-handlers*)))
+    (when f (funcall f h v) (return-from set-value 0))
     (when (eq (ctl-kind ctl) :slider)
       (setf (ctl-value ctl) v)
       (c *send-message* (ctl-hwnd ctl) #x405 1 v))
@@ -1289,7 +1351,10 @@
 
 (defvar *frame-wait* 0 "The main view's frame latency waitable object (flip model): the frame clock waits on it.")
 
-(defstruct view (hwnd 0) (swap 0) (rtv 0) (dsv 0) (depth 0) (w 0) (h 0) (print nil))
+(defstruct view (hwnd 0) (swap 0) (rtv 0) (dsv 0) (depth 0) (w 0) (h 0) (print nil)
+  ;; HDR (gpu_view_hdr): the passes draw into SCENE, half floats in extended sRGB; HDR-RESOLVE converts it into the
+  ;; back buffer (BACK, its render target), half floats in scRGB
+  (hdr nil) (back 0) (scene 0) (scene-srv 0))
 
 (defvar *main-view* nil "The first view: the app's window's.")
 
@@ -1367,6 +1432,16 @@
     (release bb))
   (multiple-value-bind (w h) (hwnd-size (view-hwnd v))
     (setf (view-w v) w (view-h v) h))
+  (when (view-hdr v)
+    ;; the passes draw into a half-float scene the size of the window; the back buffer's target is kept for the resolve
+    (setf (view-back v) (view-rtv v))
+    (let ((d (area 0)))
+      (zero d 44)
+      (poke32 d (max 1 (view-w v))) (poke32 (+ d 4) (max 1 (view-h v))) (poke32 (+ d 8) 1) (poke32 (+ d 12) 1)
+      (poke32 (+ d 16) 10) (poke32 (+ d 20) 1) (poke32 (+ d 32) #x28)        ; R16G16B16A16_FLOAT, RENDER_TARGET|SRV
+      (setf (view-scene v) (created (m *dev* 5 d 0 (out0)) "CreateTexture2D (HDR scene)"))
+      (setf (view-rtv v) (created (m *dev* 9 (view-scene v) 0 (out0)) "CreateRenderTargetView (HDR scene)")
+            (view-scene-srv v) (created (m *dev* 7 (view-scene v) 0 (out0)) "CreateShaderResourceView (HDR scene)"))))
   (let ((d (area 0)))
     (zero d 44)
     (poke32 d (max 1 (view-w v))) (poke32 (+ d 4) (max 1 (view-h v))) (poke32 (+ d 8) 1) (poke32 (+ d 12) 1)
@@ -1402,9 +1477,14 @@
 
 (defun resize-targets (v)
   (m *ctx* 33 0 0 0)                              ; OMSetRenderTargets(0, NULL, NULL)
-  (setf (view-rtv v) (release (view-rtv v)) (view-dsv v) (release (view-dsv v)) (view-depth v) (release (view-depth v)))
+  (release-targets v)
   (check (m (view-swap v) 13 0 0 0 0 (if *flip* #x40 0)) "ResizeBuffers")
   (make-targets v))
+
+(defun release-targets (v)
+  (setf (view-rtv v) (release (view-rtv v)) (view-dsv v) (release (view-dsv v)) (view-depth v) (release (view-depth v))
+        (view-back v) (release (view-back v)) (view-scene-srv v) (release (view-scene-srv v))
+        (view-scene v) (release (view-scene v))))
 
 (defun gpu-handle (kind &rest data) (new-handle (make-ctl :kind kind :data data)))
 (defun gpu-data (h) (ctl-data (ctl-of h)))
@@ -1575,6 +1655,7 @@
     (when (and (eq v *main-view*) *stat-last-tick*)
       (setf *stat-work* (max *stat-work* (- (get-internal-real-time) *stat-last-tick*))))
     (when (and *flip* (eq v *main-view*)) (frame-statistics v))
+    (when (view-hdr v) (hdr-resolve v))
     (let ((hr (logand (m (view-swap v) 8 (if *flip* 1 0) 0) #xFFFFFFFF)))   ; Present: on the refresh (flip)
       (unless (or (zerop hr) (eql hr *last-present*))
         (format t "~&vessel-windows: Present answered #x~8,'0X~%" hr))
@@ -1674,6 +1755,132 @@
     (unless (= stage 1) (m *ctx* 7 index 1 (ptr-cell 6 b)))
     (unless (= stage 0) (m *ctx* 16 index 1 (ptr-cell 6 b)))
     0))
+
+;;; HIGH DYNAMIC RANGE (gpu_view_hdr, gpu_headroom): gpu.lisp's contract is WebGPU's 'extended' mode -- a shader writes
+;;; extended sRGB, as before, and past 1.0 is brighter than white.  Windows' HDR is scRGB: linear, half floats, 1.0 = 80
+;;; nits.  So an HDR view's swap chain is R16G16B16A16_FLOAT in DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, its passes draw
+;;; into a half-float scene texture (VIEW-RTV is the scene's), and before each Present HDR-RESOLVE draws one triangle
+;;; over the back buffer that decodes the sRGB curve (sign kept, so the curve goes on past 1.0) and scales by Windows'
+;;; SDR white (Settings > Display > HDR: "SDR content brightness"), so white stays the white of everything else and
+;;; past it is brighter.  The headroom is the display's peak over that white, while Windows' HDR is on (the output's
+;;; colour space is ST.2084); 1.0 otherwise.  Needs the flip model.  A snapshot or a print of an HDR view is not made
+;;; (they read 8-bit back buffers).
+;;; IDXGISwapChain 15 GetContainingOutput; IDXGISwapChain3 38 SetColorSpace1; IDXGIOutput6 27 GetDesc1 (ColorSpace at
+;;; +100, MaxLuminance at +140).
+
+(defparameter *hdr-shader* "
+cbuffer HdrResolve : register(b12) { float sdr_white; float3 pad; };
+Texture2D<float4> scene : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position {
+  float2 p = float2((id << 1) & 2, id & 2);
+  return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float3 linear_of(float3 c) {
+  float3 a = abs(c);
+  float3 l = a <= 0.04045 ? a / 12.92 : pow((a + 0.055) / 1.055, 2.4);
+  return sign(c) * l;
+}
+float4 ps(float4 pos : SV_Position) : SV_Target {
+  float4 c = scene.Load(int3(pos.xy, 0));
+  return float4(linear_of(c.rgb) * sdr_white, 1);
+}")
+
+(defvar *hdr-vs* 0)
+(defvar *hdr-ps* 0)
+(defvar *headroom* 1.0)
+(defvar *headroom-at* nil)
+(defvar *sdr-white* 1.0 "Windows' SDR white, in scRGB units (80 nits each).")
+
+(defun hdr-shaders ()
+  (when (zerop *hdr-vs*)
+    (let* ((n (length *hdr-shader*)) (src (modus-int::w32-alloc (+ n 1))))
+      (dotimes (i n) (poke8 (+ src i) (char-code (char *hdr-shader* i))))
+      (let ((vb (compile-hlsl src n "vs" "vs_5_0")) (pb (compile-hlsl src n "ps" "ps_5_0")))
+        (unless (or (zerop vb) (zerop pb))
+          (setf *hdr-vs* (created (m *dev* 12 (m vb 3) (m vb 4) 0 (out0)) "CreateVertexShader (HDR)")
+                *hdr-ps* (created (m *dev* 15 (m pb 3) (m pb 4) 0 (out0)) "CreatePixelShader (HDR)")))
+        (release vb) (release pb))))
+  (plusp *hdr-ps*))
+
+(defun view-hdr-set (v on)
+  "V in HDR (ON) or back to 8 bits: true if it is HDR now."
+  (when (or (null v) (zerop (view-swap v)) (not *flip*)) (return-from view-hdr-set nil))
+  (when (and on (not (hdr-shaders))) (return-from view-hdr-set nil))
+  (unless (eq (and on t) (view-hdr v))
+    (m *ctx* 33 0 0 0)                                                    ; OMSetRenderTargets(0, NULL, NULL)
+    (release-targets v)
+    (check (m (view-swap v) 13 0 0 0 (if on 10 28) #x40) "ResizeBuffers (HDR)")
+    (let ((sc3 (created (m (view-swap v) 0 (guid-at (area 1) "94d99bdb-f1f8-4ab0-b236-7da0170edab1") (out0))
+                        "IDXGISwapChain3")))
+      (let ((hr (m sc3 38 (if on 1 0))))                                  ; SetColorSpace1: scRGB, or sRGB
+        (when (failed-p hr) (format t "~&vessel-windows: HDR: SetColorSpace1 #x~8,'0X~%" (logand hr #xFFFFFFFF))))
+      (release sc3))
+    (setf (view-hdr v) (and on t) *headroom-at* nil)
+    (make-targets v)
+    (format t "~&vessel-windows: ~:[standard~;high~] dynamic range, headroom ~,2F, SDR white ~D nits~%"
+            on (hdr-headroom) (round (* 80 *sdr-white*))))
+  (view-hdr v))
+
+(defun hdr-resolve (v)
+  "The scene, as scRGB, onto the back buffer."
+  (m *ctx* 33 1 (ptr-cell 4 (view-back v)) 0)                            ; the back buffer, no depth
+  (let ((k (cbuf 12)) (mapped (area 3)))
+    (zero mapped 16)
+    (check (m *ctx* 14 k 0 4 0 mapped) "Map (HDR)")
+    (poke32 (peek64 mapped) (fbits *sdr-white*))
+    (m *ctx* 15 k 0)
+    (m *ctx* 16 12 1 (ptr-cell 6 k)))                                    ; PSSetConstantBuffers b12
+  (m *ctx* 43 (aref *rasters* 0))
+  (m *ctx* 36 (aref *depths* 0) 0)
+  (m *ctx* 17 0)
+  (m *ctx* 24 4)                                                          ; a triangle list
+  (m *ctx* 11 *hdr-vs* 0 0)
+  (m *ctx* 9 *hdr-ps* 0 0)
+  (m *ctx* 8 0 1 (ptr-cell 7 (view-scene-srv v)))                         ; PSSetShaderResources t0
+  (m *ctx* 13 3 0)                                                        ; Draw(3, 0)
+  (m *ctx* 8 0 1 (ptr-cell 7 0)))                                         ; let go of the scene: next frame's target
+
+(defun sdr-white-level ()
+  "Windows' SDR white for the first active display, in scRGB units (DISPLAYCONFIG_SDR_WHITE_LEVEL: 1000 = 80 nits)."
+  (let ((np (cell 20)) (nm (cell 21)))
+    (poke32 np 0) (poke32 nm 0)
+    (when (failed-p (c *display-config-sizes* 2 np nm)) (return-from sdr-white-level 1.0))   ; QDC_ONLY_ACTIVE_PATHS
+    (let* ((paths (modus-int::w32-alloc (* 72 (max 1 (peek32 np)))))
+           (modes (modus-int::w32-alloc (* 64 (max 1 (peek32 nm)))))
+           (level
+             (when (and (not (failed-p (c *query-display-config* 2 np paths nm modes 0))) (plusp (peek32 np)))
+               (let ((info (area 4)))
+                 (zero info 24)
+                 (poke32 info 11) (poke32 (+ info 4) 24)                   ; GET_SDR_WHITE_LEVEL, its size
+                 (poke64 (+ info 8) (peek64 (+ paths 20)))                ; the first path's target: adapter
+                 (poke32 (+ info 16) (peek32 (+ paths 28)))               ; and id
+                 (and (not (failed-p (c *display-config-info* info))) (peek32 (+ info 20)))))))
+      (modus-int::w32-free paths (* 72 (max 1 (peek32 np))))
+      (modus-int::w32-free modes (* 64 (max 1 (peek32 nm))))
+      (if (and level (plusp level)) (/ level 1000.0) 1.0))))
+
+(defun hdr-headroom ()
+  "How many times SDR white the main view's display shows now: its peak over SDR white while Windows' HDR is on, 1.0
+   otherwise.  Asked again at most once a second."
+  (let ((now (get-internal-real-time)))
+    (when (or (null *headroom-at*) (> (- now *headroom-at*) internal-time-units-per-second))
+      (setf *headroom-at* now *headroom* 1.0)
+      (let ((v *main-view*))
+        (when (and v (plusp (view-swap v)) (not (failed-p (m (view-swap v) 15 (out0)))))
+          (let* ((output (peek64 (cell 0)))
+                 (o6 (progn (poke64 (cell 1) 0)
+                            (if (failed-p (m output 0 (guid-at (area 1) "068346e8-aaec-4b84-add7-137f513f77a1") (cell 1)))
+                                0 (peek64 (cell 1))))))
+            (unless (zerop o6)
+              (let ((d (area 4)))
+                (zero d 152)
+                (when (and (not (failed-p (m o6 27 d))) (= (peek32 (+ d 100)) 12))   ; HDR on: ST.2084
+                  (setf *sdr-white* (sdr-white-level))
+                  (let ((peak (/ (modus-int::%bits->single (peek32 (+ d 140))) 80.0)))
+                    (setf *headroom* (max 1.0 (/ peak *sdr-white*))))))
+              (release o6))
+            (release output))))))
+  *headroom*)
 
 ;;; THE FIRST VERTEX.  Metal's vertex_id counts from the draw's first vertex (a draw of 6 from 300 sees 300..305);
 ;;; Direct3D's SV_VertexID counts from 0 whatever StartVertexLocation says, and leaves out an indexed draw's base
@@ -3369,8 +3576,9 @@
                          (ui-post f args (lambda (r m) (next (rest steps) r m)) extra)))))))
     (next steps nil 0)))
 
-(defun choose (folder-p title kind h &optional key)
-  "Windows' file dialog for a file or (FOLDER-P) a folder; then (KIND H path), and the folder kept under KEY."
+(defun choose (folder-p title kind h &optional key filter)
+  "Windows' file dialog for a file or (FOLDER-P) a folder; then (KIND H path), and the folder kept under KEY.
+   FILTER, (name spec) such as (\"Pictures\" \"*.png;*.jpg\"), limits the files offered."
   (let ((dialog 0) (item 0) (path ""))
     (flet ((ok (r) (not (failed-p (or r 0)))))
       (ui-chain
@@ -3387,6 +3595,16 @@
           (when (ok r)
             (setf dialog (peek64 (+ mem 32)))
             (list (vslot dialog 9) (list dialog (if folder-p #x60 #x1840)))))    ; SetOptions
+        (lambda (r mem) (declare (ignore r mem))
+          (if (and filter (not folder-p))                                     ; SetFileTypes: one COMDLG_FILTERSPEC
+              (destructuring-bind (name spec) filter
+                (list (vslot dialog 4)
+                      (list dialog 1 (lambda (m)
+                                       (poke64 m (wide-at (+ m 16) name))
+                                       (poke64 (+ m 8) (wide-at (+ m 16 (* 2 (+ 1 (length name)))) spec))
+                                       m))
+                      (+ 16 (* 4 (+ 2 (length name) (length spec))))))
+              (list *sleep* (list 0))))                                       ; nothing to do: a no-op call
         (lambda (r mem) (declare (ignore r mem))
           (list (vslot dialog 17) (list dialog (lambda (m) (wide-at m title))) (* 2 (+ 1 (length title)))))
         (lambda (r mem) (declare (ignore r mem)) (list (vslot dialog 3) (list dialog *hwnd*)))   ; Show: modal
@@ -3554,15 +3772,22 @@
 (defswift "ui_set_text" (h a n) (set-text h a n))
 (defswift "ui_set_value" (h v) (set-value h v))
 (defswift "ui_set_frame" (h x y w hh)
-  (c *set-window-pos* (ctl-hwnd (ctl-of h)) 0 (px x) (px y) (px w) (px hh) #x14) 0)
-(defswift "ui_add" (parent child)
-  (let ((ch (ctl-of child)))
-    (if (eq (ctl-kind ch) :view)                  ; a GPU view: drawn in the parent's window, filling it
-        (view-attach (view-of child) (ctl-hwnd (ctl-of parent)))
-        (u *set-parent* (ctl-hwnd ch) (ctl-hwnd (ctl-of parent)))))
+  (let ((f (gethash (ctl-kind (ctl-of h)) *frame-handlers*)))
+    (if f
+        (funcall f h x y w hh)
+        (c *set-window-pos* (ctl-hwnd (ctl-of h)) 0 (px x) (px y) (px w) (px hh) #x14)))
   0)
+(defswift "ui_add" (parent child)
+  (let ((ch (ctl-of child)) (f (gethash (ctl-kind (ctl-of parent)) *add-handlers*)))
+    (cond (f (funcall f parent child))
+          ((eq (ctl-kind ch) :view)                  ; a GPU view: drawn in the parent's window, filling it
+           (view-attach (view-of child) (ctl-hwnd (ctl-of parent))))
+          (t (u *set-parent* (ctl-hwnd ch) (ctl-hwnd (ctl-of parent))))))
+  0)
+(defswift "ui_text_value" (h buf cap) (answer-text (text-value h) buf cap))
 (defswift "ui_remove" (h)
-  (let ((ctl (ctl-of h)))
+  (let* ((ctl (ctl-of h)) (f (gethash (ctl-kind ctl) *remove-handlers*)))
+    (when f (funcall f h))
     (unless (zerop (ctl-hwnd ctl)) (remhash (ctl-hwnd ctl) *by-hwnd*) (u *destroy-window* (ctl-hwnd ctl)))
     (remhash h *ctls*))
   0)
@@ -3719,8 +3944,8 @@
     v))
 (defswift "gpu_view_size" (view) (view-size view))
 (defswift "gpu_view_print" (view) (setf (view-print (view-of view)) t) 0)
-(defswift "gpu_view_hdr" (view on) 0)             ; standard range: see the top of this file
-(defswift "gpu_headroom" () 1000)
+(defswift "gpu_view_hdr" (view on) (if (view-hdr-set (view-of view) (eql on 1)) 1 0))
+(defswift "gpu_headroom" () (round (* 1000 (hdr-headroom))))
 (defswift "gpu_shader_new" (a n) (shader-new a n))
 (defswift "gpu_pipeline_new" (s va vn fa fn) (pipeline-new s va vn fa fn))
 (defswift "gpu_buffer_new" (a n) (buffer-new a n))
@@ -3779,6 +4004,9 @@
    event is the host's own term (%NEXT-EVENT) -- nothing of Lisp's is reached through an address a collection can move."
   (setf (fdefinition (find-symbol "SWIFT-CALL" "KILN-SWIFT")) #'host-call
         (fdefinition (find-symbol "%ADDR" "KILN-SWIFT")) #'token
+        ;; a term (titles, rows) is not encoded at all: the host is Lisp, so it gets the term itself, in a vector of
+        ;; one that TERM-ARG opens
+        (fdefinition (find-symbol "%TERM-OCTETS" "KILN-SWIFT")) (lambda (term) (vector term))
         (fdefinition (find-symbol "%NEXT-EVENT" "KILN-SWIFT")) (lambda () (pop *ui-events*))))
 
 (defun swift (frame)
@@ -3819,3 +4047,15 @@
 (defun cl-user::%kiln-sys (n a b c &optional (d 0) (e 8))
   (declare (ignore d e))
   (sys n a b c))
+
+;;; ---- the widgets ------------------------------------------------------------------------------------------------------
+;;;
+;;; The rest of ios-swift.lisp's components -- switches, text fields, lists, stacks, sheets, gestures and the rest -- are
+;;; in five files beside this one, each a group of DEFSWIFTs on the extension points above.  An app that makes them
+;;; loads them after this file: (vessel-windows:load-widgets).
+
+(defvar *src-dir* (make-pathname :name nil :type nil :defaults *load-truename*))
+
+(defun load-widgets ()
+  (dolist (f '("win-ui-controls" "win-ui-choices" "win-ui-containers" "win-ui-nav" "win-ui-gestures"))
+    (load (merge-pathnames (concatenate 'string f ".lisp") *src-dir*))))
