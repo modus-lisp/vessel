@@ -570,8 +570,13 @@
                   (unless (zerop v) (t4-log "~a ~5,'0x ~8,'0x" label o v)))))
      (t4-log-flush))))
 
+(defvar *t4-idle-seen* nil)
+
 (defun %t4-log-idle ()
   "From the desk's idle wait: run a new disk command; flush, at most every 2 s."
+  (unless *t4-idle-seen*                 ; the desk's start, profiled (t420-desk.lisp %T4-PHASE)
+    (setq *t4-idle-seen* t)
+    (when (fboundp '%t4-phase) (funcall '%t4-phase "desk up (first idle)")))
   (%t4-ring-drain)
   (ignore-errors (%t4-cmd-poll))
   (when (and (> *t4-log-n* *t4-log-flushed*)
