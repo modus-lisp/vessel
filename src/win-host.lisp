@@ -1789,8 +1789,8 @@
 ;;;
 ;;; The block: +#x00 WaitForSingleObject  +#x08 memcpy  +#x10 the event  +#x18 IAudioClient  +#x20 IAudioRenderClient
 ;;; +#x28 the device buffer's frames  +#x30 the ring  +#x38 its size - 1  +#x40 bytes ever written (dword, the app's)
-;;; +#x48 bytes ever read (dword, the thread's)  +#x50 the device's padding (frames)  +#x58 underruns: times the device
-;;; was empty with nothing in the ring, once sound had begun  +#x68 a padding cell  +#x70 a buffer pointer cell
+;;; +#x48 bytes ever read (dword, the thread's)  +#x50 the device's padding (frames)  +#x58 underruns: wakes that found
+;;; the device empty once sound had begun -- it had played silence, whatever the ring held  +#x68 a padding cell  +#x70 a buffer pointer cell
 ;;; +#x78 frames being copied  +#x80 stop  +#x100 the code.  The two counters are dwords, so each side reads and
 ;;; writes them whole, and wrap with the ring (its size divides 2^32).
 ;;; IAudioClient 3 Initialize, 4 GetBufferSize, 6 GetCurrentPadding, 10 Start, 13 SetEventHandle, 14 GetService;
@@ -1813,12 +1813,14 @@
        #x48 #x8B #x01 #xFF #x50 #x30               ; GetCurrentPadding
        #x85 #xC0 (:j ,js :loop)
        #x8B #x43 #x68 #x48 #x89 #x43 #x50          ; padding -> +0x50
+       #x48 #x85 #xC0 (:j ,jne :nonempty)          ; the device empty once sound has begun: it played silence
+       #x83 #x7B #x40 #x00 (:j ,je :nonempty)
+       #x48 #xFF #x43 #x58                         ; an underrun
+       #x8B #x43 #x68                              ; eax = padding again (0)
+       (:label :nonempty)
        #x48 #x8B #x73 #x28 #x48 #x29 #xC6 (:j ,jle :loop)        ; rsi = room (frames)
        #x8B #x7B #x40 #x2B #x7B #x48 #xC1 #xEF #x02              ; edi = frames in the ring
-       #x85 #xFF (:j ,jne :have)
-       #x48 #x83 #x7B #x50 #x00 (:j ,jne :loop)    ; the device still has some: not a gap
-       #x83 #x7B #x40 #x00 (:j ,je :loop)          ; nothing ever written: not begun
-       #x48 #xFF #x43 #x58 (:j ,jmp :loop)         ; an underrun
+       #x85 #xFF (:j ,je :loop)                    ; nothing in the ring
        (:label :have)
        #x48 #x39 #xFE (:j ,jbe :keep) #x48 #x89 #xFE   ; rsi = min(room, ring)
        (:label :keep)
@@ -1863,8 +1865,8 @@
         (zero wf 20)
         (poke16 wf 1) (poke16 (+ wf 2) channels) (poke32 (+ wf 4) rate) (poke32 (+ wf 8) (* rate channels 2))
         (poke16 (+ wf 12) (* channels 2)) (poke16 (+ wf 14) 16)
-        ;; shared; EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY; a 30 ms device buffer
-        (unless (ok (m client 3 0 #x88040000 300000 0 wf 0)) (release client) (fail "Initialize refused")))
+        ;; shared; EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY; a 60 ms device buffer: slack for a late wake
+        (unless (ok (m client 3 0 #x88040000 600000 0 wf 0)) (release client) (fail "Initialize refused")))
       (let ((event (c *create-event* 0 0 0 0)))
         (m client 13 event)                                              ; SetEventHandle
         (poke32 (cell 1) 0)
@@ -1910,6 +1912,34 @@
 (defvar *audio-seams* 0 "Chunk boundaries this second where a channel jumped more than 1/16 of full scale: a click.")
 (defvar *audio-last* (list 0 0) "The last chunk's last left and right samples.")
 
+(defvar *record* (let ((p (modus-int::%cli-getenv "VESSEL_RECORD"))) (and p (plusp (length p)) p))
+  "VESSEL_RECORD=PATH: the first 20 seconds of what the app hands the speaker, written to PATH as a WAV.")
+(defvar *recording* nil)
+(defvar *recording-at* 0)
+
+(defun record-samples (src n)
+  (when (and *record* (not (eq *recording* :done)))
+    (unless *recording* (setf *recording* (make-array (* 2 48000 20) :element-type '(signed-byte 16) :initial-element 0)))
+    (dotimes (i n)
+      (when (< *recording-at* (length *recording*))
+        (setf (aref *recording* *recording-at*) (ash (s32 (peek32 (+ src (* 8 i)))) -1))
+        (incf *recording-at*)))
+    (when (>= *recording-at* (length *recording*))
+      (let* ((data (* 2 (length *recording*))) (b (make-array (+ 44 data) :element-type '(unsigned-byte 8))))
+        (flet ((put32 (o v) (dotimes (k 4) (setf (aref b (+ o k)) (ldb (byte 8 (* 8 k)) v))))
+               (put16 (o v) (dotimes (k 2) (setf (aref b (+ o k)) (ldb (byte 8 (* 8 k)) v)))))
+          (loop for ch across "RIFF" for k from 0 do (setf (aref b k) (char-code ch)))
+          (put32 4 (+ 36 data))
+          (loop for ch across "WAVEfmt " for k from 8 do (setf (aref b k) (char-code ch)))
+          (put32 16 16) (put16 20 1) (put16 22 2) (put32 24 48000) (put32 28 192000) (put16 32 4) (put16 34 16)
+          (loop for ch across "data" for k from 36 do (setf (aref b k) (char-code ch)))
+          (put32 40 data)
+          (loop for v across *recording* for k from 44 by 2 do (put16 k (logand v #xFFFF))))
+        (with-open-file (f *record* :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+          (write-sequence b f))
+        (format t "~&vessel-windows: 20 s of the speaker's samples written to ~A~%" *record*)
+        (setf *recording* :done)))))
+
 (defun audio-gap-count () (if (wasapi-p) (peek64 (+ *wa* #x58)) *audio-gaps*))
 
 (defun audio-write (src n)
@@ -1917,6 +1947,7 @@
   (cond
     ((null *speaker*) -1)
     ((wasapi-p)
+     (record-samples src n)
      (let* ((wr (peek32 (+ *wa* #x40))) (ring (peek64 (+ *wa* #x30))) (mask (- +ring-bytes+ 1))
             (q (floor (+ (ring-filled) (* 4 (peek64 (+ *wa* #x50)))) 4)))
        (setf *audio-least* (if *audio-least* (min *audio-least* q) q))
