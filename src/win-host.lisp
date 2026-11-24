@@ -34,6 +34,7 @@
 ;;;;   the camera        Media Foundation: frames as BGRA, a preview, a JPEG (WIC), video (H.264, MPEG-4; no sound)
 ;;;;                     -- UNTESTED: written on a PC with no camera
 ;;;;   files, folders    Windows' file dialog (IFileOpenDialog), on the windows' thread; a folder kept under a key
+;;;;   Bluetooth LE      modus's WinRT radio (net/win32-ble.lisp), polled each frame: chirp's mesh links
 ;;;;   not on a PC       head tracking, the phone's motion, the watch's link: each answers that it is not here
 ;;;;
 ;;;; THE ONE THREAD.  The window is made by, and its messages are pumped on, the thread that runs the app (Win32
@@ -1013,6 +1014,7 @@
   (when *loopback* (loopback-poll))
   (when *np* (np-poll))
   (when *cameras* (cam-tick))
+  (when *ble* (ble-poll))
   (run-timers)
   0)
 
@@ -3381,6 +3383,41 @@
   (let ((path (cdr (assoc key (remembered-folders) :test #'string=))))
     (if (and path (probe-file (concatenate 'string (string-right-trim "/" path) "/"))) path "")))
 
+;;; ---- Bluetooth LE (ble_*: ios-native.lisp's BLE-START, chirp's mesh) -------------------------------------------------
+;;;
+;;; What Bluetooth.swift is on Apple: modus's own Windows radio (net/win32-ble.lisp, WinRT), which has Bluetooth.swift's
+;;; shape -- a central and a peripheral of one service, links by number -- and its events.  Nothing here blocks: the
+;;; radio is polled each frame and each of its events goes on as :ble, handle 0, the value the event itself:
+;;; (:state on) (:link link up max) (:data link bytes) (:log text).
+
+(defvar *ble* nil "modus's radio, while it is on.")
+
+(defun ble-start (service characteristic)
+  (if *ble*
+      1
+      (multiple-value-bind (radio why) (modus-int::w32-ble-start service characteristic)
+        (if radio
+            (progn (setf *ble* radio) 1)
+            (progn (format t "~&vessel-windows: Bluetooth: ~A~%" why)
+                   (ui-event (list :ble 0 (list :state 0)))
+                   0)))))
+
+(defun ble-poll ()
+  (dolist (e (modus-int::w32-ble-poll *ble*))
+    (ui-event (list :ble 0 e))))
+
+(defun ble-send (link addr n)
+  (if (and *ble* (plusp n))
+      (let* ((arr (token-array addr))
+             (bytes (make-array n :element-type '(unsigned-byte 8))))
+        (dotimes (i n) (setf (aref bytes i) (if arr (aref arr i) (peek8 (+ addr i)))))
+        (if (modus-int::w32-ble-send *ble* link bytes) 1 0))
+      0))
+
+(defun ble-stop ()
+  (when *ble* (modus-int::w32-ble-stop *ble*) (setf *ble* nil))
+  0)
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -3538,6 +3575,11 @@
 (defswift "files_choose_folder" (a n)
   (choose t "Choose a Folder" :folder (new-handle (make-ctl :kind :picker)) (and (plusp n) (utf8-text a n))))
 (defswift "files_folder_path" (a n buf cap) (answer-text (folder-path (utf8-text a n)) buf cap))
+
+;; Bluetooth LE: modus's WinRT radio
+(defswift "ble_start" (sa sn ca cn) (ble-start (utf8-text sa sn) (utf8-text ca cn)))
+(defswift "ble_send" (link a n) (ble-send link a n))
+(defswift "ble_stop" () (ble-stop))
 
 ;; the phone's motion and the watch's link: neither is here (a PC)
 (defswift "device_motion" (on) 0)
