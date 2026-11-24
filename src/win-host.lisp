@@ -21,7 +21,8 @@
 ;;;;                     own class, rounded, so its children's notifications reach the same ring
 ;;;;   menus             the window's menu bar; Ctrl+KEY for a Mac's Command+KEY
 ;;;;   the status item   an icon in the notification area: its tooltip the title, its menu on a click;
-;;;;                     notifications are toasts (an App User Model ID registered per user), else its balloons
+;;;;                     notifications are toasts (an App User Model ID registered per user, on a Start menu
+;;;;                     shortcut the app makes), else its balloons
 ;;;;   alerts            MessageBoxW (OK, or OK and Cancel)
 ;;;;   the speaker       modus's own waveOut speaker (net/win32-audio.lisp: W32-AUDIO-OPEN ...)
 ;;;;   game controllers  XInput (an Xbox controller, or anything that presents as one)
@@ -1337,10 +1338,66 @@
                       (let ((logo (namestring (merge-pathnames "../windows/out/stage/Assets/Square150x150Logo.png" *src-dir*))))
                         (when (probe-file logo) (put "IconUri" (substitute #\\ #\/ (namestring (probe-file logo)))))))
                     (c reg-close key))
+                  (start-menu-shortcut id name)
                   (c explicit (wide1 id))
                   (format t "~&vessel-windows: notifications are toasts, as ~A~%" id)
                   id)
               (error (e) (format t "~&vessel-windows: no toasts (~A): balloons instead~%" e) :none)))))
+
+;;; THE START MENU SHORTCUT.  Windows shows an unpackaged app's toasts only when its ID is on a Start menu shortcut
+;;; (measured: with the registry key alone, a toast was taken and kept in the history but never shown, while one
+;;; under PowerShell's ID -- which has its shortcut -- showed).  So an app makes its own, in the user's Start menu
+;;; (no administrator), named for it and carrying its ID (System.AppUserModel.ID), that starts it as it was started
+;;; this time: this executable, these arguments, this directory.  It is rewritten each run, so it follows the app.
+;;; IShellLinkW 7 SetDescription, 9 SetWorkingDirectory, 11 SetArguments, 20 SetPath; IPropertyStore 6 SetValue,
+;;; 7 Commit; IPersistFile 6 Save.
+
+(defun command-arguments ()
+  "This process's command line after its executable (GetCommandLineW), as given."
+  (let* ((line (or (modus-int::w32-wstr (c (modus-int::w32-proc "kernel32.dll" "GetCommandLineW"))) ""))
+         (line (string-left-trim " " line))
+         (end (if (and (plusp (length line)) (char= (char line 0) #\"))
+                  (1+ (or (position #\" line :start 1) (1- (length line))))
+                  (or (position #\Space line) (length line)))))
+    (string-trim " " (subseq line (min end (length line))))))
+
+(defun start-menu-shortcut (id name)
+  "NAME.lnk in the user's Start menu, starting this app as it was started, carrying the App User Model ID ID."
+  (let* ((exe (progn (c (modus-int::w32-proc "kernel32.dll" "GetModuleFileNameW") 0 (area 5) 260)
+                     (modus-int::w32-wstr (area 5))))
+         (dir (progn (c (modus-int::w32-proc "kernel32.dll" "GetCurrentDirectoryW") 260 (area 5))
+                     (modus-int::w32-wstr (area 5))))
+         (programs (format nil "~A\\Microsoft\\Windows\\Start Menu\\Programs"
+                           (or (modus-int::%cli-getenv "APPDATA") (error "no APPDATA"))))
+         (file (format nil "~A\\~A.lnk" programs (remove-if (lambda (ch) (find ch "\\/:*?\"<>|")) name)))
+         (link (co-make "00021401-0000-0000-C000-000000000046" "000214F9-0000-0000-C000-000000000046")))
+    (when (zerop link) (error "no shell link"))
+    (unwind-protect
+         (progn
+           (m link 20 (wide1 exe))
+           (m link 11 (wide1 (command-arguments)))
+           (m link 9 (wide1 dir))
+           (m link 7 (wide1 name))
+           (let ((store (progn (poke64 (cell 13) 0)
+                               (m link 0 (guid-at (area 6) "886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99") (cell 13))
+                               (peek64 (cell 13)))))
+             (when (zerop store) (error "no property store on the link"))
+             (let ((key (area 7)) (pv (+ (area 7) 32)))
+               (guid-at key "9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3")          ; PKEY_AppUserModel_ID
+               (poke32 (+ key 16) 5)
+               (zero pv 24) (poke16 pv 31) (poke64 (+ pv 8) (wide2 id))     ; VT_LPWSTR
+               (when (failed-p (m store 6 key pv)) (release store) (error "the ID was refused"))
+               (m store 7))
+             (release store))
+           (let ((file-io (progn (poke64 (cell 13) 0)
+                                 (m link 0 (guid-at (area 6) "0000010B-0000-0000-C000-000000000046") (cell 13))
+                                 (peek64 (cell 13)))))
+             (when (zerop file-io) (error "no IPersistFile on the link"))
+             (let ((hr (m file-io 6 (wide1 file) 1)))
+               (release file-io)
+               (when (failed-p hr) (error "the shortcut was not saved (#x~8,'0X)" (logand hr #xFFFFFFFF)))))
+           (format t "~&vessel-windows: Start menu: ~A~%" file))
+      (release link))))
 
 (defun xml-text (s)
   (with-output-to-string (o)

@@ -34,9 +34,9 @@ Commands run from the workspace root. `modus` below is `.\modus-win64-hosted.exe
 
 ## Needs a person at the screen
 
-- [ ] **Toasts** (`notify_post`): a toast was taken by Windows and is in its notification history for the app's
-  ID (`ModusLisp.Vessel.<title>`, registered under `HKCUSoftwareClassesAppUserModelId`). Not yet seen by eye:
-  its look, its icon, and that a click on it brings the app forward.
+- [ ] **Toasts** (`notify_post`): seen on screen (2026-11-24), once the app's Start menu shortcut carried its ID
+  (`ModusLisp.Vessel.<title>`, also registered under `HKCU\Software\Classes\AppUserModelId`). Not yet checked:
+  that a click on one brings the app forward, and the badge icon (the exe's own, not the Vessel logo).
 - [ ] **hello3d looks the same in HDR mode on an SDR display.** Its view now always draws through the HDR path; it
   should look exactly as before. Nobody has looked yet.
 - [ ] **Typing** (WM_CHAR text input): real typing of letters, spaces, `;` and Backspace is verified. Not typed yet:
@@ -94,7 +94,7 @@ Commands run from the workspace root. `modus` below is `.\modus-win64-hosted.exe
 
 ## Already verified (for reference)
 
-Toasts (in Windows' notification history), window, frame pacing (flip model), raw-input mouse look, WASAPI speaker, generational GC, microphone capture rate,
+Toasts (seen on screen), window, frame pacing (flip model), raw-input mouse look, WASAPI speaker, generational GC, microphone capture rate,
 speech (aloud, to a file, file transcription), now playing (all commands through the session API), file and folder
 dialogs (picked by a person), Bluetooth radio start, text input (real typing), and the ~80 widgets' 210 automated
 checks (all five files loaded together).
