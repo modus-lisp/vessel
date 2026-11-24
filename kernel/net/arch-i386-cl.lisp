@@ -16,7 +16,7 @@
 ;;;; #x780000 / #x781000 — inside this image — and under last-defun-wins only a
 ;;;; later definition moves them.
 ;;;;
-;;;; Memory: the net block at #x04000000 .. #x04400000, which the boot stub
+;;;; Memory: the net block at #x0F000000 .. #x0F400000, which the boot stub
 ;;;; (boot/boot-i386-cl.lisp) maps from RAM on a machine of 32 MB or more and
 ;;;; whose physical address it records at #x80AC -- the E1000's rings are DMA'd.
 ;;;; NE2000 is port I/O.
@@ -80,23 +80,23 @@
   (mmio-do-write32)
   val)
 
-;; DMA: the net block, VA #x04000000 .. #x04400000, is RAM the stub mapped on a
+;; DMA: the net block, VA #x0F000000 .. #x0F400000, is RAM the stub mapped on a
 ;; machine of 32 MB or more; its physical address is the stub's word at #x80AC.
 (defun pc-net-block-p () (not (zerop (mem-ref #x80AC :u32))))
 
 (defun e1000-dma-addr (addr)
   "e1000.lisp's seam: the device's address for net-block address ADDR."
-  (+ (- addr #x04000000) (mem-ref #x80AC :u32)))
+  (+ (- addr #x0F000000) (mem-ref #x80AC :u32)))
 
 (defun e1000-map-bar (phys)
   "e1000.lisp's seam: the E1000's registers (128 KB) in the MMIO window."
   (pc-mmio-map phys #x20000))
 
 ;; the E1000's rings and buffers, in the net block past the state below
-(defun e1000-rx-desc-base () #x04200000)   ; 128 x 16
-(defun e1000-tx-desc-base () #x04201000)   ; 64 x 16
-(defun e1000-rx-buf-base ()  #x04210000)   ; 128 x 2048
-(defun e1000-tx-buf-base ()  #x04250000)   ; 64 x 1536
+(defun e1000-rx-desc-base () #x0F200000)   ; 128 x 16
+(defun e1000-tx-desc-base () #x0F201000)   ; 64 x 16
+(defun e1000-rx-buf-base ()  #x0F210000)   ; 128 x 2048
+(defun e1000-tx-buf-base ()  #x0F250000)   ; 64 x 1536
 
 ;; ============================================================
 ;; Timing / serial / entropy
@@ -128,7 +128,7 @@
           (max 20 (floor n 100))))))
 
 (defun %io-delay-iters ()
-  (let ((cell (if (zerop (mem-ref #x80AC :u32)) nil #x043FFFF0)))
+  (let ((cell (if (zerop (mem-ref #x80AC :u32)) nil #x0F3FFFF0)))
     (let ((k (if cell (mem-ref cell :u32) *io-delay-iters*)))
       (if (and k (> k 0))
           k
@@ -175,13 +175,13 @@
 ;; ============================================================
 ;; NE2000 host buffers and driver state
 ;; ============================================================
-(defun ne2k-rx-host ()       #x04000000)
-(defun ne2k-tx-host ()       #x04001000)
+(defun ne2k-rx-host ()       #x0F000000)
+(defun ne2k-tx-host ()       #x0F001000)
 (declaim (overridable e1000-state-base))
-(defun e1000-state-base ()   #x04060000)
+(defun e1000-state-base ()   #x0F060000)
 (declaim (overridable fe-scratch-base))
-(defun fe-scratch-base ()    #x04060900)
+(defun fe-scratch-base ()    #x0F060900)
 (declaim (overridable ssh-conn-base))
-(defun ssh-conn-base ()      #x04080000)
+(defun ssh-conn-base ()      #x0F080000)
 (declaim (overridable ssh-ipc-base))
-(defun ssh-ipc-base ()       #x04100000)
+(defun ssh-ipc-base ()       #x0F100000)

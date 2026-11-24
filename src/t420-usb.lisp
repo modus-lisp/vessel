@@ -21,8 +21,8 @@
 ;;;; the hardware it is meant to become usb-tree's EHCI backend in the kernel.
 ;;;;
 ;;;; MEMORY.  The controller reads its schedules by physical address, so they live in the net
-;;;; block (#x04000000, mapped by the boot stub, physical base at #x80AC), in the quarter the
-;;;; E1000 leaves alone: #x04300000 .. #x0430FFFF.  Every word the controller may read while it
+;;;; block (#x0F000000, mapped by the boot stub, physical base at #x80AC), in the quarter the
+;;;; E1000 leaves alone: #x0F300000 .. #x0F30FFFF.  Every word the controller may read while it
 ;;;; runs is written with ONE 32-bit store (%MMIO-WRITE32): a MEM-REF :U32 store on this tower is
 ;;;; two 16-bit halves, and a token half-written is a transfer half-armed.
 
@@ -45,9 +45,9 @@
 
 ;;; ---- memory ---------------------------------------------------------------------------------
 
-(defconstant +t4u-area+ #x04300000)
+(defconstant +t4u-area+ #x0F300000)
 (defun %t4u-va (off) (+ +t4u-area+ off))
-(defun %t4u-pa (va) (+ (- va #x04000000) (mem-ref #x80AC :u32)))
+(defun %t4u-pa (va) (+ (- va #x0F000000) (mem-ref #x80AC :u32)))
 (defun %t4u-w (va v) (modus-int::%mmio-write32 va (logand v #xFFFFFFFF)))
 (defun %t4u-r (va) (modus-int::%mmio-read32 va))
 
