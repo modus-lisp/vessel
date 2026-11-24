@@ -4155,5 +4155,5 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 (defvar *src-dir* (make-pathname :name nil :type nil :defaults *load-truename*))
 
 (defun load-widgets ()
-  (dolist (f '("win-ui-controls" "win-ui-choices" "win-ui-containers" "win-ui-nav" "win-ui-gestures"))
+  (dolist (f '("win-ui-controls" "win-ui-choices" "win-ui-containers" "win-ui-nav" "win-ui-gestures" "win-ui-app"))
     (load (merge-pathnames (concatenate 'string f ".lisp") *src-dir*))))

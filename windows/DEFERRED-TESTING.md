@@ -22,7 +22,8 @@ Commands run from the workspace root. `modus` below is `.\modus-win64-hosted.exe
 - [ ] **Dictation from the microphone** (`ear_*`, SAPI): the file path is verified (a WAV transcribed word for word);
   live listening starts but has only heard silence. Speak a sentence and read `ear_text`.
 - [ ] **Bluetooth LE link** (`ble_*`): the radio comes on, scans and offers the service. Not done: a link to a peer
-  and data both ways. Needs a second device running chirp.
+  and data both ways. Needs a second device running chirp: run `modus --script vessel\src\chirp-windows.lisp`
+  beside a phone or Mac running chirp, and check each sees the other in Nearby and their messages cross.
 - [ ] **Spatial sound** (`spatial_*`, ISpatialAudioClient): only the fallback (panning) has run; this PC's output has
   no spatial format on. Turn on Windows Sonic for Headphones (Settings > System > Sound > the device > Spatial
   audio), run hello3d, and listen for the hums placed in 3D as the camera turns.
@@ -55,6 +56,10 @@ Commands run from the workspace root. `modus` below is `.\modus-win64-hosted.exe
   - [ ] context, edit and row-action menus (right-click or long press): choose an item
   - [ ] calendar: click a day (the real MCN_SELECT notification)
   - [ ] stepper: keyboard arrows
+- [ ] **chirp by hand** (`win-ui-app.lisp`, the native app layer): pictured by its tour (`CHIRP_TOUR=dir`: chat,
+  a message sent, Nearby, Radio Log, Nickname), where Send and Back were called directly because clicks posted by a
+  script were handled several frames late. Click Send and Back with the mouse, press Enter in the compose bar,
+  choose from the ⋯ menu, and Save a new nickname.
 - [ ] **Widgets by eye**: the placeholder text in text fields and search bars, the spinner's animation, the icon
   glyphs `ui_image_new` maps (about 20 SF Symbol names to Segoe Fluent Icons code points, from memory), page dots,
   and the coloured panels and shapes.
@@ -77,6 +82,10 @@ Commands run from the workspace root. `modus` below is `.\modus-win64-hosted.exe
 - `ui_blur_new` is a dark fill, not a blur. `ui_share_present` copies to the clipboard (no share sheet).
 - Snapshots and printing do not work on an HDR view (they read 8-bit back buffers).
 - Camera recordings have no sound.
+- The native app layer (`app_*`) covers what chirp uses: navigation, bar buttons and menus, tables, the compose bar,
+  forms, Documents, the UTC offset. Not yet: browsers, screens shown whole (`app_screen`/`app_show`), alerts,
+  status bar, previews, sharing, table appends and placeholders, and the rest of Native.swift. Table rows are one
+  line ("title — subtitle"); the compose bar has no placeholder.
 - Head tracking, device motion and the watch link answer "not here" (no PC equivalent).
 
 ## Already verified (for reference)
