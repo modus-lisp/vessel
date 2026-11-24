@@ -447,11 +447,11 @@
 
 (defun %t4-log-udp (s)
   (when (and *t4-log-udp* (boundp '*t4-ip*) (consp (symbol-value '*t4-ip*))
-             (integerp (first (symbol-value '*t4-ip*))) (fboundp 'udp-send))
+             (integerp (first (symbol-value '*t4-ip*))) (fboundp 'modus-int::udp-send))
     (ignore-errors
       (let* ((n (min 1400 (+ 1 (length s)))) (b (make-array n :initial-element 10)))
         (dotimes (i (- n 1)) (setf (aref b i) (logand (char-code (char s i)) 255)))
-        (funcall 'udp-send (car *t4-log-udp*) (cdr *t4-log-udp*) (cdr *t4-log-udp*) b n)))))
+        (funcall 'modus-int::udp-send (car *t4-log-udp*) (cdr *t4-log-udp*) (cdr *t4-log-udp*) b n)))))
 
 (defun t4-log (fmt &rest args)
   "Append a line to the disk log, as FORMAT would print it (and send it, %T4-LOG-UDP)."
