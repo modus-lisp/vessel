@@ -26,8 +26,9 @@
 ;;;;   the speaker       modus's own waveOut speaker (net/win32-audio.lisp: W32-AUDIO-OPEN ...)
 ;;;;   game controllers  XInput (an Xbox controller, or anything that presents as one)
 ;;;;   location          Windows.Devices.Geolocation's Geolocator, through modus's WinRT layer
-;;;;   not on a PC       spatial sound (sound.lisp pans in its own mix), the phone's motion, the watch's link: each
-;;;;                     answers that it is not here
+;;;;   spatial sound     ISpatialAudioClient (Windows Sonic, Dolby Atmos, DTS:X), when the output has one turned on;
+;;;;                     else sound.lisp pans in its own mix
+;;;;   not on a PC       head tracking, the phone's motion, the watch's link: each answers that it is not here
 ;;;;
 ;;;; THE ONE THREAD.  The window is made by, and its messages are pumped on, the thread that runs the app (Win32
 ;;;; delivers a window's messages to its creator).  Every call here is synchronous, as the Swift calls are.
@@ -251,6 +252,7 @@
   (*init-common-controls* "comctl32.dll" "InitCommonControlsEx")
   (*dwm-flush* "dwmapi.dll" "DwmFlush")
   (*memcpy* "ntdll.dll" "memcpy")
+  (*memset* "ntdll.dll" "memset")
   (*d3d11-create-device* "d3d11.dll" "D3D11CreateDevice")
   (*create-dc* "gdi32.dll" "CreateDCW")
   (*delete-dc* "gdi32.dll" "DeleteDC")
@@ -2308,6 +2310,231 @@
   (setf *mic-state* 0)
   0)
 
+;;; ---- spatial sound (spatial_*: sound.lisp's SPATIAL-*) ---------------------------------------------------------------
+;;;
+;;; What Spatial.swift is on Apple: each voice a sound object placed in 3D by the platform's renderer -- here
+;;; ISpatialAudioClient, so Windows Sonic for Headphones, Dolby Atmos or DTS:X, whichever the output has turned on
+;;; (Settings > Sound > the device > Spatial audio).  With none on, the device offers no dynamic objects and
+;;; spatial_start answers 0: sound.lisp pans in its own mix, as before.
+;;; The samples are Lisp's (TONE, PLUCK), copied once into native memory as 32-bit floats (spatial_sound).  A thread
+;;; of native code waits on the stream's event and, each period (10 ms), for every voice: activates its object when
+;;; asked, copies the next period of its sound into the object's buffer (a looping sound wraps; a one-shot pads with
+;;; silence, then ends), and sets its position and volume.  Windows positions are the listener's own -- x right,
+;;; y up, z behind -- and a renderer places by direction only, so Lisp turns each world position into the listener's
+;;; frame and attenuates by distance as AVAudioEnvironmentNode does by default (inverse, reference 1 m), writing the
+;;; four floats the thread reads.
+;;; The block: +#x00 WaitForSingleObject  +#x08 memcpy  +#x10 the event  +#x18 ISpatialAudioObjectRenderStream
+;;; +#x20 memset  +#x28 stop  +#x30 available-objects cell  +#x38 frames-per-period cell  +#x40 buffer cell
+;;; +#x48 buffer-length cell  +#x50 slots  +#x58 periods run  +#x60 activations refused  +#x80 the object format
+;;; +#xA0 the activation parameters  +#xD0 their PROPVARIANT  +#x100 the code  +#x1000 the slots, 128 bytes each:
+;;; +0 wanted (Lisp's: 1 play, 0 stop)  +8 the object (the thread's)  +16 the samples  +24 their frames  +32 the
+;;; position in them (the thread's)  +40 loop  +48 x y z volume (floats, Lisp's)  +64 a one-shot ended (the thread's).
+;;; ISpatialAudioClient 4 GetNativeStaticObjectTypeMask, 5 GetMaxDynamicObjectCount, 10 ActivateSpatialAudioStream;
+;;; the stream 5 Start, 8 BeginUpdatingAudioObjects, 9 EndUpdatingAudioObjects, 10 ActivateSpatialAudioObject; an
+;;; object 3 GetBuffer, 4 SetEndOfStream, 7 SetPosition, 8 SetVolume.
+
+(defconstant +spatial-slots+ 32)
+(defvar *sp* 0 "The spatial block.")
+(defvar *sp-state* nil "NIL untried, :ON, or :OFF.")
+(defvar *sp-sounds* (make-array 0 :adjustable t :fill-pointer 0) "(address . frames) of each sound, by handle - 1.")
+(defvar *sp-listener* (list 0.0 0.0 0.0 0.0 0.0 -1.0 0.0 1.0 0.0) "Position, forward, up.")
+(defvar *sp-master* 1.0)
+(defvar *sp-voices* (make-array +spatial-slots+ :initial-element nil) "Each slot's (x y z gain) in the world.")
+
+(defun sp-slot (i) (+ *sp* #x1000 (* 128 i)))
+
+(defun spatial-code ()
+  (let ((jne '(#x0F #x85)) (je '(#x0F #x84)) (js '(#x0F #x88)) (jns '(#x0F #x89)) (jae '(#x0F #x83))
+        (jb '(#x0F #x82)) (jmp '(#xE9)))
+    (assemble
+     `(#x53 #x56 #x57 #x41 #x54 #x41 #x55 #x48 #x83 #xEC #x30    ; push rbx rsi rdi r12 r13; sub rsp,0x30
+       #x48 #x89 #xCB                              ; mov rbx,rcx    the block
+       (:label :loop)
+       #x48 #x83 #x7B #x28 #x00 (:j ,jne :out)     ; stop?
+       #x48 #x8B #x4B #x10 #xBA #x64 #x00 #x00 #x00 #xFF #x13    ; WaitForSingleObject(event, 100)
+       #x48 #x8B #x4B #x18 #x48 #x8D #x53 #x30 #x4C #x8D #x43 #x38   ; rcx stream, &available, &frames
+       #x48 #x8B #x01 #xFF #x50 #x40               ; BeginUpdatingAudioObjects
+       #x85 #xC0 (:j ,js :loop)
+       #x44 #x8B #x63 #x38                         ; r12d = frames this period
+       #x48 #x8D #xB3 #x00 #x10 #x00 #x00          ; rsi = the first slot
+       #x48 #x8B #x7B #x50                         ; rdi = slots
+       (:label :slot)
+       #x48 #x85 #xFF (:j ,je :end)
+       #x48 #x83 #x3E #x00 (:j ,jne :wanted)
+       ;; not wanted: end and release its object, if it has one
+       #x48 #x8B #x4E #x08 #x48 #x85 #xC9 (:j ,je :next)
+       #x31 #xD2 #x48 #x8B #x01 #xFF #x50 #x20     ; SetEndOfStream(0)
+       #x48 #x8B #x4E #x08 #x48 #x8B #x01 #xFF #x50 #x10   ; Release
+       #x48 #xC7 #x46 #x08 #x00 #x00 #x00 #x00
+       (:j ,jmp :next)
+       (:label :wanted)
+       #x48 #x83 #x7E #x08 #x00 (:j ,jne :play)    ; has its object
+       #x48 #x83 #x7E #x40 #x00 (:j ,jne :next)    ; a one-shot that has ended
+       #x48 #x8B #x4B #x18 #xBA #x01 #x00 #x00 #x00 #x4C #x8D #x46 #x08   ; rcx stream, Dynamic, &object
+       #x48 #x8B #x01 #xFF #x50 #x50               ; ActivateSpatialAudioObject
+       #x85 #xC0 (:j ,jns :play)
+       #x48 #xFF #x43 #x60 (:j ,jmp :next)         ; refused (none free): try again next period
+       (:label :play)
+       #x48 #x8B #x4E #x08 #x48 #x8D #x53 #x40 #x4C #x8D #x43 #x48   ; rcx object, &buffer, &length
+       #x48 #x8B #x01 #xFF #x50 #x18               ; GetBuffer
+       #x85 #xC0 (:j ,js :next)
+       #x4D #x89 #xE5                              ; r13 = frames to copy
+       #x48 #x83 #x7E #x28 #x00 (:j ,jne :full)    ; a loop: always a whole period
+       #x48 #x8B #x46 #x18 #x48 #x2B #x46 #x20     ; rax = frames left
+       #x4C #x39 #xE8 (:j ,jae :full)
+       #x49 #x89 #xC5
+       (:label :full)
+       #x48 #x8B #x4B #x40 #x48 #x8B #x56 #x20 #x48 #xC1 #xE2 #x02 #x48 #x03 #x56 #x10   ; buffer, samples+pos*4
+       #x4D #x89 #xE8 #x49 #xC1 #xE0 #x02 #xFF #x53 #x08   ; memcpy(.., .., r13*4)
+       #x4C #x89 #xE9 #x48 #xC1 #xE1 #x02 #x48 #x03 #x4B #x40 #x31 #xD2   ; buffer+r13*4, 0
+       #x4D #x89 #xE0 #x4D #x29 #xE8 #x49 #xC1 #xE0 #x02 #xFF #x53 #x20   ; memset(.., 0, (frames-r13)*4)
+       #x4C #x01 #x6E #x20                         ; pos += r13
+       #x48 #x8B #x46 #x20 #x48 #x3B #x46 #x18 (:j ,jb :placed)
+       #x48 #x83 #x7E #x28 #x00 (:j ,je :ended)
+       #x48 #x2B #x46 #x18 #x48 #x89 #x46 #x20 (:j ,jmp :placed)   ; a loop wraps (the samples are padded a period)
+       (:label :ended)
+       #x48 #x8B #x4E #x08 #x44 #x89 #xEA #x48 #x8B #x01 #xFF #x50 #x20   ; SetEndOfStream(r13)
+       #x48 #x8B #x4E #x08 #x48 #x8B #x01 #xFF #x50 #x10   ; Release
+       #x48 #xC7 #x46 #x08 #x00 #x00 #x00 #x00
+       #x48 #xC7 #x46 #x40 #x01 #x00 #x00 #x00     ; ended
+       (:j ,jmp :next)
+       (:label :placed)
+       #x48 #x8B #x4E #x08
+       #xF3 #x0F #x10 #x4E #x30 #xF3 #x0F #x10 #x56 #x34 #xF3 #x0F #x10 #x5E #x38   ; xmm1-3 = x y z
+       #x48 #x8B #x01 #xFF #x50 #x38               ; SetPosition
+       #x48 #x8B #x4E #x08 #xF3 #x0F #x10 #x4E #x3C
+       #x48 #x8B #x01 #xFF #x50 #x40               ; SetVolume
+       (:label :next)
+       #x48 #x81 #xC6 #x80 #x00 #x00 #x00 #x48 #xFF #xCF (:j ,jmp :slot)
+       (:label :end)
+       #x48 #x8B #x4B #x18 #x48 #x8B #x01 #xFF #x50 #x48   ; EndUpdatingAudioObjects
+       #x48 #xFF #x43 #x58
+       (:j ,jmp :loop)
+       (:label :out)
+       #x48 #x83 #xC4 #x30 #x41 #x5D #x41 #x5C #x5F #x5E #x5B #x31 #xC0 #xC3))))
+
+(defun spatial-start ()
+  "Windows' spatial renderer on the default output, its thread started: 1, or 0 when the output has no spatial
+   format turned on (or anything else refuses)."
+  (when *sp-state* (return-from spatial-start (if (eq *sp-state* :on) 1 0)))
+  (setf *sp-state* :off)
+  (c *co-initialize* 0 0)
+  (flet ((fail (why) (format t "~&vessel-windows: spatial sound: ~A; panned in the mix instead~%" why)
+           (return-from spatial-start 0)))
+    (let ((g1 (area 1)) (g2 (area 2)))
+      (modus-int::w32-put-guid g1 "BCDE0395-E52F-467C-8E3D-C4579291692E")
+      (modus-int::w32-put-guid g2 "A95664D2-9614-4F35-A746-DE8DB63617E6")
+      (when (failed-p (c *co-create* g1 0 23 g2 (out0))) (fail "no device enumerator"))
+      (let ((enum (peek64 (cell 0))))
+        (when (failed-p (m enum 4 0 0 (out0))) (release enum) (fail "no default output"))
+        (let ((dev (peek64 (cell 0))))
+          (release enum)
+          (modus-int::w32-put-guid g1 "BBF8E066-AAAA-49BE-9A4D-FD2A858EA27F")
+          (let ((hr (m dev 3 g1 23 0 (out0))))
+            (release dev)
+            (when (failed-p hr) (fail (format nil "no spatial client (#x~8,'0X)" (logand hr #xFFFFFFFF)))))
+          (let ((client (peek64 (cell 0))))
+            (poke32 (cell 1) 0)
+            (m client 5 (cell 1))                                            ; GetMaxDynamicObjectCount
+            (let ((most (peek32 (cell 1))))
+              (when (zerop most)
+                (release client)
+                (fail "the output has no spatial format on (Settings > Sound > the device > Spatial audio)"))
+              (let* ((block (modus-int::w32-alloc #x2000 t)) (wf (+ block #x80)) (params (+ block #xA0))
+                     (pv (+ block #xD0)) (event (c *create-event* 0 0 0 0)) (slots (min most +spatial-slots+)))
+                (zero block #x2000)
+                (poke16 wf 3) (poke16 (+ wf 2) 1) (poke32 (+ wf 4) 48000)    ; WAVEFORMATEX: float, mono, 48 kHz
+                (poke32 (+ wf 8) (* 48000 4)) (poke16 (+ wf 12) 4) (poke16 (+ wf 14) 32)
+                (poke64 params wf) (poke32 (+ params 8) 0)                   ; no static objects
+                (poke32 (+ params 12) 0) (poke32 (+ params 16) slots)        ; dynamic: 0 .. SLOTS
+                (poke32 (+ params 20) 6) (poke64 (+ params 24) event) (poke64 (+ params 32) 0)   ; GameEffects
+                (poke16 pv 65) (poke32 (+ pv 8) 40) (poke64 (+ pv 16) params) ; VT_BLOB
+                (modus-int::w32-put-guid g1 "BAB5F473-B423-477B-85F5-B5A332A04153")
+                (let ((hr (m client 10 pv g1 (out0))))                       ; ActivateSpatialAudioStream
+                  (when (failed-p hr)
+                    (release client)
+                    (fail (format nil "the stream was refused (#x~8,'0X)" (logand hr #xFFFFFFFF)))))
+                (let ((stream (peek64 (cell 0))))
+                  (poke64 block *wait-single*) (poke64 (+ block 8) *memcpy*) (poke64 (+ block #x10) event)
+                  (poke64 (+ block #x18) stream) (poke64 (+ block #x20) *memset*) (poke64 (+ block #x50) slots)
+                  (loop for b in (spatial-code) for i from 0 do (poke8 (+ block #x100 i) b))
+                  (setf *sp* block)
+                  (let ((thread (c *create-thread* 0 0 (+ block #x100) block 0 0)))
+                    (c *set-thread-priority* thread 2))
+                  (when (failed-p (m stream 5)) (setf *sp* 0) (fail "Start refused"))
+                  (setf *sp-state* :on)
+                  (format t "~&vessel-windows: spatial sound: Windows' renderer, ~D object~:P~%" slots)
+                  1)))))))))
+
+(defun spatial-sound (addr n rate)
+  "A sound's N samples (a token for a single-float vector) in native memory, padded with its first period so a loop
+   can be copied a period at a time without wrapping: a handle.  RATE is 48000, as the objects are."
+  (declare (ignore rate))
+  (let* ((arr (token-array addr)) (pad 4096) (mem (modus-int::w32-alloc (* 4 (+ n pad)))))
+    (flet ((sample (i) (if arr (aref arr i) (modus-int::%bits->single (peek32 (+ addr (* 4 i)))))))
+      (dotimes (i n) (poke32 (+ mem (* 4 i)) (fbits (sample i))))
+      (dotimes (i pad) (poke32 (+ mem (* 4 (+ n i))) (if (plusp n) (fbits (sample (mod i n))) 0))))
+    (vector-push-extend (cons mem n) *sp-sounds*)
+    (fill-pointer *sp-sounds*)))
+
+(defun spatial-voice (sound loop)
+  "SOUND playing as an object of its own, at the listener until placed: a voice (a slot + 1), or 0 if none is free."
+  (when (or (zerop *sp*) (not (<= 1 sound (fill-pointer *sp-sounds*)))) (return-from spatial-voice 0))
+  (dotimes (i (peek64 (+ *sp* #x50)) 0)
+    (let ((s (sp-slot i)))
+      (when (and (or (zerop (peek64 s)) (= 1 (peek64 (+ s 64)))) (zerop (peek64 (+ s 8))))
+        (poke64 s 0)
+        (destructuring-bind (mem . n) (aref *sp-sounds* (1- sound))
+          (poke64 (+ s 16) mem) (poke64 (+ s 24) n) (poke64 (+ s 32) 0) (poke64 (+ s 40) (if (eql loop 1) 1 0)))
+        (setf (aref *sp-voices* i) (list 0.0 0.0 0.0 1.0 :here))
+        (sp-write i)
+        (poke64 (+ s 64) 0)
+        (poke64 s 1)                                                         ; last: the thread may take it now
+        (return (1+ i))))))
+
+(defun sp-write (i)
+  "Slot I's world position, in the listener's frame, and its volume, where the thread reads them."
+  (destructuring-bind (x y z gain &optional here) (aref *sp-voices* i)
+    (destructuring-bind (lx ly lz fx fy fz ux uy uz) *sp-listener*
+      (let* ((dx (- x lx)) (dy (- y ly)) (dz (- z lz))
+             (rx (- (* fy uz) (* fz uy))) (ry (- (* fz ux) (* fx uz))) (rz (- (* fx uy) (* fy ux)))
+             (s (sp-slot i)))
+        (multiple-value-bind (px py pz d)
+            (if here
+                (values 0.0 0.0 0.0 0.0)
+                (values (+ (* dx rx) (* dy ry) (* dz rz)) (+ (* dx ux) (* dy uy) (* dz uz))
+                        (- (+ (* dx fx) (* dy fy) (* dz fz))) (sqrt (+ (* dx dx) (* dy dy) (* dz dz)))))
+          (poke32 (+ s 48) (fbits px)) (poke32 (+ s 52) (fbits py)) (poke32 (+ s 56) (fbits pz))
+          (poke32 (+ s 60) (fbits (min 1.0 (/ (* gain *sp-master*) (max 1.0 d))))))))))
+
+(defun spatial-floats (a n)
+  (let ((arr (token-array a)))
+    (loop for i below n collect (float (if arr (aref arr i) (modus-int::%bits->single (peek32 (+ a (* 4 i))))) 1.0))))
+
+(defun spatial-place (voice a)
+  (let ((i (1- voice)))
+    (when (and (plusp *sp*) (< -1 i +spatial-slots+) (aref *sp-voices* i))
+      (setf (aref *sp-voices* i) (spatial-floats a 4))
+      (sp-write i)))
+  0)
+
+(defun spatial-listener (a)
+  (setf *sp-listener* (spatial-floats a 9))
+  (unless (zerop *sp*) (dotimes (i +spatial-slots+) (when (aref *sp-voices* i) (sp-write i))))
+  0)
+
+(defun spatial-stop (voice)
+  (let ((i (1- voice)))
+    (when (and (plusp *sp*) (< -1 i +spatial-slots+))
+      (poke64 (sp-slot i) 0)
+      (setf (aref *sp-voices* i) nil)))
+  0)
+
+(defun spatial-volume (v)
+  (setf *sp-master* (/ (max 0 (min 1000 v)) 1000.0))
+  (unless (zerop *sp*) (dotimes (i +spatial-slots+) (when (aref *sp-voices* i) (sp-write i))))
+  0)
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -2410,10 +2637,19 @@
     h))
 (defswift "notify_badge" (count) 0)
 
-;; spatial sound: not here (sound.lisp pans instead)
-(defswift "spatial_start" () 0)
+;; spatial sound: Windows' own renderer when the output has a spatial format on (else sound.lisp pans)
+(defswift "spatial_start" () (spatial-start))
+(defswift "spatial_sound" (addr n rate) (spatial-sound addr n rate))
+(defswift "spatial_voice" (sound loop) (spatial-voice sound loop))
+(defswift "spatial_place" (voice a) (spatial-place voice a))
+(defswift "spatial_listener" (a) (spatial-listener a))
+(defswift "spatial_stop" (voice) (spatial-stop voice))
+(defswift "spatial_volume" (v) (spatial-volume v))
+;; no head tracking on a PC: headphones here don't report the head
+(defswift "spatial_head" (on) 0)
 (defswift "spatial_head_permission" () 3)
 (defswift "spatial_head_attitude" (a) 0)
+(defswift "spatial_head_recenter" () 0)
 
 ;; the phone's motion and the watch's link: neither is here (a PC)
 (defswift "device_motion" (on) 0)
