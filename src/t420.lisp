@@ -430,7 +430,7 @@
 ;;;   LBA +0: "T4LOG" then the byte count (u32 at +8) and the flush count (+12); data from LBA +1.
 ;;; `kiln t420' pads the disk so the region exists (*T4-LOG-LBA*, 4096 sectors).
 
-(defvar *t4-log-lba* 128000)
+(defvar *t4-log-lba* 262144)        ; kiln t420 --log-lba sets it in the core
 (defvar *t4-log* (make-array (* 1024 1024) :element-type '(unsigned-byte 8)))
 (defvar *t4-log-n* 0)           ; bytes in the log
 (defvar *t4-log-flushed* 0)     ; bytes on the disk
@@ -501,7 +501,7 @@
 ;;; image (scripts on the Zero: t4cmd.py) and the desk's idle loop picks it up and logs the answer.
 ;;;   LBA *T4-CMD-LBA*: "T4CMD" then a sequence number (u32 at +8) and the text's length (+12);
 ;;;   the text from +16, up to 15 sectors in all.  A new sequence number is a new command.
-(defvar *t4-cmd-lba* 130560)    ; inside the log's region, past what a 1 MB log can reach
+(defvar *t4-cmd-lba* (+ 262144 2560)) ; inside the log's region, past what a 1 MB log can reach
 (defvar *t4-cmd-seq* nil)       ; the last one seen (NIL: none yet -- the first read only records it)
 (defvar *t4-cmd-at* 0)
 
