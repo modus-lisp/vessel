@@ -46,7 +46,10 @@
 ;;; ---- memory ---------------------------------------------------------------------------------
 
 (defconstant +t4u-area+ #x0F300000)
-(defun %t4u-va (off) (+ +t4u-area+ off))
+(defvar *t4u-area* +t4u-area+
+  "The schedules' area of the controller being worked: the keyboard's and mouse's controller
+   here, the boot disk's elsewhere (t420-usb-disk.lisp binds it, with *T4-USB* and the bus).")
+(defun %t4u-va (off) (+ *t4u-area* off))
 (defun %t4u-pa (va) (+ (- va #x0F000000) (mem-ref #x80AC :u32)))
 (defun %t4u-w (va v) (modus-int::%mmio-write32 va (logand v #xFFFFFFFF)))
 (defun %t4u-r (va) (modus-int::%mmio-read32 va))
@@ -107,9 +110,16 @@
       (when (>= eecp #x40)
         (let ((leg (modus-int::pci-config-read bus dev fn eecp)))
           (when (= (logand leg #xFF) 1)
-            (modus-int::pci-config-write bus dev fn eecp (logior leg (ash 1 24)))
-            (unless (%t4u-wait (lambda () (not (logbitp 16 (modus-int::pci-config-read bus dev fn eecp)))) 1000)
+            ;; as Linux's ehci_bios_handoff: SMI on OS-ownership change on first, so the BIOS's
+            ;; handler hears of the request (without it a BIOS that is busy with the controller --
+            ;; the boot disk's, at the desk's start -- is not told, and keeps driving it)
+            (when (logbitp 16 leg)
+              (modus-int::pci-config-write bus dev fn (+ eecp 4)
+                                           (logior (modus-int::pci-config-read bus dev fn (+ eecp 4)) (ash 1 13))))
+            (modus-int::pci-config-write bus dev fn eecp (logand (logior leg (ash 1 24)) (lognot (ash 1 16))))
+            (unless (%t4u-wait (lambda () (not (logbitp 16 (modus-int::pci-config-read bus dev fn eecp)))) 5000)
               (%t4u-say "the BIOS kept ~X:~X.~X; taking it anyway" bus dev fn))
+            ;; every SMI off (and their status bits cleared)
             (modus-int::pci-config-write bus dev fn (+ eecp 4) #xE0000000))))
       ;; stop, reset
       (%t4u-opw 0 (logand (%t4u-opr 0) (lognot 1)))
@@ -119,7 +129,7 @@
         (%t4u-say "reset did not finish")
         (return-from %t4u-take nil))
       ;; the schedules: an async ring of one head QH, and a frame list that points nowhere yet
-      (%t4u-clear +t4u-area+ #x4000)
+      (%t4u-clear *t4u-area* #x4000)
       (dotimes (i 1024) (%t4u-w (+ (%t4u-frame-list) (* 4 i)) 1))
       (let ((h (%t4u-head-qh)))
         (%t4u-w h (logior (%t4u-pa h) 2))

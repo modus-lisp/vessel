@@ -441,15 +441,33 @@
   (when (< *t4-log-n* (length *t4-log*))
     (setf (aref *t4-log* *t4-log-n*) b *t4-log-n* (+ *t4-log-n* 1))))
 
+(defvar *t4-log-udp* (cons #x0A000001 7778)
+  "(ip . port): every log line also goes there as a UDP datagram, once the network is up -- a log
+   that does not need the disk (the rig's Pi, the gateway, listens: nc -u -l -k 7778).  NIL: off.")
+
+(defun %t4-log-udp (s)
+  (when (and *t4-log-udp* (boundp '*t4-ip*) (consp (symbol-value '*t4-ip*))
+             (integerp (first (symbol-value '*t4-ip*))) (fboundp 'udp-send))
+    (ignore-errors
+      (let* ((n (min 1400 (+ 1 (length s)))) (b (make-array n :initial-element 10)))
+        (dotimes (i (- n 1)) (setf (aref b i) (logand (char-code (char s i)) 255)))
+        (funcall 'udp-send (car *t4-log-udp*) (cdr *t4-log-udp*) (cdr *t4-log-udp*) b n)))))
+
 (defun t4-log (fmt &rest args)
-  "Append a line to the disk log, as FORMAT would print it."
+  "Append a line to the disk log, as FORMAT would print it (and send it, %T4-LOG-UDP)."
   (let ((s (apply #'format nil fmt args)))
     (dotimes (i (length s)) (t4-log-byte (logand (char-code (char s i)) 255)))
     (t4-log-byte 10)
+    (%t4-log-udp s)
     nil))
 
+(defvar *t4-disk-own* nil
+  "(read . write): the desk's own driver for the boot disk (t420-usb-disk.lisp), once it has
+   taken the disk's controller from the BIOS; NIL: INT 13h.")
+
 (defun %t4-disk-write (lba nsec)
-  "Write NSEC (<= 64) sectors from #x30000 to LBA of the boot disk.  T when the BIOS said yes."
+  "Write NSEC (<= 64) sectors from #x30000 to LBA of the boot disk.  T when it worked."
+  (when *t4-disk-own* (return-from %t4-disk-write (funcall (cdr *t4-disk-own*) lba nsec)))
   (setf (mem-ref #xC000 :u8) 16 (mem-ref #xC001 :u8) 0
         (mem-ref #xC002 :u8) nsec (mem-ref #xC003 :u8) 0
         (mem-ref #xC004 :u32) 0                       ; buffer offset 0 ...
@@ -488,7 +506,8 @@
 (defvar *t4-cmd-at* 0)
 
 (defun %t4-disk-read (lba nsec)
-  "Read NSEC (<= 64) sectors at LBA of the boot disk to #x30000.  T when the BIOS said yes."
+  "Read NSEC (<= 64) sectors at LBA of the boot disk to #x30000.  T when it worked."
+  (when *t4-disk-own* (return-from %t4-disk-read (funcall (car *t4-disk-own*) lba nsec)))
   (setf (mem-ref #xC000 :u8) 16 (mem-ref #xC001 :u8) 0
         (mem-ref #xC002 :u8) nsec (mem-ref #xC003 :u8) 0
         (mem-ref #xC004 :u32) 0

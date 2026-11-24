@@ -74,6 +74,11 @@
   ;; USB keyboards and mice (t420-usb.lisp): the controllers the BIOS does not boot from
   (when (fboundp 't4-usb-start)
     (t4-log "kiln t420: usb ~A" (handler-case (funcall 't4-usb-start) (error (c) (princ-to-string c)))))
+  ;; the boot disk, from the BIOS (t420-usb-disk.lisp): its USB code then goes quiet in SMM, as it
+  ;; does under Linux, instead of re-arming the other controller's SMIs
+  (when (fboundp 't4d-take)
+    (t4-log "kiln t420: disk ~A" (handler-case (if (funcall 't4d-take) "ours" "the BIOS's")
+                                    (error (c) (princ-to-string c)))))
   (setf *t4-px* (floor *t4-w* 2) *t4-py* (floor *t4-h* 2))
   ;; the hardware cursor (t420-gpu.lisp), where there is an Intel display engine: the pointer
   ;; is then a plane the display blends, not pixels written into the screen and put back
