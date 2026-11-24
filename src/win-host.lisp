@@ -28,6 +28,8 @@
 ;;;;   location          Windows.Devices.Geolocation's Geolocator, through modus's WinRT layer
 ;;;;   spatial sound     ISpatialAudioClient (Windows Sonic, Dolby Atmos, DTS:X), when the output has one turned on;
 ;;;;                     else sound.lisp pans in its own mix
+;;;;   speech            SAPI 5: an SpVoice speaks (aloud, or into a WAV), the in-process recognizer dictates (from
+;;;;                     the microphone, or a WAV)
 ;;;;   not on a PC       head tracking, the phone's motion, the watch's link: each answers that it is not here
 ;;;;
 ;;;; THE ONE THREAD.  The window is made by, and its messages are pumped on, the thread that runs the app (Win32
@@ -253,6 +255,7 @@
   (*dwm-flush* "dwmapi.dll" "DwmFlush")
   (*memcpy* "ntdll.dll" "memcpy")
   (*memset* "ntdll.dll" "memset")
+  (*co-task-mem-free* "ole32.dll" "CoTaskMemFree")
   (*d3d11-create-device* "d3d11.dll" "D3D11CreateDevice")
   (*create-dc* "gdi32.dll" "CreateDCW")
   (*delete-dc* "gdi32.dll" "DeleteDC")
@@ -2535,6 +2538,185 @@
   (unless (zerop *sp*) (dotimes (i +spatial-slots+) (when (aref *sp-voices* i) (sp-write i))))
   0)
 
+;;; ---- speech (speech_*, ear_*: vessel's speech.lisp) ------------------------------------------------------------------
+;;;
+;;; What Speech.swift is on Apple, on SAPI 5: the voice is an SpVoice speaking asynchronously (its own threads), the
+;;; ear an in-process recognizer with the dictation grammar, on the default microphone or on a WAV file.  SAPI queues
+;;; what it hears as events, and Lisp takes them whenever it asks the ear anything (EAR-POLL): nothing calls back.
+;;; ISpVoice 11 GetEvents, 13 SetOutput, 20 Speak, 22 GetStatus, 32 WaitUntilDone; ISpStream 17 BindToFile,
+;;; 18 Close; ISpRecognizer 9 SetInput, 12 CreateRecoContext; ISpRecoContext 7 SetNotifyWin32Event, 10 SetInterest,
+;;; 11 GetEvents, 14 CreateGrammar; ISpRecoGrammar 20 LoadDictation, 22 SetDictationState; ISpRecoResult 5 GetText.
+
+(defvar *voice* 0 "The SpVoice that speaks aloud.")
+(defvar *wide-temp* 0)
+(defvar *wide-temp-size* 0)
+
+(defun wide-temp (s)
+  "S as UTF-16 in a buffer of its own (any length; good until the next WIDE-TEMP)."
+  (let ((need (+ 4 (* 4 (length s)))))
+    (when (< *wide-temp-size* need)
+      (unless (zerop *wide-temp*) (modus-int::w32-free *wide-temp* *wide-temp-size*))
+      (setf *wide-temp-size* (max need 4096) *wide-temp* (modus-int::w32-alloc *wide-temp-size*)))
+    (wide-at *wide-temp* s)))
+
+(defun co-make (clsid iid)
+  "A new COM object of CLSID, as IID; 0 if refused."
+  (c *co-initialize* 0 0)
+  (let ((g1 (area 1)) (g2 (area 2)))
+    (modus-int::w32-put-guid g1 clsid)
+    (modus-int::w32-put-guid g2 iid)
+    (if (failed-p (c *co-create* g1 0 23 g2 (out0))) 0 (peek64 (cell 0)))))
+
+(defparameter +sp-voice+ "96749377-3391-11D2-9EE3-00C04F797396")
+(defparameter +isp-voice+ "6C44DF74-72B9-4992-A1EC-EF996E0422D4")
+(defparameter +sp-stream+ "715D9C59-4442-11D2-9605-00C04F8EE628")
+(defparameter +isp-stream+ "12E3CCA9-7518-44C5-A5E7-BA5A79CB929E")
+
+(defun voice ()
+  (when (zerop *voice*) (setf *voice* (co-make +sp-voice+ +isp-voice+)))
+  *voice*)
+
+(defun speech-say (text)
+  (let ((v (voice)))
+    (if (zerop v) 0 (progn (m v 20 (wide-temp text) #x13 0) 1))))         ; ASYNC | PURGEBEFORESPEAK | IS_NOT_XML
+
+(defun speech-hush () (unless (zerop *voice*) (m *voice* 20 0 3 0)) 0)    ; nothing, purging what was queued
+
+(defun speech-speaking ()
+  (if (zerop *voice*)
+      0
+      (progn (zero (area 3) 32)
+             (m *voice* 22 (area 3) 0)                                       ; GetStatus: dwRunningState at +12
+             (if (logtest (peek32 (+ (area 3) 12)) 2) 1 0))))                ; SPRS_IS_SPEAKING
+
+(defvar *said* (make-array 0 :adjustable t :fill-pointer 0) "Files being said: (voice stream) or a result.")
+
+(defun wav-stream (path mode)
+  "An SpStream bound to PATH: MODE 3 to write a 16 kHz 16-bit mono WAV, 0 to read one; 0 if refused."
+  (let ((s (co-make +sp-stream+ +isp-stream+)))
+    (unless (zerop s)
+      (let ((fmt (area 4)) (wf (+ (area 4) 16)))
+        (modus-int::w32-put-guid fmt "C31ADBAE-527F-4FF5-A230-F62BB61FF70C")   ; SPDFID_WaveFormatEx
+        (zero wf 20)
+        (poke16 wf 1) (poke16 (+ wf 2) 1) (poke32 (+ wf 4) 16000) (poke32 (+ wf 8) 32000)
+        (poke16 (+ wf 12) 2) (poke16 (+ wf 14) 16)
+        (when (failed-p (if (= mode 3) (m s 17 (wide1 path) 3 fmt wf 0) (m s 17 (wide1 path) 0 0 0 0)))
+          (release s) (setf s 0))))
+    s))
+
+(defun speech-to-file (text path)
+  "Say TEXT into a WAV at PATH, not aloud: a handle for speech_file_done."
+  (let ((v (co-make +sp-voice+ +isp-voice+)) (s 0))
+    (vector-push-extend
+     (cond ((zerop v) -1)
+           ((zerop (setf s (wav-stream path 3))) (release v) -1)
+           (t (m v 13 s 1) (m v 20 (wide-temp text) #x11 0) (list v s)))  ; SetOutput; Speak ASYNC | IS_NOT_XML
+     *said*)
+    (fill-pointer *said*)))
+
+(defun speech-file-done (h)
+  "0 still writing, 1 written, -1 failed."
+  (if (not (<= 1 h (fill-pointer *said*)))
+      -1
+      (let ((it (aref *said* (1- h))))
+        (if (integerp it)
+            it
+            (destructuring-bind (v s) it
+              (let ((hr (logand (m v 32 0) #xFFFFFFFF)))                       ; WaitUntilDone(0)
+                (if (= hr 1)                                                 ; S_FALSE: still speaking
+                    0
+                    (progn (m v 13 0 0) (m s 18) (release s) (release v)
+                           (setf (aref *said* (1- h)) (if (failed-p hr) -1 1))))))))))
+
+;;; the ear
+
+(defvar *ear* nil "Listening: (recognizer context grammar), or NIL.")
+(defvar *ear-state* 0 "As ear_state answers: 0 idle, 2 listening, 4 failed, 5 transcribing a file.")
+(defvar *ear-text* "")
+(defvar *ear-partial* "")
+(defvar *ear-level* 0)
+(defvar *ear-events* 0)
+
+(defconstant +ear-interest+
+  (logior (ash 1 30) (ash 1 33) (ash 1 34) (ash 1 38) (ash 1 39) (ash 1 50)))
+;; SPFEI_FLAGCHECK, END_SR_STREAM, RECOGNITION, HYPOTHESIS, SR_AUDIO_LEVEL
+
+(defun ear-open (input)
+  "Dictation on INPUT (an audio-in object or a stream; taken over): (recognizer context grammar), or NIL."
+  (let ((rec (co-make "41B89B6B-9399-11D2-9623-00C04F8EE628" "C2B5F241-DAA0-4507-9E16-5A1EAA2B7A5C")))
+    (when (zerop rec) (release input) (return-from ear-open nil))
+    (flet ((fail (why) (format t "~&vessel-windows: speech recognition: ~A~%" why) (release rec)
+             (return-from ear-open nil)))
+      (when (failed-p (m rec 9 input 1)) (release input) (fail "the input was refused"))
+      (release input)                                                        ; the recognizer holds it now
+      (when (failed-p (m rec 12 (out0))) (fail "no recognition context (is a recognizer installed?)"))
+      (let ((ctx (peek64 (cell 0))))
+        (m ctx 7 0 0)                                                        ; SetNotifyWin32Event: events queue
+        (m ctx 10 +ear-interest+ +ear-interest+)
+        (when (failed-p (m ctx 14 0 (out0))) (release ctx) (fail "no grammar"))
+        (let ((g (peek64 (cell 0))))
+          (when (failed-p (m g 20 0 0)) (release g) (release ctx) (fail "no dictation"))
+          (m g 22 1)                                                         ; SPRS_ACTIVE
+          (when (zerop *ear-events*) (setf *ear-events* (modus-int::w32-alloc (* 32 16))))
+          (list rec ctx g))))))
+
+(defun ear-close ()
+  (when *ear*
+    (destructuring-bind (rec ctx g) *ear*
+      (m g 22 0) (release g) (release ctx) (release rec))
+    (setf *ear* nil)))
+
+(defun ear-start ()
+  (unless (eql *ear-state* 2)
+    (ear-close)
+    (let ((mic (co-make "CF3D2E50-53F2-11D2-960C-00C04F8EE628" "00000000-0000-0000-C000-000000000046")))  ; SpMMAudioIn
+      (setf *ear* (and (plusp mic) (ear-open mic))
+            *ear-state* (if *ear* 2 4) *ear-partial* "")))
+  0)
+
+(defun ear-file (path)
+  (ear-close)
+  (let ((s (wav-stream path 0)))
+    (setf *ear* (and (plusp s) (ear-open s))
+          *ear-state* (if *ear* 5 4) *ear-partial* ""))
+  0)
+
+(defun ear-stop () (ear-close) (setf *ear-state* 0 *ear-partial* "" *ear-level* 0) 0)
+
+(defun result-text (r)
+  (m r 5 #xFFFFFFFF #xFFFFFFFF 1 (out0) 0)                                   ; GetText(whole phrase), replacements
+  (let ((p (peek64 (cell 0))))
+    (if (zerop p) "" (prog1 (or (modus-int::w32-wstr p) "") (c *co-task-mem-free* p)))))
+
+(defun ear-poll ()
+  "Take what the recognizer has queued: its words, the partial phrase, the level, the end of a file."
+  (when *ear*
+    (let ((ctx (second *ear*)) (ev *ear-events*))
+      (loop
+        (poke32 (cell 5) 0)
+        (when (failed-p (m ctx 11 16 ev (cell 5))) (return))
+        (let ((n (peek32 (cell 5))))
+          (dotimes (i n)
+            (let* ((e (+ ev (* 32 i))) (id (peek16 e)) (kind (peek16 (+ e 2))) (lp (peek64 (+ e 24))))
+              (case id
+                (38 (let ((words (result-text lp)))
+                      (when (plusp (length words))
+                        (setf *ear-text* (if (zerop (length *ear-text*)) words
+                                             (concatenate 'string *ear-text* " " words))))
+                      (setf *ear-partial* "")))
+                (39 (setf *ear-partial* (result-text lp)))
+                (50 (setf *ear-level* (* 10000 (peek64 (+ e 16)))))
+                (34 (when (eql *ear-state* 5) (setf *ear-state* 0 *ear-partial* ""))))
+              ;; the event's own parameter, freed as SpClearEvent does
+              (case kind ((2 3) (release lp)) ((1 4) (c *co-task-mem-free* lp)))))
+          (when (< n 16) (return))))
+      (when (eql *ear-state* 0) (ear-close)))))
+
+(defun answer-text (s buf cap)
+  "S as UTF-8 into BUF (a token or an address), at most CAP bytes: its length."
+  (let ((b (seal:utf8-encode s)))
+    (if (> (length b) cap) 0 (progn (put-bytes buf b) (length b)))))
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -2650,6 +2832,21 @@
 (defswift "spatial_head_permission" () 3)
 (defswift "spatial_head_attitude" (a) 0)
 (defswift "spatial_head_recenter" () 0)
+
+;; speech: SAPI's voice and recognizer
+(defswift "speech_say" (a n) (speech-say (utf8-text a n)))
+(defswift "speech_hush" () (speech-hush))
+(defswift "speech_speaking" () (speech-speaking))
+(defswift "speech_to_file" (a n pa pn) (speech-to-file (utf8-text a n) (utf8-text pa pn)))
+(defswift "speech_file_done" (h) (speech-file-done h))
+(defswift "ear_start" () (ear-start))
+(defswift "ear_stop" () (ear-stop))
+(defswift "ear_clear" () (setf *ear-text* "" *ear-partial* "") 0)
+(defswift "ear_file" (a n) (ear-file (utf8-text a n)))
+(defswift "ear_state" () (ear-poll) *ear-state*)
+(defswift "ear_level" () (ear-poll) *ear-level*)
+(defswift "ear_text" (buf cap) (ear-poll) (answer-text *ear-text* buf cap))
+(defswift "ear_partial" (buf cap) (ear-poll) (answer-text *ear-partial* buf cap))
 
 ;; the phone's motion and the watch's link: neither is here (a PC)
 (defswift "device_motion" (on) 0)
