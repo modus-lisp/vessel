@@ -21,7 +21,7 @@
 ;;;;                     own class, rounded, so its children's notifications reach the same ring
 ;;;;   menus             the window's menu bar; Ctrl+KEY for a Mac's Command+KEY
 ;;;;   the status item   an icon in the notification area: its tooltip the title, its menu on a click;
-;;;;                     notifications are its balloons (toasts on Windows 10 and 11)
+;;;;                     notifications are toasts (an App User Model ID registered per user), else its balloons
 ;;;;   alerts            MessageBoxW (OK, or OK and Cancel)
 ;;;;   the speaker       modus's own waveOut speaker (net/win32-audio.lisp: W32-AUDIO-OPEN ...)
 ;;;;   game controllers  XInput (an Xbox controller, or anything that presents as one)
@@ -1300,6 +1300,90 @@
     (if (zerop (logand (c *notify-icon* 1 a) #xFFFFFFFF))
         (format t "~&vessel-windows: the notification ~S was refused~%" title)
         (format t "~&vessel-windows: notified: ~A~%" title))))
+
+;;; TOASTS.  A notification is a real Windows toast (ToastNotificationManager), not a tray balloon, once the app has
+;;; an App User Model ID Windows knows: an unpackaged app registers one under HKEY_CURRENT_USER
+;;; (Software\Classes\AppUserModelId\ID: DisplayName, and IconUri when there is a logo), names its process with it
+;;; (SetCurrentProcessExplicitAppUserModelID), and sends through CreateToastNotifierWithId.  No certificate, no
+;;; package, no administrator.  The ID is per app, from its window's title (ModusLisp.Vessel.Hello3D), so each app's
+;;; toasts carry its own name.  If anything refuses, the balloon as before.
+;;; IToastNotificationManagerStatics 7 CreateToastNotifierWithId; IXmlDocumentIO 6 LoadXml;
+;;; IToastNotificationFactory 6 CreateToastNotification; IToastNotifier 6 Show.
+
+(defvar *toast-id* nil "This app's App User Model ID, once registered; :NONE if it could not be.")
+
+(defun toast-id ()
+  (or *toast-id*
+      (setf *toast-id*
+            (handler-case
+                (let* ((name (let ((title (if (plusp *hwnd*) (window-text *hwnd*) "")))
+                               (if (plusp (length title)) title "Vessel")))
+                       (id (concatenate 'string "ModusLisp.Vessel." (remove-if-not #'alphanumericp name)))
+                       (reg-create (modus-int::w32-proc "advapi32.dll" "RegCreateKeyExW"))
+                       (reg-set (modus-int::w32-proc "advapi32.dll" "RegSetValueExW"))
+                       (reg-close (modus-int::w32-proc "advapi32.dll" "RegCloseKey"))
+                       (explicit (modus-int::w32-proc "shell32.dll" "SetCurrentProcessExplicitAppUserModelID")))
+                  (poke64 (cell 12) 0)
+                  (unless (zerop (logand (c reg-create #x80000001 (wide1 (concatenate 'string "Software\\Classes\\AppUserModelId\\" id))
+                                            0 0 0 #x20006 0 (cell 12) 0)
+                                         #xFFFFFFFF))
+                    (error "the registry refused the ID"))
+                  (let ((key (peek64 (cell 12))))
+                    (flet ((put (value-name text)
+                             (let ((n (* 2 (+ 1 (length text)))))
+                               (wide-at (+ *cb* #x3000) text)
+                               (c reg-set key (wide1 value-name) 0 1 (+ *cb* #x3000) n))))     ; REG_SZ
+                      (put "DisplayName" name)
+                      (let ((logo (namestring (merge-pathnames "../windows/out/stage/Assets/Square150x150Logo.png" *src-dir*))))
+                        (when (probe-file logo) (put "IconUri" (substitute #\\ #\/ (namestring (probe-file logo)))))))
+                    (c reg-close key))
+                  (c explicit (wide1 id))
+                  (format t "~&vessel-windows: notifications are toasts, as ~A~%" id)
+                  id)
+              (error (e) (format t "~&vessel-windows: no toasts (~A): balloons instead~%" e) :none)))))
+
+(defun xml-text (s)
+  (with-output-to-string (o)
+    (loop for ch across s
+          do (case ch (#\& (write-string "&amp;" o)) (#\< (write-string "&lt;" o)) (#\> (write-string "&gt;" o))
+                   (#\" (write-string "&quot;" o)) (t (write-char ch o))))))
+
+(defun toast (title body)
+  "TITLE and BODY as a toast: T if Windows took it."
+  (let ((id (toast-id)))
+    (when (eq id :none) (return-from toast nil))
+    (let* ((ctx (wrt)) (made '())
+           (xml (format nil "<toast><visual><binding template=\"ToastGeneric\"><text>~A</text><text>~A</text></binding></visual></toast>"
+                        (xml-text title) (xml-text body))))
+      (flet ((keep (obj) (unless (zerop obj) (push obj made)) obj)
+             (ok (hr) (>= hr 0)))
+        (unwind-protect
+             (let* ((statics (keep (modus-int::wrt-factory ctx "Windows.UI.Notifications.ToastNotificationManager"
+                                                           "50AC103F-D235-4598-BBEF-98FE4D1A3AD4")))
+                    (notifier (let ((h (np-hstring id)))
+                                (prog1 (and (plusp statics)
+                                            (ok (modus-int::wrt-call ctx statics 7 h (modus-int::wrt-out-clear ctx 8)))
+                                            (keep (modus-int::wrt-out-ref ctx 8)))
+                                  (modus-int::%wrt-hstring-free ctx h))))
+                    (doc (keep (modus-int::wrt-activate ctx "Windows.Data.Xml.Dom.XmlDocument")))
+                    (io (and (plusp doc) (keep (modus-int::wrt-qi ctx doc "6CD0E74E-EE65-4489-9EBF-CA43E87BA637"))))
+                    (loaded (and io (plusp io)
+                                 (let ((h (np-hstring xml)))
+                                   (prog1 (ok (modus-int::wrt-call ctx io 6 h)) (modus-int::%wrt-hstring-free ctx h)))))
+                    (idoc (and loaded (keep (modus-int::wrt-qi ctx doc "F7F3A506-1E87-42D6-BCFB-B8C809FA5494"))))
+                    (factory (and idoc (plusp idoc)
+                                  (keep (modus-int::wrt-factory ctx "Windows.UI.Notifications.ToastNotification"
+                                                                "04124B20-82C6-4229-B109-FD9ED4662B53"))))
+                    (note (and factory (plusp factory)
+                               (ok (modus-int::wrt-call ctx factory 6 idoc (modus-int::wrt-out-clear ctx 9)))
+                               (keep (modus-int::wrt-out-ref ctx 9)))))
+               (and notifier note (plusp note) (ok (modus-int::wrt-call ctx notifier 6 note))))
+          (dolist (obj made) (modus-int::wrt-release ctx obj)))))))
+
+(defun notify (title body)
+  (if (ignore-errors (toast title body))
+      (format t "~&vessel-windows: toast: ~A~%" title)
+      (tray-balloon title body)))
 
 (defun tray-message (what)
   (case what
@@ -3856,13 +3940,13 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 (defswift "dock_badge" (a n) 0)
 (defswift "dock_bounce" (critical) 0)
 
-;; notifications: the notification area's balloons, which Windows shows as its own notifications
+;; notifications: toasts (TOAST), or the notification area's balloons where toasts are refused
 (defswift "notify_permission" () 1)
 (defswift "notify_ask" () (ui-event (list :notifyask 0 1)) 0)
 (defswift "notify_post" (ta tn ba bn after)
   (let ((title (utf8-text ta tn)) (body (utf8-text ba bn))
         (h (new-handle (make-ctl :kind :notification))))
-    (after after (lambda () (setf *last-notification* h) (tray-balloon title body)))
+    (after after (lambda () (setf *last-notification* h) (notify title body)))
     h))
 (defswift "notify_badge" (count) 0)
 
