@@ -807,11 +807,44 @@
   "Every key held, let go: the window stopped taking the keyboard, and its releases go elsewhere."
   (maphash (lambda (vk ks) (declare (ignore vk)) (push-event (logior (ash 9 40) ks))) *held*)
   (clrhash *held*)
-  (setf *shift* nil *ctrl* nil))
+  (setf *shift* nil *ctrl* nil *alt* nil *char-pending* nil *high-surrogate* nil))
+
+;;; WHAT A KEY TYPES.  A character key (a letter, a digit, punctuation, the number pad) is not sent when it goes
+;;; down: it waits for the WM_CHAR TranslateMessage makes of it, which is what this keyboard's layout, its dead keys
+;;; and the IME say it typed -- an AZERTY "a", an "é" from a dead key, a "!" from Shift+1 -- and that character is
+;;; the press's keysym (Latin-1 as itself, anything else #x1000000 + its code, as X11 and glass read keysyms).  Its
+;;; release sends the same keysym, so a game still sees the key held.  A character with no key of its own (the IME's
+;;; composed text, the emoji panel's) is a press and a release at once.  The other keys -- arrows, Enter, the
+;;; function keys -- and any key with Ctrl or Alt held (a shortcut) go as their keysyms when they go down.
+
+(defvar *alt* nil)
+(defvar *char-pending* nil "The character key just pressed, waiting for the WM_CHAR that says what it typed.")
+(defvar *high-surrogate* nil)
+
+(defun char-key-p (vk)
+  (or (<= #x30 vk #x39) (<= #x41 vk #x5A) (<= #x60 vk #x6F) (<= #xBA vk #xE2)))
+
+(defun typed (unit repeat)
+  "A WM_CHAR's UTF-16 UNIT: the character the last key typed, or one with no key."
+  (if (<= #xD800 unit #xDBFF)
+      (setf *high-surrogate* unit)
+      (let ((cp (if (and *high-surrogate* (<= #xDC00 unit #xDFFF))
+                    (+ #x10000 (ash (- *high-surrogate* #xD800) 10) (- unit #xDC00))
+                    unit)))
+        (setf *high-surrogate* nil)
+        (when (and (>= cp #x20) (/= cp #x7F) (not repeat))
+          (let ((ks (if (or (<= cp #x7E) (<= #xA0 cp #xFF)) cp (+ #x1000000 cp))))
+            (if *char-pending*
+                (progn (setf (gethash *char-pending* *held*) ks *char-pending* nil)
+                       (push-event (logior (ash 8 40) ks)))
+                (progn (push-event (logior (ash 8 40) ks)) (push-event (logior (ash 9 40) ks)))))))))
 
 (defun key (vk down repeat)
   (when (= vk 16) (setf *shift* down))
   (when (= vk 17) (setf *ctrl* down))
+  (when (= vk 18) (setf *alt* down))
+  (if (and down (not repeat) (char-key-p vk) (not *ctrl*) (not *alt*))
+      (setf *char-pending* vk)                                     ; its WM_CHAR says what it typed
   (if down
       (unless repeat
         (let ((ks (keysym vk)))
@@ -824,7 +857,7 @@
       (let ((ks (gethash vk *held*)))
         (when ks
           (remhash vk *held*)
-          (push-event (logior (ash 9 40) ks))))))
+          (push-event (logior (ash 9 40) ks)))))))
 
 ;;; THE POINTER, LOCKED (a game's mouse-look): hidden, held in the window (ClipCursor), and put back in the middle
 ;;; after each move, whose distance from the middle is the motion.  Wanted until let go; lost while the window is
@@ -902,6 +935,8 @@
            (progn (lb-mark :active) (ui-event (list :appstate 0 "active")))))
       ((and main (= msg #x10))                              ; WM_CLOSE
        (if *on-quit* (ui-event (list :quit 0)) (quit-now)))
+      ((and main (= msg #x102))                             ; WM_CHAR: what a key (or the IME) typed
+       (typed (logand wp #xFFFF) (logbitp 30 lp)))
       ((and main (<= #x100 msg #x105) (/= msg #x102) (/= msg #x103))
        (key (logand wp #xFF) (or (= msg #x100) (= msg #x104)) (logbitp 30 lp)))
       ((and main (<= #x200 msg #x20E))
