@@ -277,6 +277,9 @@
   (*create-event* "kernel32.dll" "CreateEventW")
   (*set-thread-priority* "kernel32.dll" "SetThreadPriority")
   (*wait-single* "kernel32.dll" "WaitForSingleObject")
+  (*create-file* "kernel32.dll" "CreateFileW")
+  (*write-file* "kernel32.dll" "WriteFile")
+  (*close-handle* "kernel32.dll" "CloseHandle")
   (*set-process-info* "kernel32.dll" "SetProcessInformation" :optional)
   (*current-process* "kernel32.dll" "GetCurrentProcess")
   (*get-message* "user32.dll" "GetMessageW")
@@ -856,8 +859,8 @@
        (release-keys) (unlock-pointer))
       ((and main (= msg #x1C))                              ; WM_ACTIVATEAPP
        (if (zerop wp)
-           (progn (release-keys) (unlock-pointer) (ui-event (list :appstate 0 "inactive")))
-           (ui-event (list :appstate 0 "active"))))
+           (progn (release-keys) (unlock-pointer) (lb-mark :inactive) (ui-event (list :appstate 0 "inactive")))
+           (progn (lb-mark :active) (ui-event (list :appstate 0 "active")))))
       ((and main (= msg #x10))                              ; WM_CLOSE
        (if *on-quit* (ui-event (list :quit 0)) (quit-now)))
       ((and main (<= #x100 msg #x105) (/= msg #x102) (/= msg #x103))
@@ -983,6 +986,7 @@
       (pump)
       (setf *stat-pump* (max *stat-pump* (- (get-internal-real-time) t1)))))
   (setf *stat-last-tick* (get-internal-real-time))
+  (when *loopback* (loopback-poll))
   (run-timers)
   0)
 
@@ -1791,18 +1795,36 @@
 ;;; +#x28 the device buffer's frames  +#x30 the ring  +#x38 its size - 1  +#x40 bytes ever written (dword, the app's)
 ;;; +#x48 bytes ever read (dword, the thread's)  +#x50 the device's padding (frames)  +#x58 underruns: wakes that found
 ;;; the device empty once sound had begun -- it had played silence, whatever the ring held  +#x68 a padding cell  +#x70 a buffer pointer cell
-;;; +#x78 frames being copied  +#x80 stop  +#x100 the code.  The two counters are dwords, so each side reads and
+;;; +#x60 the lowest padding since the app last looked  +#x78 frames being copied  +#x80 stop  +#x100 the code.  The two counters are dwords, so each side reads and
 ;;; writes them whole, and wrap with the ring (its size divides 2^32).
 ;;; IAudioClient 3 Initialize, 4 GetBufferSize, 6 GetCurrentPadding, 10 Start, 13 SetEventHandle, 14 GetService;
 ;;; IAudioRenderClient 3 GetBuffer, 4 ReleaseBuffer; IMMDeviceEnumerator 4 GetDefaultAudioEndpoint; IMMDevice 3 Activate.
 
 (defvar *speaker* nil "The speaker: :WASAPI, or W32-AUDIO-OPEN's waveOut speaker, once opened.")
 (defvar *wa* 0 "The WASAPI block.")
+(defvar *audio-clock* 0 "IAudioClock: how far the device has really played.")
+(defvar *audio-clock-hz* 0)
+(defvar *clock-last* nil "The last (device-position qpc-position), for DEVICE-DRIFT.")
+
+(defun device-drift ()
+  "Milliseconds the device's playback fell behind (or ran ahead of) the system clock since the last call: a stall or
+   a skip somewhere after the ring -- the engine, the driver, the device.  NIL before there are two readings."
+  (unless (zerop *audio-clock*)
+    (when (zerop (logand (m *audio-clock* 4 (cell 2) (cell 3)) #xFFFFFFFF))   ; GetPosition(&pos, &qpc 100ns)
+      (let ((pos (peek64 (cell 2))) (qpc (peek64 (cell 3))) (out nil))
+        (when (and *clock-last* (plusp *audio-clock-hz*))
+          (destructuring-bind (p0 q0) *clock-last*
+            (let ((played-ms (/ (* 1000.0 (- pos p0)) *audio-clock-hz*))
+                  (wall-ms (/ (- qpc q0) 10000.0)))
+              (setf out (- played-ms wall-ms)))))
+        (setf *clock-last* (list pos qpc))
+        out))))
 (defconstant +ring-bytes+ (ash 1 20))
 (defvar *pcm* nil)
 
 (defun wasapi-code ()
-  (let ((jne '(#x0F #x85)) (je '(#x0F #x84)) (js '(#x0F #x88)) (jle '(#x0F #x8E)) (jbe '(#x0F #x86)) (jmp '(#xE9)))
+  (let ((jne '(#x0F #x85)) (je '(#x0F #x84)) (js '(#x0F #x88)) (jle '(#x0F #x8E)) (jbe '(#x0F #x86)) (jmp '(#xE9))
+        (jae '(#x0F #x83)))
     (assemble
      `(#x53 #x56 #x57 #x48 #x83 #xEC #x30          ; push rbx/rsi/rdi; sub rsp,0x30
        #x48 #x89 #xCB                              ; mov rbx,rcx    the block
@@ -1813,6 +1835,9 @@
        #x48 #x8B #x01 #xFF #x50 #x30               ; GetCurrentPadding
        #x85 #xC0 (:j ,js :loop)
        #x8B #x43 #x68 #x48 #x89 #x43 #x50          ; padding -> +0x50
+       #x48 #x3B #x43 #x60 (:j ,jae :not-lower)    ; the lowest this second -> +0x60
+       #x48 #x89 #x43 #x60
+       (:label :not-lower)
        #x48 #x85 #xC0 (:j ,jne :nonempty)          ; the device empty once sound has begun: it played silence
        #x83 #x7B #x40 #x00 (:j ,je :nonempty)
        #x48 #xFF #x43 #x58                         ; an underrun
@@ -1867,6 +1892,11 @@
         (poke16 (+ wf 12) (* channels 2)) (poke16 (+ wf 14) 16)
         ;; shared; EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY; a 60 ms device buffer: slack for a late wake
         (unless (ok (m client 3 0 #x88040000 600000 0 wf 0)) (release client) (fail "Initialize refused")))
+      ;; the device's own mix format: what Windows converts our 16-bit 48 kHz stereo to
+      (when (not (failed-p (m client 8 (out0))))                         ; GetMixFormat
+        (let ((mf (peek64 (cell 0))))
+          (format t "~&vessel-windows: the device mixes ~D Hz, ~D channel~:P, ~D bits~:[~; (resampled from 48000)~]~%"
+                  (peek32 (+ mf 4)) (peek16 (+ mf 2)) (peek16 (+ mf 14)) (/= (peek32 (+ mf 4)) rate))))
       (let ((event (c *create-event* 0 0 0 0)))
         (m client 13 event)                                              ; SetEventHandle
         (poke32 (cell 1) 0)
@@ -1874,17 +1904,24 @@
         (modus-int::w32-put-guid g1 "F294ACFC-3146-4483-A7BF-ADDCA7C260E2")
         (unless (ok (m client 14 g1 (out0))) (release client) (fail "no render client"))
         (setf render (peek64 (cell 0)))
+        (modus-int::w32-put-guid g1 "CD63314F-3FBA-4A1B-812C-EF96358728E7")       ; IAudioClock: the device's position
+        (when (ok (m client 14 g1 (out0)))
+          (setf *audio-clock* (peek64 (cell 0)))
+          (m *audio-clock* 3 (cell 4))                                           ; GetFrequency (not cell 1: the buffer size)
+          (setf *audio-clock-hz* (peek64 (cell 4))))
         (let ((block (modus-int::w32-alloc #x1000 t)) (ring (modus-int::w32-alloc +ring-bytes+)))
           (poke64 block *wait-single*) (poke64 (+ block 8) *memcpy*) (poke64 (+ block #x10) event)
           (poke64 (+ block #x18) client) (poke64 (+ block #x20) render) (poke64 (+ block #x28) (peek32 (cell 1)))
           (poke64 (+ block #x30) ring) (poke64 (+ block #x38) (- +ring-bytes+ 1))
           (loop for b in (wasapi-code) for i from 0 do (poke8 (+ block #x100 i) b))
+          (poke64 (+ block #x60) #xFFFFFFFF)
           (setf *wa* block)
           (let ((thread (c *create-thread* 0 0 (+ block #x100) block 0 0)))
             (c *set-thread-priority* thread 2))                          ; THREAD_PRIORITY_HIGHEST
           (unless (ok (m client 10)) (fail "Start refused"))             ; Start
           (format t "~&vessel-windows: speaker: WASAPI, a ~D-frame device buffer, fed by its own thread~%"
                   (peek32 (cell 1)))
+          (when *loopback* (ignore-errors (loopback-open)))
           t)))))
 
 (defun audio-open (rate channels)
@@ -1899,6 +1936,105 @@
 (defun wasapi-p () (eq *speaker* :wasapi))
 
 (defun ring-filled () (logand (- (peek32 (+ *wa* #x40)) (peek32 (+ *wa* #x48))) #xFFFFFFFF))
+
+;;; WHAT WINDOWS ACTUALLY PLAYS (VESSEL_LOOPBACK=PATH): the output device's final mix -- every app's sound, after the
+;;; audio engine -- captured in loopback mode for 30 s and written to PATH as a float WAV, with each packet the engine
+;;; marked DATA_DISCONTINUITY (a glitch of its own) and each change of focus logged against the recording's clock.  A
+;;; hole there is in Windows' mix; a clean recording while a pop is heard puts the pop after Windows (HDMI, the TV).
+;;; IAudioCaptureClient 3 GetBuffer, 4 ReleaseBuffer, 5 GetNextPacketSize.
+
+(defvar *loopback* (let ((p (modus-int::%cli-getenv "VESSEL_LOOPBACK"))) (and p (plusp (length p)) p)))
+(defvar *lb-capture* 0)
+(defvar *lb-buf* 0)
+(defvar *lb-frame-bytes* 8)
+(defvar *lb-frames* 0)
+(defvar *lb-max* (* 48000 30))
+(defvar *lb-glitches* '() "Milliseconds into the recording where the engine flagged a discontinuity.")
+(defvar *lb-marks* '() "(milliseconds what): the focus changes, against the recording.")
+(defvar *lb-done* nil)
+
+(defun lb-ms () (round (* 1000 *lb-frames*) 48000))
+
+(defun lb-mark (what) (when (and *loopback* (plusp *lb-capture*) (not *lb-done*)) (push (list (lb-ms) what) *lb-marks*)))
+
+(defun loopback-open ()
+  (let ((g1 (area 1)) (g2 (area 2)))
+    (modus-int::w32-put-guid g1 "BCDE0395-E52F-467C-8E3D-C4579291692E")
+    (modus-int::w32-put-guid g2 "A95664D2-9614-4F35-A746-DE8DB63617E6")
+    (when (failed-p (c *co-create* g1 0 23 g2 (out0))) (return-from loopback-open nil))
+    (let ((enum (peek64 (cell 0))))
+      (when (failed-p (m enum 4 0 0 (out0))) (release enum) (return-from loopback-open nil))
+      (let ((dev (peek64 (cell 0))))
+        (release enum)
+        (modus-int::w32-put-guid g1 "1CB9AD4C-DBFA-4C32-B178-C2F568A703B2")
+        (when (failed-p (m dev 3 g1 23 0 (out0))) (release dev) (return-from loopback-open nil))
+        (let ((client (peek64 (cell 0))))
+          (release dev)
+          (m client 8 (out0))                                              ; GetMixFormat
+          (let ((mf (peek64 (cell 0))))
+            (setf *lb-frame-bytes* (peek16 (+ mf 12)))
+            ;; shared, LOOPBACK, a 1 s buffer, the device's own format
+            (when (failed-p (m client 3 0 #x20000 10000000 0 mf 0))
+              (format t "~&vessel-windows: loopback: Initialize refused~%") (return-from loopback-open nil)))
+          (modus-int::w32-put-guid g1 "C8ADBD64-E71E-48A0-A4DE-185C395CD317")
+          (when (failed-p (m client 14 g1 (out0))) (return-from loopback-open nil))
+          (setf *lb-capture* (peek64 (cell 0))
+                *lb-buf* (modus-int::w32-alloc (* *lb-max* *lb-frame-bytes*)))
+          (m client 10)                                                    ; Start
+          (format t "~&vessel-windows: recording what Windows plays: 30 s to ~A~%" *loopback*)
+          t)))))
+
+(defun loopback-poll ()
+  (when (and (plusp *lb-capture*) (not *lb-done*))
+    (loop
+      (poke32 (cell 10) 0)
+      (when (failed-p (m *lb-capture* 5 (cell 10))) (return))             ; GetNextPacketSize
+      (when (zerop (peek32 (cell 10))) (return))
+      (poke64 (cell 11) 0) (poke32 (cell 12) 0) (poke32 (cell 13) 0)
+      (when (failed-p (m *lb-capture* 3 (cell 11) (cell 12) (cell 13) 0 0)) (return))   ; GetBuffer
+      (let ((frames (peek32 (cell 12))) (flags (peek32 (cell 13))) (data (peek64 (cell 11))))
+        (when (logtest flags 1) (push (lb-ms) *lb-glitches*))              ; DATA_DISCONTINUITY
+        (let ((n (min frames (- *lb-max* *lb-frames*))))
+          (when (plusp n)
+            (let ((dst (+ *lb-buf* (* *lb-frames* *lb-frame-bytes*))) (bytes (* n *lb-frame-bytes*)))
+              (if (logtest flags 2)                                        ; SILENT
+                  (zero dst bytes)
+                  (c *memcpy* dst data bytes)))
+            (incf *lb-frames* n)))
+        (m *lb-capture* 4 frames))                                         ; ReleaseBuffer
+      (when (>= *lb-frames* *lb-max*) (loopback-write) (return)))))
+
+(defun loopback-write ()
+  (setf *lb-done* t)
+  (let* ((data (* *lb-frames* *lb-frame-bytes*)) (hdr (modus-int::w32-alloc 64)))
+    (flet ((put32 (o v) (poke32 (+ hdr o) v)) (put16 (o v) (poke16 (+ hdr o) v))
+           (tag (o text) (loop for ch across text for k from 0 do (poke8 (+ hdr o k) (char-code ch)))))
+      (tag 0 "RIFF") (put32 4 (+ 36 data)) (tag 8 "WAVEfmt ") (put32 16 16) (put16 20 3) (put16 22 2)
+      (put32 24 48000) (put32 28 (* 48000 *lb-frame-bytes*)) (put16 32 *lb-frame-bytes*) (put16 34 32)
+      (tag 36 "data") (put32 40 data))
+    ;; CreateFileW / WriteFile: 11 MB from native memory, no Lisp vector in between
+    (let ((h (w32-call-file *loopback*)))
+      (when h
+        (w32-write-all h hdr 44)
+        (w32-write-all h *lb-buf* data)
+        (c *close-handle* h)))
+    (format t "~&vessel-windows: what Windows played, ~D ms, written to ~A~%" (lb-ms) *loopback*)
+    (format t "~&vessel-windows: the engine's own glitches (discontinuities) at ms: ~S~%" (reverse *lb-glitches*))
+    (format t "~&vessel-windows: focus changes at ms: ~S~%" (reverse *lb-marks*))
+    (finish-output)))
+
+(defun w32-call-file (path)
+  (let ((h (c *create-file* (wide1 path) #x40000000 0 0 2 #x80 0)))       ; GENERIC_WRITE, CREATE_ALWAYS
+    (if (or (zerop h) (= h #xFFFFFFFFFFFFFFFF)) nil h)))
+
+(defun w32-write-all (h addr n)
+  (loop while (plusp n)
+        do (let ((chunk (min n #x100000)))
+             (poke32 (cell 14) 0)
+             (c *write-file* h addr chunk (cell 14) 0)
+             (let ((done (peek32 (cell 14))))
+               (when (zerop done) (return))
+               (incf addr done) (decf n done)))))
 
 ;;; GAPS, COUNTED (1013, as the Mac's AUDIO-UNDERRUNS).  WASAPI: the feeding thread counts each time the device was
 ;;; empty with nothing in the ring.  waveOut: a write that finds nothing queued, once sound has begun.  A write that
@@ -1996,8 +2132,12 @@
               (round (* 1000 *stat-pump*) internal-time-units-per-second)
               (- (modus-int::%gc-count) (or *stat-gcs* (modus-int::%gc-count)))
               (and *speaker*
-                   (format nil "~D gap~:P, ~D dropped, ~D jump~:P, least queued ~D ms (~D gaps in all)"
-                           gaps drops *audio-seams* (if *audio-least* (round (* 1000 *audio-least*) 48000) 0) (audio-gap-count))))
+                   (format nil "~D gap~:P, ~D dropped, ~D jump~:P, least queued ~D ms~@[, device low ~D ms~]~@[, device clock ~@D ms~] (~D gaps in all)"
+                           gaps drops *audio-seams* (if *audio-least* (round (* 1000 *audio-least*) 48000) 0)
+                           (and (wasapi-p) (prog1 (round (* 1000 (peek64 (+ *wa* #x60))) 48000)
+                                             (poke64 (+ *wa* #x60) #xFFFFFFFF)))
+                           (and (wasapi-p) (let ((d (device-drift))) (and d (round d))))
+                           (audio-gap-count))))
       (finish-output))
     (setf *audio-said* (list (audio-gap-count) *audio-dropped*) *audio-least* nil *stat-frames* 0 *stat-longest* 0
           *audio-seams* 0 *stat-wait* 0 *stat-pump* 0 *stat-late* 0 *stat-early* 0 *stat-work* 0 *stat-repeats* 0
