@@ -49,6 +49,13 @@ $side = Join-Path $out "vessel.exe.manifest"
   <assemblyIdentity version="1.0.0.0" name="ModusLisp.Vessel" type="win32"/>
   <msix xmlns="urn:schemas-microsoft-com:msix.v1"
         publisher="$Publisher" packageName="ModusLisp.Vessel" applicationId="Vessel" />
+  <!-- Windows 10 and 11: without it Windows treats the exe as an older app; among other things it refuses
+       WS_EX_LAYERED on a child window, so ui_fade_to could only show or hide -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
 </assembly>
 "@ | Set-Content -Encoding utf8 $side
 & "$Sdk\mt.exe" -nologo -manifest $side "-outputresource:$exe;#1"

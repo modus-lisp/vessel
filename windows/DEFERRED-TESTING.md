@@ -73,9 +73,10 @@ Commands run from the workspace root. `modus` below is `.\modus-win64-hosted.exe
 
 ## Known gaps (not tests: things not built yet)
 
-- `ui_fade_to` only shows or hides at the end: Windows refused WS_EX_LAYERED on a child window. Likely because
-  modus's executable declares no Windows 8+ compatibility in a manifest; `vessel.exe`'s embedded manifest could
-  declare it. Untested theory.
+- `ui_fade_to` under plain `modus.exe` only shows or hides: Windows refuses WS_EX_LAYERED on a child window to an
+  exe whose manifest declares no Windows 8+ compatibility (measured: refused for modus.exe, allowed for the same
+  exe with a Windows 10 `supportedOS` manifest). `vessel.exe` (build-identity.ps1) now declares it, and fades for
+  real there; `modus.exe` itself would need its build to embed such a manifest.
 - Lists: the Delete key and F5 are not wired (a list's keyboard messages do not reach Lisp without subclassing);
   delete and refresh are in the row's right-click menu.
 - Grids and collections do not scroll; moving a stack's child does not re-lay out the stack.
