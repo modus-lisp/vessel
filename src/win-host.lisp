@@ -1313,33 +1313,41 @@
 
 (defvar *toast-id* nil "This app's App User Model ID, once registered; :NONE if it could not be.")
 
+(defun app-id (name)
+  "The App User Model ID of the app called NAME (its window's title)."
+  (concatenate 'string "ModusLisp.Vessel." (remove-if-not #'alphanumericp name)))
+
+(defun register-app-id (id name)
+  "ID known to Windows for the current user, shown as NAME, with the Vessel logo when there is one."
+  (let ((reg-create (modus-int::w32-proc "advapi32.dll" "RegCreateKeyExW"))
+        (reg-set (modus-int::w32-proc "advapi32.dll" "RegSetValueExW"))
+        (reg-close (modus-int::w32-proc "advapi32.dll" "RegCloseKey")))
+    (poke64 (cell 12) 0)
+    (unless (zerop (logand (c reg-create #x80000001 (wide1 (concatenate 'string "Software\\Classes\\AppUserModelId\\" id))
+                              0 0 0 #x20006 0 (cell 12) 0)                      ; HKCU, KEY_WRITE
+                           #xFFFFFFFF))
+      (error "the registry refused the ID"))
+    (let ((key (peek64 (cell 12))))
+      (flet ((put (value-name text)
+               (let ((n (* 2 (+ 1 (length text)))))
+                 (wide-at (+ *cb* #x3000) text)
+                 (c reg-set key (wide1 value-name) 0 1 (+ *cb* #x3000) n))))           ; REG_SZ
+        (put "DisplayName" name)
+        (let ((logo (namestring (merge-pathnames "../windows/out/stage/Assets/Square150x150Logo.png" *src-dir*))))
+          (when (probe-file logo) (put "IconUri" (substitute #\\ #\/ (namestring (probe-file logo)))))))
+      (c reg-close key))
+    id))
+
 (defun toast-id ()
   (or *toast-id*
       (setf *toast-id*
             (handler-case
                 (let* ((name (let ((title (if (plusp *hwnd*) (window-text *hwnd*) "")))
                                (if (plusp (length title)) title "Vessel")))
-                       (id (concatenate 'string "ModusLisp.Vessel." (remove-if-not #'alphanumericp name)))
-                       (reg-create (modus-int::w32-proc "advapi32.dll" "RegCreateKeyExW"))
-                       (reg-set (modus-int::w32-proc "advapi32.dll" "RegSetValueExW"))
-                       (reg-close (modus-int::w32-proc "advapi32.dll" "RegCloseKey"))
-                       (explicit (modus-int::w32-proc "shell32.dll" "SetCurrentProcessExplicitAppUserModelID")))
-                  (poke64 (cell 12) 0)
-                  (unless (zerop (logand (c reg-create #x80000001 (wide1 (concatenate 'string "Software\\Classes\\AppUserModelId\\" id))
-                                            0 0 0 #x20006 0 (cell 12) 0)
-                                         #xFFFFFFFF))
-                    (error "the registry refused the ID"))
-                  (let ((key (peek64 (cell 12))))
-                    (flet ((put (value-name text)
-                             (let ((n (* 2 (+ 1 (length text)))))
-                               (wide-at (+ *cb* #x3000) text)
-                               (c reg-set key (wide1 value-name) 0 1 (+ *cb* #x3000) n))))     ; REG_SZ
-                      (put "DisplayName" name)
-                      (let ((logo (namestring (merge-pathnames "../windows/out/stage/Assets/Square150x150Logo.png" *src-dir*))))
-                        (when (probe-file logo) (put "IconUri" (substitute #\\ #\/ (namestring (probe-file logo)))))))
-                    (c reg-close key))
-                  (start-menu-shortcut id name)
-                  (c explicit (wide1 id))
+                       (id (app-id name)))
+                  (register-app-id id name)
+                  (start-menu-shortcut id name)                           ; kept if there is one (an install's)
+                  (c (modus-int::w32-proc "shell32.dll" "SetCurrentProcessExplicitAppUserModelID") (wide1 id))
                   (format t "~&vessel-windows: notifications are toasts, as ~A~%" id)
                   id)
               (error (e) (format t "~&vessel-windows: no toasts (~A): balloons instead~%" e) :none)))))
@@ -1348,7 +1356,9 @@
 ;;; (measured: with the registry key alone, a toast was taken and kept in the history but never shown, while one
 ;;; under PowerShell's ID -- which has its shortcut -- showed).  So an app makes its own, in the user's Start menu
 ;;; (no administrator), named for it and carrying its ID (System.AppUserModel.ID), that starts it as it was started
-;;; this time: this executable, these arguments, this directory.  It is rewritten each run, so it follows the app.
+;;; this time: this executable, these arguments, this directory -- made only when there is none, so a run from a
+;;; workspace does not repoint an installed app's shortcut.  An install (windows/install.lisp) writes its own, with
+;;; the installed executable, and REPLACE.
 ;;; IShellLinkW 7 SetDescription, 9 SetWorkingDirectory, 11 SetArguments, 20 SetPath; IPropertyStore 6 SetValue,
 ;;; 7 Commit; IPersistFile 6 Save.
 
@@ -1361,21 +1371,25 @@
                   (or (position #\Space line) (length line)))))
     (string-trim " " (subseq line (min end (length line))))))
 
-(defun start-menu-shortcut (id name)
-  "NAME.lnk in the user's Start menu, starting this app as it was started, carrying the App User Model ID ID."
-  (let* ((exe (progn (c (modus-int::w32-proc "kernel32.dll" "GetModuleFileNameW") 0 (area 5) 260)
-                     (modus-int::w32-wstr (area 5))))
-         (dir (progn (c (modus-int::w32-proc "kernel32.dll" "GetCurrentDirectoryW") 260 (area 5))
-                     (modus-int::w32-wstr (area 5))))
+(defun start-menu-shortcut (id name &key exe args dir replace)
+  "NAME.lnk in the user's Start menu carrying the App User Model ID ID, starting EXE with ARGS in DIR (by default
+   this process's own); kept as it is if there is one, unless REPLACE.  Its path."
+  (let* ((exe (or exe (progn (c (modus-int::w32-proc "kernel32.dll" "GetModuleFileNameW") 0 (area 5) 260)
+                             (modus-int::w32-wstr (area 5)))))
+         (args (or args (command-arguments)))
+         (dir (or dir (progn (c (modus-int::w32-proc "kernel32.dll" "GetCurrentDirectoryW") 260 (area 5))
+                             (modus-int::w32-wstr (area 5)))))
          (programs (format nil "~A\\Microsoft\\Windows\\Start Menu\\Programs"
                            (or (modus-int::%cli-getenv "APPDATA") (error "no APPDATA"))))
          (file (format nil "~A\\~A.lnk" programs (remove-if (lambda (ch) (find ch "\\/:*?\"<>|")) name)))
-         (link (co-make "00021401-0000-0000-C000-000000000046" "000214F9-0000-0000-C000-000000000046")))
+         (link (if (and (not replace) (probe-file file))
+                   (return-from start-menu-shortcut file)
+                   (co-make "00021401-0000-0000-C000-000000000046" "000214F9-0000-0000-C000-000000000046"))))
     (when (zerop link) (error "no shell link"))
     (unwind-protect
          (progn
            (m link 20 (wide1 exe))
-           (m link 11 (wide1 (command-arguments)))
+           (m link 11 (wide1 args))
            (m link 9 (wide1 dir))
            (m link 7 (wide1 name))
            (let ((store (progn (poke64 (cell 13) 0)
@@ -1396,7 +1410,8 @@
              (let ((hr (m file-io 6 (wide1 file) 1)))
                (release file-io)
                (when (failed-p hr) (error "the shortcut was not saved (#x~8,'0X)" (logand hr #xFFFFFFFF)))))
-           (format t "~&vessel-windows: Start menu: ~A~%" file))
+           (format t "~&vessel-windows: Start menu: ~A~%" file)
+           file)
       (release link))))
 
 (defun xml-text (s)
@@ -4134,7 +4149,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
           (setf (view-swap v) (release (view-swap v)) (view-hwnd v) 0))))
 (defswift "gpu_view_size" (view) (view-size view))
 (defswift "gpu_view_print" (view) (setf (view-print (view-of view)) t) 0)
-(defswift "gpu_view_hdr" (view on) (if (view-hdr-set (view-of view) (eql on 1)) 1 0))
+(defswift "gpu_view_hdr" (view on)                ; VESSEL_HDR=0: standard range, whatever the app asks
+  (if (and (not (equal (modus-int::%cli-getenv "VESSEL_HDR") "0")) (view-hdr-set (view-of view) (eql on 1))) 1 0))
 (defswift "gpu_headroom" () (round (* 1000 (hdr-headroom))))
 (defswift "gpu_shader_new" (a n) (shader-new a n))
 (defswift "gpu_pipeline_new" (s va vn fa fn) (pipeline-new s va vn fa fn))
