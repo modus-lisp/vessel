@@ -30,6 +30,7 @@
 ;;;;                     else sound.lisp pans in its own mix
 ;;;;   speech            SAPI 5: an SpVoice speaks (aloud, or into a WAV), the in-process recognizer dictates (from
 ;;;;                     the microphone, or a WAV)
+;;;;   now playing       the System Media Transport Controls: the media overlay and the media keys
 ;;;;   not on a PC       head tracking, the phone's motion, the watch's link: each answers that it is not here
 ;;;;
 ;;;; THE ONE THREAD.  The window is made by, and its messages are pumped on, the thread that runs the app (Win32
@@ -997,6 +998,7 @@
       (setf *stat-pump* (max *stat-pump* (- (get-internal-real-time) t1)))))
   (setf *stat-last-tick* (get-internal-real-time))
   (when *loopback* (loopback-poll))
+  (when *np* (np-poll))
   (run-timers)
   0)
 
@@ -2717,6 +2719,175 @@
   (let ((b (seal:utf8-encode s)))
     (if (> (length b) cap) 0 (progn (put-bytes buf b) (length b)))))
 
+;;; ---- now playing (np_*: vessel's now-playing.lisp) -------------------------------------------------------------------
+;;;
+;;; What NowPlaying.swift is on Apple: Windows' System Media Transport Controls -- the media overlay the keyboard's
+;;; media keys, a headset's buttons and the volume flyout show -- for the main window, through
+;;; ISystemMediaTransportControlsInterop.  What is playing goes to its display updater (music: title, artist,
+;;; album, and the cover as a StorageFile's stream reference), the length and position to its timeline; its button
+;;; presses and seeks arrive through two event handlers (modus's native WinRT delegates, which only ring events) and
+;;; are taken a frame at a time (NP-POLL), as :media and :seek events on the handle np_enable gave.
+;;; Slots, from the SDK's windows.media.h: ISystemMediaTransportControls 7 put_PlaybackStatus, 8 get_DisplayUpdater,
+;;; 11 put_IsEnabled, 13 put_IsPlayEnabled, 15 put_IsStopEnabled, 17 put_IsPauseEnabled, 25 put_IsPreviousEnabled,
+;;; 27 put_IsNextEnabled, 32 add_ButtonPressed; ...Controls2 12 UpdateTimelineProperties, 13
+;;; add_PlaybackPositionChangeRequested; the display updater 7 put_Type, 11 put_Thumbnail, 12 get_MusicProperties,
+;;; 16 ClearAll, 17 Update; IMusicDisplayProperties 7 put_Title, 11 put_Artist; ...2 7 put_AlbumTitle; the timeline
+;;; 7 put_StartTime, 9 put_EndTime, 11 put_MinSeekTime, 13 put_MaxSeekTime, 15 put_Position (TimeSpans, 100 ns).
+
+(defvar *np* nil "The media controls: (smtc smtc2 updater music music2), once np_enable has made them.")
+(defvar *np-handle* 0)
+(defvar *np-text* (vector "" "" ""))
+(defvar *np-artwork* nil "The cover last shown: a path, or the bytes.")
+(defvar *np-cover-count* 0)
+
+(defconstant +np-button-id+ 901)
+(defconstant +np-seek-id+ 902)
+
+(defun np-hstring (s)
+  "An HSTRING of S (any text), which the caller deletes."
+  (let* ((ctx (wrt)) (a (wide-temp s)) (units (1- (floor (modus-int::w32-put-wstr a s) 2))))
+    (modus-int::%wrt-combase ctx 3 a units (modus-int::wrt-out-clear ctx 31))
+    (modus-int::wrt-out-ref ctx 31)))
+
+(defun np-put-text (obj slot s)
+  (let ((h (np-hstring s)))
+    (modus-int::wrt-call (wrt) obj slot h)
+    (modus-int::%wrt-hstring-free (wrt) h)))
+
+(defun np-enable ()
+  (unless *np*
+    (let* ((ctx (wrt))
+           (interop (modus-int::wrt-factory ctx "Windows.Media.SystemMediaTransportControls"
+                                            "DDB0472D-C911-4A1F-86D9-DC3D71A95F5A")))
+      (flet ((fail (why) (format t "~&vessel-windows: media controls: ~A~%" why)
+               (return-from np-enable (setf *np-handle* (new-handle (make-ctl :kind :media))))))
+        (when (zerop interop) (fail "no interop factory"))
+        (let ((hr (modus-int::wrt-call ctx interop 6 *hwnd* (modus-int::wrt-guid ctx 0 "99FA3FF4-1742-42A6-902E-087D41F965EC")
+                                       (modus-int::wrt-out-clear ctx 0))))
+          (modus-int::wrt-release ctx interop)
+          (when (< hr 0) (fail (format nil "GetForWindow refused (#x~8,'0X)" (logand hr #xFFFFFFFF)))))
+        (let* ((smtc (modus-int::wrt-out-ref ctx 0))
+               (smtc2 (modus-int::wrt-qi ctx smtc "EA98D2F6-7F3C-4AF2-A586-72889808EFB1"))
+               (updater (progn (modus-int::wrt-call ctx smtc 8 (modus-int::wrt-out-clear ctx 1))
+                               (modus-int::wrt-out-ref ctx 1)))
+               ;; the music properties exist only once the updater's type is Music
+               (music (progn (modus-int::wrt-call ctx updater 7 1)                  ; MediaPlaybackType_Music
+                             (modus-int::wrt-call ctx updater 12 (modus-int::wrt-out-clear ctx 2))
+                             (modus-int::wrt-out-ref ctx 2)))
+               (music2 (if (zerop music) 0 (modus-int::wrt-qi ctx music "00368462-97D3-44B9-B00F-008AFCEFAF18"))))
+          (dolist (slot '(11 13 15 17 25 27)) (modus-int::wrt-call ctx smtc slot 1))   ; enabled: play pause stop prev next
+          (modus-int::wrt-call ctx smtc 32 (modus-int::wrt-delegate ctx +np-button-id+ "0557E996-7B23-5BAE-AA81-EA0D671143A4")
+                               (modus-int::wrt-out-clear ctx 3))
+          (unless (zerop smtc2)
+            (modus-int::wrt-call ctx smtc2 13 (modus-int::wrt-delegate ctx +np-seek-id+ "44E34F15-BDC0-50A7-ACE4-39E91FB753F1")
+                                 (modus-int::wrt-out-clear ctx 3)))
+          (setf *np* (list smtc smtc2 updater music music2)
+                *np-handle* (new-handle (make-ctl :kind :media)))
+          (format t "~&vessel-windows: media controls: the window's System Media Transport Controls~%")))))
+  *np-handle*)
+
+(defun np-show (duration-ms position-ms playing)
+  "What np_text and np_artwork set, shown: the text, the state, the timeline; then Update."
+  (when *np*
+    (destructuring-bind (smtc smtc2 updater music music2) *np*
+      (let ((ctx (wrt)))
+        (unless (zerop music)
+          (np-put-text music 7 (aref *np-text* 0))
+          (np-put-text music 11 (aref *np-text* 1)))
+        (unless (zerop music2) (np-put-text music2 7 (aref *np-text* 2)))
+        (modus-int::wrt-call ctx smtc 7 (if playing 3 4))                           ; Playing / Paused
+        (unless (zerop smtc2)
+          (let* ((inspectable (modus-int::wrt-activate ctx "Windows.Media.SystemMediaTransportControlsTimelineProperties"))
+                 (tl (if (zerop inspectable) 0 (modus-int::wrt-qi ctx inspectable "5125316A-C3A2-475B-8507-93534DC88F15"))))
+            (unless (zerop inspectable) (modus-int::wrt-release ctx inspectable))
+            (unless (zerop tl)
+              (let ((end (* 10000 duration-ms)))
+                (modus-int::wrt-call ctx tl 7 0) (modus-int::wrt-call ctx tl 9 end)
+                (modus-int::wrt-call ctx tl 11 0) (modus-int::wrt-call ctx tl 13 end)
+                (modus-int::wrt-call ctx tl 15 (* 10000 (min position-ms (max duration-ms position-ms)))))
+              (modus-int::wrt-call ctx smtc2 12 tl)
+              (modus-int::wrt-release ctx tl))))
+        (modus-int::wrt-call ctx updater 17))))                                      ; Update
+  0)
+
+(defun np-clear ()
+  (when *np*
+    (destructuring-bind (smtc smtc2 updater music music2) *np*
+      (declare (ignore smtc2 music music2))
+      (modus-int::wrt-call (wrt) updater 16)                                         ; ClearAll
+      (modus-int::wrt-call (wrt) updater 7 1)
+      (modus-int::wrt-call (wrt) updater 17)
+      (modus-int::wrt-call (wrt) smtc 7 0)))                                         ; Closed
+  (setf *np-text* (vector "" "" "") *np-artwork* nil)
+  0)
+
+(defun np-windows-path (path)
+  (substitute #\\ #\/ path))
+
+(defun np-art-file (path)
+  "PATH's image as the cover: a StorageFile (asynchronously), then its stream reference, then Update."
+  (let* ((ctx (wrt))
+         (statics (modus-int::wrt-factory ctx "Windows.Storage.StorageFile" "5984C710-DAF2-43C8-8BB4-A4D3EACFD03F")))
+    (unless (zerop statics)
+      (let* ((h (np-hstring (np-windows-path path)))
+             (hr (modus-int::wrt-call ctx statics 6 h (modus-int::wrt-out-clear ctx 5)))  ; GetFileFromPathAsync
+             (op (modus-int::wrt-out-ref ctx 5)))
+        (modus-int::%wrt-hstring-free ctx h)
+        (modus-int::wrt-release ctx statics)
+        (unless (or (< hr 0) (zerop op))
+          (when-done op
+            (lambda (done file)
+              (when (and done (plusp file) *np*)
+                (let ((refs (modus-int::wrt-factory ctx "Windows.Storage.Streams.RandomAccessStreamReference"
+                                                    "857309DC-3FBF-4E7D-986F-EF3B1A07A964")))
+                  (unless (zerop refs)
+                    (when (>= (modus-int::wrt-call ctx refs 6 file (modus-int::wrt-out-clear ctx 6)) 0)   ; CreateFromFile
+                      (let ((ref (modus-int::wrt-out-ref ctx 6)) (updater (third *np*)))
+                        (modus-int::wrt-call ctx updater 11 ref)                     ; put_Thumbnail
+                        (modus-int::wrt-call ctx updater 17)
+                        (modus-int::wrt-release ctx ref)))
+                    (modus-int::wrt-release ctx refs)))
+                (modus-int::wrt-release ctx file)))))))))
+
+(defun np-artwork (path)
+  (unless (or (zerop (length path)) (equal path *np-artwork*))
+    (setf *np-artwork* path)
+    (np-art-file path))
+  0)
+
+(defun np-artwork-data (addr n)
+  "A cover from its bytes: written to a file in %TEMP% (StorageFile reads files), then shown as a path is."
+  (let ((arr (token-array addr)))
+    (unless (or (zerop n) (and arr (equalp arr *np-artwork*)))
+      (setf *np-artwork* (if arr (copy-seq arr) addr))
+      (let* ((png (and arr (> (length arr) 4) (= (aref arr 1) (char-code #\P))))
+             (path (format nil "~A\\vessel-cover-~D.~A" (or (modus-int::%cli-getenv "TEMP") "C:\\Windows\\Temp")
+                           (incf *np-cover-count*) (if png "png" "jpg")))
+             (h (w32-call-file path)))
+        (when h
+          (w32-write-all h (native-of addr n) n)
+          (c *close-handle* h)
+          (np-art-file path)))))
+  0)
+
+
+(defun np-poll ()
+  "The media keys and seeks since the last frame, as :media and :seek events."
+  (let ((ctx (wrt)))
+    (dolist (e (modus-int::wrt-events ctx))
+      (destructuring-bind (id sender args) e
+        (case id
+          (901
+           (modus-int::wrt-call ctx args 6 (modus-int::wrt-out-clear ctx 4))      ; get_Button
+           (let ((name (case (logand (modus-int::wrt-out-ref ctx 4) #xFFFFFFFF)
+                         (0 "play") (1 "pause") (2 "stop") (6 "next") (7 "previous"))))
+             (when name (ui-event (list :media *np-handle* name)))))
+          (902
+           (modus-int::wrt-call ctx args 6 (modus-int::wrt-out-clear ctx 4))      ; get_RequestedPlaybackPosition
+           (ui-event (list :seek *np-handle* (floor (modus-int::wrt-out-ref ctx 4) 10000)))))
+        (unless (zerop sender) (modus-int::wrt-release ctx sender))
+        (unless (zerop args) (modus-int::wrt-release ctx args))))))
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -2847,6 +3018,14 @@
 (defswift "ear_level" () (ear-poll) *ear-level*)
 (defswift "ear_text" (buf cap) (ear-poll) (answer-text *ear-text* buf cap))
 (defswift "ear_partial" (buf cap) (ear-poll) (answer-text *ear-partial* buf cap))
+
+;; now playing: the System Media Transport Controls
+(defswift "np_enable" () (np-enable))
+(defswift "np_text" (field a n) (when (<= 0 field 2) (setf (aref *np-text* field) (utf8-text a n))) 0)
+(defswift "np_artwork" (a n) (np-artwork (utf8-text a n)))
+(defswift "np_artwork_data" (a n) (np-artwork-data a n))
+(defswift "np_times" (duration position playing) (np-show duration position (eql playing 1)))
+(defswift "np_clear" () (np-clear))
 
 ;; the phone's motion and the watch's link: neither is here (a PC)
 (defswift "device_motion" (on) 0)
