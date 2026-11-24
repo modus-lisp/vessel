@@ -82,10 +82,12 @@
 (defun %t4u-sleep (ms) (modus-int::%sleep-ms ms))
 
 (defun %t4u-wait (pred ms)
-  "Poll PRED every millisecond for up to MS: T when it held."
-  (dotimes (i ms nil)
-    (when (funcall pred) (return t))
-    (%t4u-sleep 1)))
+  "Poll PRED until it holds, for up to MS by the clock: T when it held.  (It slept a
+   \"millisecond\" between polls, and the bare %SLEEP-MS is a calibrated spin that is far longer
+   on the T420: a 32 KB disk read took 30 ms, 1.0 MB/s; polling, 38.5 MB/s.)"
+  (let ((end (+ (get-internal-real-time) (* ms (floor internal-time-units-per-second 1000)))))
+    (loop (when (funcall pred) (return t))
+          (when (> (get-internal-real-time) end) (return nil)))))
 
 (defun %t4u-take (bus dev fn)
   "Take the EHCI controller at BUS:DEV.FN from the BIOS, reset it and start its schedules.
