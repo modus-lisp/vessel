@@ -393,11 +393,19 @@
                        (hw (u *create-window* 0 (wide1 "BUTTON") (wide2 text) #x50000000   ; WS_CHILD | WS_VISIBLE
                               bx top (px 44) (px 32) parent 0 *hinst* 0)))
                   (unless (zerop hw)
+                    (raise hw)                                                          ; above what was made before
                     (u *send-message* hw #x30 *font* 1)                                 ; WM_SETFONT
                     (setf (gethash hw *gs-key-buttons*) (cons field text))
                     (push hw made)
                     (incf bx (+ (px 44) (px 6))))))
-              (setf (gethash field *gs-key-groups*) (nreverse made)))))))))
+              (setf (gethash field *gs-key-groups*) (nreverse made))
+              ;; the row goes when the field does
+              (push (lambda ()
+                      (dolist (hw (gethash field *gs-key-groups*))
+                        (remhash hw *gs-key-buttons*)
+                        (u *destroy-window* hw))
+                      (remhash field *gs-key-groups*))
+                    (gethash field *on-remove*)))))))))
 
 (defun gs-message-hook (msg hwnd wp lp)
   "A key button's click (WM_COMMAND, BN_CLICKED) types its key, and is no tap."

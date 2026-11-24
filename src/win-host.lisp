@@ -945,6 +945,7 @@
 ;;;   *TICK-HOOKS*          (fn): once a frame (WAIT-FRAME), for what is polled or animated
 ;;;   *REMOVE-HANDLERS*     kind -> (fn handle): ui_remove, before the control's own window goes (its other windows)
 ;;;   *FRAME-HANDLERS*      kind -> (fn handle x y w h): ui_set_frame, in points, instead of moving the one window
+;;;   *ON-REMOVE*           handle -> functions: ui_remove of that one handle also runs them (a field's key row)
 
 (defvar *message-hooks* '())
 (defvar *add-handlers* (make-hash-table))
@@ -953,6 +954,7 @@
 (defvar *text-value-handlers* (make-hash-table))
 (defvar *tick-hooks* '())
 (defvar *remove-handlers* (make-hash-table))
+(defvar *on-remove* (make-hash-table) "A handle -> functions to call when ui_remove takes it (its extras going too).")
 (defvar *frame-handlers* (make-hash-table))
 
 (defun handle-message (msg hwnd wp lp)
@@ -1118,11 +1120,31 @@
 ;;; ---- controls ------------------------------------------------------------------------------------------------------
 
 
+(defvar *get-window-long* 0)
+(defvar *set-window-long* 0)
+
+(defun raise (hwnd)
+  "A child window to the top of its siblings, as UIKit puts a new view: Windows puts a new child window at the
+   BOTTOM, so a full-window panel made first (a screen's background) would cover everything made after it.  And it
+   clips its siblings (WS_CLIPSIBLINGS): without that, two overlapping controls paint over each other in whatever
+   order they happen to repaint, and the order of the siblings decides nothing.  Top-level windows are left alone."
+  (when (zerop *get-window-long*)
+    (setf *get-window-long* (modus-int::w32-proc "user32.dll" "GetWindowLongPtrW")
+          *set-window-long* (modus-int::w32-proc "user32.dll" "SetWindowLongPtrW")))
+  (when (plusp hwnd)
+    (let ((style (logand (c *get-window-long* hwnd -16) #xFFFFFFFF)))                     ; GWL_STYLE
+      (when (logtest style #x40000000)                                                    ; WS_CHILD
+        (unless (logtest style #x04000000)                                                ; WS_CLIPSIBLINGS
+          (c *set-window-long* hwnd -16 (logior style #x04000000)))
+        (c *set-window-pos* hwnd 0 0 0 0 0 #x33)))))                                      ; HWND_TOP, FRAMECHANGED
+
 (defun new-handle (ctl)
   (let ((h *next-handle*))
     (incf *next-handle*)
     (setf (gethash h *ctls*) ctl)
-    (unless (zerop (ctl-hwnd ctl)) (setf (gethash (ctl-hwnd ctl) *by-hwnd*) h))
+    (unless (zerop (ctl-hwnd ctl))
+      (setf (gethash (ctl-hwnd ctl) *by-hwnd*) h)
+      (raise (ctl-hwnd ctl)))
     h))
 
 (defun ctl-of (h) (or (gethash h *ctls*) (error "vessel-windows: no handle ~S" h)))
@@ -1171,12 +1193,16 @@
   (let* ((ctl (ctl-of h)) (f (gethash (ctl-kind ctl) *text-value-handlers*)))
     (cond (f (funcall f h))
           ((zerop (ctl-hwnd ctl)) "")
-          (t (let ((n (u *send-message* (ctl-hwnd ctl) #x0E 0 0)))                     ; WM_GETTEXTLENGTH
-               (if (zerop n)
-                   ""
-                   (let ((buf (modus-int::w32-alloc (* 2 (+ n 1)))))
-                     (u *send-message* (ctl-hwnd ctl) #x0D (+ n 1) buf)                      ; WM_GETTEXT
-                     (prog1 (or (modus-int::w32-wstr buf) "") (modus-int::w32-free buf (* 2 (+ n 1)))))))))))
+          (t (window-text (ctl-hwnd ctl))))))
+
+(defun window-text (hwnd)
+  "HWND's text (WM_GETTEXT, on the windows' thread)."
+  (let ((n (u *send-message* hwnd #x0E 0 0)))                                        ; WM_GETTEXTLENGTH
+    (if (zerop n)
+        ""
+        (let ((buf (modus-int::w32-alloc (* 2 (+ n 1)))))
+          (u *send-message* hwnd #x0D (+ n 1) buf)                                    ; WM_GETTEXT
+          (prog1 (or (modus-int::w32-wstr buf) "") (modus-int::w32-free buf (* 2 (+ n 1))))))))
 
 (defun set-value (h v)
   (let* ((ctl (ctl-of h)) (f (gethash (ctl-kind ctl) *set-value-handlers*)))
@@ -3782,12 +3808,15 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
     (cond (f (funcall f parent child))
           ((eq (ctl-kind ch) :view)                  ; a GPU view: drawn in the parent's window, filling it
            (view-attach (view-of child) (ctl-hwnd (ctl-of parent))))
-          (t (u *set-parent* (ctl-hwnd ch) (ctl-hwnd (ctl-of parent))))))
+          (t (u *set-parent* (ctl-hwnd ch) (ctl-hwnd (ctl-of parent)))
+             (raise (ctl-hwnd ch)))))
   0)
 (defswift "ui_text_value" (h buf cap) (answer-text (text-value h) buf cap))
 (defswift "ui_remove" (h)
   (let* ((ctl (ctl-of h)) (f (gethash (ctl-kind ctl) *remove-handlers*)))
     (when f (funcall f h))
+    (dolist (g (gethash h *on-remove*)) (funcall g))
+    (remhash h *on-remove*)
     (unless (zerop (ctl-hwnd ctl)) (remhash (ctl-hwnd ctl) *by-hwnd*) (u *destroy-window* (ctl-hwnd ctl)))
     (remhash h *ctls*))
   0)
@@ -3939,9 +3968,29 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 ;; the GPU
 (defswift "gpu_language" () 1)
 (defswift "gpu_view_new" (x y w h)
-  (let ((v (view-new)))
+  (let ((v (if (and (plusp w) (plusp h)) (view-in-frame x y w h) (view-new))))
     (when *debug* (format t "~&vessel-windows: gpu_view_new -> ~S (next handle ~S)~%" v *next-handle*))
     v))
+
+(defun view-in-frame (x y w h)
+  "A view at X Y, W x H points in the window (gpu-view with a frame: a storybook's square, beside other views), in
+   a child window of its own; 0 0 0 0 is the old meaning, the whole window or one ui_add attaches."
+  (gpu-init)
+  (let ((hwnd (u *create-window* 0 (wide1 "VesselPanel") (wide2 "") #x56000000             ; CHILD VISIBLE CLIP*
+                 (px x) (px y) (px w) (px h) *hwnd* 0 *hinst* 0))
+        (v (make-view)))
+    (when (zerop hwnd) (error "vessel-windows: no window for a view"))
+    (view-attach v hwnd)
+    (let ((h (new-handle (make-ctl :kind :view :hwnd hwnd :data (list v)))))
+      h)))
+
+;; a view going away: its swap chain and targets first, then (ui_remove) its window
+(setf (gethash :view *remove-handlers*)
+      (lambda (h)
+        (let ((v (view-of h)))
+          (m *ctx* 33 0 0 0)
+          (release-targets v)
+          (setf (view-swap v) (release (view-swap v)) (view-hwnd v) 0))))
 (defswift "gpu_view_size" (view) (view-size view))
 (defswift "gpu_view_print" (view) (setf (view-print (view-of view)) t) 0)
 (defswift "gpu_view_hdr" (view on) (if (view-hdr-set (view-of view) (eql on 1)) 1 0))
@@ -4047,6 +4096,55 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 (defun cl-user::%kiln-sys (n a b c &optional (d 0) (e 8))
   (declare (ignore d e))
   (sys n a b c))
+
+;;; ---- a picture of a window (for tests and tours) ---------------------------------------------------------------------
+;;;
+;;; WINDOW-SHOT: a window as it looks, child controls and all (PrintWindow, PW_CLIENTONLY | PW_RENDERFULLCONTENT), as
+;;; a 32-bit top-down BMP at PATH.  The process that owns the windows can always picture them, whatever a sandbox lets
+;;; another process see of the screen.
+
+(defvar *create-compatible-dc* 0)
+(defvar *create-dib-section* 0)
+(defvar *select-object* 0)
+(defvar *delete-object* 0)
+(defvar *print-window* 0)
+
+(defun window-shot (hwnd path)
+  "HWND's client area, as a BMP at PATH: T, or NIL."
+  (when (zerop *print-window*)
+    (setf *create-compatible-dc* (modus-int::w32-proc "gdi32.dll" "CreateCompatibleDC")
+          *create-dib-section* (modus-int::w32-proc "gdi32.dll" "CreateDIBSection")
+          *select-object* (modus-int::w32-proc "gdi32.dll" "SelectObject")
+          *delete-object* (modus-int::w32-proc "gdi32.dll" "DeleteObject")
+          *print-window* (modus-int::w32-proc "user32.dll" "PrintWindow")))
+  (multiple-value-bind (w h) (hwnd-size hwnd)
+    (when (and (plusp w) (plusp h))
+      (let* ((screen (c *get-dc* 0)) (dc (c *create-compatible-dc* screen)) (bmi (modus-int::w32-alloc 64))
+             (bytes (* 4 w h)) (ok nil))
+        (zero bmi 40)
+        (poke32 bmi 40) (poke32 (+ bmi 4) w) (poke32 (+ bmi 8) (- h)) (poke16 (+ bmi 12) 1) (poke16 (+ bmi 14) 32)
+        (poke64 (cell 0) 0)
+        (let* ((dib (c *create-dib-section* dc bmi 0 (cell 0) 0 0)) (bits (peek64 (cell 0))))
+          (unless (or (zerop dib) (zerop bits))
+            (let ((old (c *select-object* dc dib)))
+              (c *print-window* hwnd dc 3)                                       ; PW_CLIENTONLY | PW_RENDERFULLCONTENT
+              (let ((hdr (modus-int::w32-alloc 64)) (f (w32-call-file path)))
+                (when f
+                  (zero hdr 54)
+                  (poke8 hdr (char-code #\B)) (poke8 (+ hdr 1) (char-code #\M))
+                  (poke32 (+ hdr 2) (+ 54 bytes)) (poke32 (+ hdr 10) 54)
+                  (c *memcpy* (+ hdr 14) bmi 40)
+                  (w32-write-all f hdr 54)
+                  (w32-write-all f bits bytes)
+                  (c *close-handle* f)
+                  (setf ok t))
+                (modus-int::w32-free hdr 64))
+              (c *select-object* dc old))
+            (c *delete-object* dib)))
+        (c *delete-dc* dc)
+        (c *release-dc* 0 screen)
+        (modus-int::w32-free bmi 64)
+        ok))))
 
 ;;; ---- the widgets ------------------------------------------------------------------------------------------------------
 ;;;

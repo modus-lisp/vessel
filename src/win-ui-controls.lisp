@@ -113,10 +113,23 @@
     (cue-banner hwnd (utf8-text a n))
     (new-handle (make-ctl :kind :text-field :hwnd hwnd))))
 
+;; A multi-line EDIT breaks lines only at CR LF: Lisp's newlines go in as CR LF and come back as newlines.
+(defun crlf (text)
+  (with-output-to-string (s)
+    (loop for ch across text for prev = nil then cur for cur = ch
+          do (when (and (char= ch #\Newline) (not (eql prev #\Return))) (write-char #\Return s))
+             (write-char ch s))))
+(defun lf (text) (remove #\Return text))
+
 (defun text-view-new (a n x y w h)
   (let ((hwnd (make-child *hwnd* "EDIT" "" #xA01044 x y w h)))   ; WS_BORDER|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN
-    (set-edit-text hwnd (utf8-text a n))
+    (set-edit-text hwnd (crlf (utf8-text a n)))
     (new-handle (make-ctl :kind :text-view :hwnd hwnd))))
+
+(setf (gethash :text-view *set-text-handlers*)
+      (lambda (h text) (set-edit-text (ctl-hwnd (ctl-of h)) (crlf text)))
+      (gethash :text-view *text-value-handlers*)
+      (lambda (h) (lf (window-text (ctl-hwnd (ctl-of h))))))
 
 (defun search-bar-new (a n x y w h)
   (let ((hwnd (make-child *hwnd* "EDIT" "" #x800080 x y w h)))
