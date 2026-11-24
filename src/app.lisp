@@ -231,7 +231,13 @@
               (let ((now (get-universal-time)))
                 (when (/= now last)
                   (setf last now)
-                  (multiple-value-bind (s m h) (decode-universal-time now)
+                  (multiple-value-bind (s m h)
+                      ;; the platform's zone when it names one (hours west, as CL counts
+                      ;; them): modus has no zone database and decodes in GMT otherwise
+                      (decode-universal-time now (if (and (boundp '*kiln-time-zone*)
+                                                          (symbol-value '*kiln-time-zone*))
+                                                     (symbol-value '*kiln-time-zone*)
+                                                     0))
                     (glass:fb-fill fb #x10141a)
                     (glass:fb-text fb 16 20 (format nil "~2,'0d:~2,'0d:~2,'0d" h m s)
                                    :size 40 :color #xe6ebf2))
@@ -580,11 +586,27 @@
         (and f (funcall (find-symbol "SURF-TEXT-P" "GLASS.WM") f)))
       (let ((f (glass.desk::desk-focus desk))) (and f (glass.desk::win-text-p f)))))
 
+(defvar *kiln-show-move* nil
+  "A platform's own way to show a window move, or NIL: a function of (FB DAMAGE COPY) -- DAMAGE
+   (x0 y0 x1 y1) and COPY (sx sy dx dy w h) in screen pixels -- that moves COPY on the screen (a
+   GPU's blitter: t420-gpu.lisp) and shows DAMAGE less COPY's destination from FB, answering T
+   when it did.  Asked only for a frame glass marks EXACT (FB-TAKE-FRAME: nothing but moves), and
+   only where the desk is the screen at 1x from its top left.")
+
 (defun %kiln-desk-tick (desk)
   "Poll the windows and composite; (values CHANGED X Y W H), the rectangle to show.  glass.wm
    reports its damage on the screen framebuffer (FB-MARK-FRAME), as its RFB sender reads it."
   (if (%wm-desk-p desk)
       (let ((fb (%wm-call "WM-FB" desk)))
+        ;; THE MOVES the events since the last tick made, first, before the windows' own changes
+        ;; join them: a frame of moves alone goes to *KILN-SHOW-MOVE*; anything else is put back
+        (when *kiln-show-move*
+          (multiple-value-bind (no d copy mark-time exact) (glass:fb-take-frame fb)
+            (declare (ignore no mark-time))
+            (when d
+              (unless (and exact copy (consp d)
+                           (ignore-errors (funcall *kiln-show-move* fb d copy)))
+                (glass:fb-mark-frame fb d copy)))))
         (%wm-call "WM-TICK" desk)
         (let ((d (nth-value 1 (glass:fb-take-frame fb)))
               (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))

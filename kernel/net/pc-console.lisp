@@ -196,6 +196,7 @@
   (pcc-copy-bytes (pcc-scan-normal) #x1B400)
   (pcc-copy-bytes (pcc-scan-shifted) #x1B480)
   (setf (mem-ref #x1B040 :u32) 0)
+  (setf (mem-ref #x1B078 :u32) 0)                 ; text mode, whatever RAM held
   ;; A clean screen: what boot drew before the font was here is blanks at
   ;; best, and whatever firmware left at worst.
   (let ((i 0))
@@ -210,10 +211,28 @@
         (setq j (+ j 8))))
     (fb-set-cursor-x 0) (fb-set-cursor-y 0)))
 
+;; A seam: the character on a graphics framebuffer the image set up itself
+;; (net/pc-vbe.lisp, bare i386); nothing where there is none.
+(declaim (overridable %fb-console-char))
+(defun %fb-console-char (code) code nil)
+
+;; THE CONSOLE RING: while #x5FFF4 holds #x1234567 (a fixnum: the console writes before there is a heap to make a bignum in), every byte the console writes is
+;; also kept in 64 KB of low RAM at #x60000, its count at #x5FFF0 -- for a machine with no
+;; serial port, where something else (kiln's desk on the T420: vessel src/t420.lisp) carries it
+;; off.  Off unless that word is set, so every other image is unchanged.
+(defun %console-ring-byte (code)
+  (when (= (mem-ref #x5FFF4 :u32) #x1234567)
+    (let ((n (mem-ref #x5FFF0 :u32)))
+      (when (< n 65536)
+        (setf (mem-ref (+ #x60000 n) :u8) (logand code 255)
+              (mem-ref #x5FFF0 :u32) (+ n 1))))))
+
 (defun %console-write-char (code)
   ;; The write-char-serial hook: COM1 always, then the screens.
   (write-char-serial code)
-  (vga-write-char code)
+  (%console-ring-byte code)
+  ;; not once a VBE graphics mode is set (pc-vbe.lisp's #x1B078): text memory is no longer the screen
+  (if (= (mem-ref #x1B078 :u32) 1) (%fb-console-char code) (vga-write-char code))
   (when (fb-on-p) (fb-write-char code)))
 
 (defun %console-read-char ()
