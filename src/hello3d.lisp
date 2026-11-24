@@ -53,6 +53,7 @@ fragment float4 world_fragment(Out in [[stage_in]], constant Frame &frame [[buff
     float sky = 0.5 + 0.5 * n.y;                                   // light from above, a little from everywhere
     float3 base = picture.sample(s, in.uv).rgb * object.tint.rgb;
     float3 colour = base * (0.18 + 0.22 * sky + 0.75 * sun);
+    colour *= object.tint.a;                                       // a glow: past 1 is brighter than white (HDR)
     float d = distance(in.world, frame.eye.xyz);
     float fog = clamp((d - frame.fog.x) / (frame.fog.y - frame.fog.x), 0.0, 1.0);
     return float4(mix(colour, frame.fog_colour.rgb, fog), 1.0);
@@ -297,6 +298,15 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   watch watch-count (watch-turn nil) (watch-bpm 0) (watch-at 0)
   ;; A FLIP: when it began (internal real time), or NIL -- each cube turns head over heels once, in turn
   (flip-at nil) (flip-plucked 0)
+  ;; THE MAP, a second window: the scene from above, and where you are -- its window, its GPU view, the arrow's lines
+  ;; (rewritten each frame), and whether it is showing
+  map-window map-view map-arrow (map-shown nil)
+  ;; the field of view, which a trackpad's pinch narrows and widens (radians)
+  (fov (/ pi 3))
+  ;; HDR: whether the view draws extended range, and how much brighter than white the screen can go now
+  (hdr nil) (headroom 1.0)
+  ;; THE LIGHT, the way it travels (toward the ground): a fixed afternoon, or the real sun's from where you are
+  (light (list -0.5 -1.0 -0.35)) sun-label
   ;; TOUCH (a phone): each finger by its slot (type 14 events) -> (role x y) where it last was -- :move fingers
   ;; also keep where they landed, the stick's centre; the stick's deflection now, -1..1 each way
   (touch nil) (fingers (make-hash-table)) (stick-x 0.0) (stick-y 0.0) (scale 1))
@@ -402,6 +412,13 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
            (when (and (= ks #xff1b) (game-locked g))
              (kiln-mac:window-pointer-lock nil) (setf (game-locked g) nil))))
       (9 (remhash (logand e #xFFFFFFFFFF) (game-held g)))
+      ;; A TRACKPAD: pinch to zoom (the field of view), two fingers turned to turn, double-tapped to zoom back
+      (15 (multiple-value-bind (kind phase amount) (kiln-mac:gesture-event e)
+            (declare (ignore phase))
+            (case kind
+              (:pinch (setf (game-fov g) (max 0.3 (min 1.7 (/ (game-fov g) (+ 1 amount))))))
+              (:rotate (incf (game-yaw g) (* amount (/ pi 180))))
+              (:smart-zoom (setf (game-fov g) (/ pi 3))))))
       (5 (let* ((k (game-scale g)) (px (floor (logand e #xFFFFF) k)) (py (floor (logand (ash e -20) #xFFFFF) k))
                 (shape (if (and (game-hud-rect g)
                                 (destructuring-bind (x y w h) (game-hud-rect g)
@@ -464,6 +481,69 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
                      (kiln-sound:play (kiln-sound:pluck (* 440 (expt 2 (/ (* 2 i) 12)))) :gain 0.25))
                    (incf (game-flip-plucked g))))
         (when (> since (+ (* 8 *flip-stagger*) *flip-seconds*)) (setf (game-flip-at g) nil))))))
+
+(defparameter *map-half* 13.0 "The map shows this far from the middle each way, in the world's units.")
+
+(defun top-down (aspect)
+  "Looking straight down on the scene, north (-Z) up: x and z across the view (*MAP-HALF* each way, the narrower side
+   of the view), height as depth -- the higher, the nearer."
+  (let ((m (mat)) (k (/ 1.0 *map-half*)))
+    (setf (aref m 0) (float (if (> aspect 1) (/ k aspect) k) 1.0)  ; x across
+          (aref m 9) (float (- (if (< aspect 1) (* k aspect) k)) 1.0)  ; z up the view, -Z at the top
+          (aref m 6) (/ -1.0 40)  (aref m 14) 0.5                 ; height: depth 0.5 at 0, nearer above
+          (aref m 15) 1.0)
+    m))
+
+(defun arrow-points (x z yaw)
+  "Where you are and which way you face, as three segments: a dart, two units long, flat at a height above the cubes."
+  (let* ((fx (- (sin yaw))) (fz (- (cos yaw))) (rx (cos yaw)) (rz (- (sin yaw)))
+         (tipx (+ x (* 1.4 fx))) (tipz (+ z (* 1.4 fz)))
+         (lx (- x (* 0.8 rx) (* 0.6 fx))) (lz (- z (* 0.8 rz) (* 0.6 fz)))
+         (bx (+ x (* 0.8 rx) (* -0.6 fx))) (bz (+ z (* 0.8 rz) (* -0.6 fz))) (y 6))
+    (floats lx y lz tipx y tipz   tipx y tipz bx y bz   bx y bz lx y lz)))
+
+(defun open-map (g)
+  "The map window: made the first time, shown after."
+  (if (game-map-window g)
+      (kiln-mac:window-show (game-map-window g))
+      (let ((win (kiln-mac:new-window "Map" 300 300 :palette t)))
+        (setf (game-map-window g) win
+              (game-map-view g) (kiln-gpu:gpu-view 0 0 0 0)
+              (game-map-arrow g) (kiln-gpu:gpu-buffer (* 4 18)))
+        (kiln-swift:ui-add win (game-map-view g))
+        (kiln-mac:on-window-close win (lambda () (setf (game-map-shown g) nil)))))
+  (setf (game-map-shown g) t))
+
+(defun render-map (g)
+  "The map's frame: the floor and the cubes from above, unfogged, and the arrow over them."
+  (when (and (game-map-shown g) (game-map-view g))
+    (multiple-value-bind (w h) (kiln-gpu:gpu-view-size (game-map-view g))
+      (when (and (plusp w) (plusp h))
+        (let* ((projection (top-down (/ w h)))
+               (frame (floats projection -0.5 -1.0 -0.35 0.0   0 60 0 1   500 1000 0 0   0 0 0 1))
+               (a (game-angle g)))
+          (kiln-gpu:with-gpu-pass (pass (game-map-view g) :clear *dusk*)
+            (kiln-gpu:gpu-use pass (game-pipeline g))
+            (kiln-gpu:gpu-cull pass :none)          ; the view from above is a mirror image: no face is culled
+            (kiln-gpu:gpu-constants pass frame 1)
+            (draw-thing pass (game-floor-vertices g) (game-floor-indices g) 6 (game-floor-texture g)
+                        (identity-mat) (floats 1 1 1 1))
+            (dotimes (i 8)
+              (multiple-value-bind (x y z) (ring-position i a)
+                (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
+                            (mat* (translation x y z) (rotation-y (+ a (* i 0.7)))) (hue (/ i 8.0)))))
+            (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
+                        (mat* (translation 0 (middle-height a) 0) (scaling 1.8)) (floats 1.0 0.85 0.55 1))
+            ;; YOU: an orange dart, over everything
+            (destructuring-bind (ex ey ez) (game-eye g)
+              (declare (ignore ey))
+              (kiln-gpu:gpu-write (game-map-arrow g) (arrow-points ex ez (game-yaw g))))
+            (kiln-gpu:gpu-depth pass :none)
+            (kiln-gpu:gpu-cull pass :none)
+            (kiln-gpu:gpu-use pass (game-line-pipeline g))
+            (kiln-gpu:gpu-bind pass (game-map-arrow g) 0)
+            (kiln-gpu:gpu-constants pass (floats projection 1.0 0.62 0.25 1.0 (* 1.0 (game-scale g)) (/ w 2.0) (/ h 2.0) 0) 2)
+            (kiln-gpu:gpu-draw pass 18)))))))
 
 (defun draw-thing (pass vertices indices count texture model tint)
   "One object: its vertices, texture, model matrix and tint, drawn."
@@ -581,10 +661,10 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
 (defun render (g)
   (multiple-value-bind (w h) (kiln-gpu:gpu-view-size (game-view g))
     (when (and (plusp w) (plusp h))
-      (let* ((projection (perspective (/ pi 3) (/ w h) 0.1 120.0))
+      (let* ((projection (perspective (game-fov g) (/ w h) 0.1 120.0))
              (view (look (game-eye g) (game-yaw g) (game-pitch g)))
              (frame (floats (mat* projection view)
-                            -0.5 -1.0 -0.35 0.0
+                            (first (game-light g)) (second (game-light g)) (third (game-light g)) 0.0
                             (first (game-eye g)) (second (game-eye g)) (third (game-eye g)) 1.0
                             18.0 60.0 0.0 0.0
                             (/ (ldb (byte 8 16) *dusk*) 255.0) (/ (ldb (byte 8 8) *dusk*) 255.0)
@@ -609,7 +689,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
           (draw-thing pass (game-cube-vertices g) (game-cube-indices g) 36 (game-crate-texture g)
                       (mat* (translation 0 (middle-height a) 0)
                             (mat* (rotation-x (flip-turn g 8)) (mat* (rotation-y (* -0.5 a)) (scaling 1.8))))
-                      (floats 1.0 0.85 0.55 1))
+                      ;; glowing, on an HDR screen: brighter than white and back, as far as the screen goes
+                      (floats 1.0 0.85 0.55 (+ 1 (* (- (glow-peak g) 1) (+ 0.5 (* 0.5 (sin (* 2 a))))))))
           ;; over everything, while the head is followed: the head
           (when (or (game-head g) *head-demo*) (draw-head pass g w h))
           ;; and beside it, on a phone, the phone
@@ -765,6 +846,53 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (setf kiln-sound:*master* (if heard 1.0 0.0))
     (when (game-spatial g) (kiln-sound:spatial-volume (if heard 1.0 0.0)))))
 
+(defun compass (azimuth)
+  (aref #("north" "north-east" "east" "south-east" "south" "south-west" "west" "north-west")
+        (mod (round azimuth 45) 8)))
+
+(defun light-from-sun (g)
+  "The light from where the sun is now, seen from where you are: asked for once, said first what for."
+  (flet ((go-on ()
+           (kiln-location:location-start)
+           ;; the first fix comes a moment later: looked for each frame until it does (SUN-TICK)
+           (setf (game-sun-label g) (or (game-sun-label g) :waiting))))
+    (case (kiln-location:location-permission)
+      (:allowed (go-on))
+      (:refused (let ((alert (kiln-swift:ui-alert "Location is off"
+                                                  "To light the scene from your sun, allow Hello 3D in System Settings > Privacy & Security > Location Services.")))
+                  (kiln-swift:ui-alert-action alert "OK")
+                  (kiln-swift:ui-alert-present alert)))
+      (t (let ((alert (kiln-swift:ui-alert "Light from your sun?"
+                                           "Hello 3D can light the scene from where the sun is in your sky right now. Next, you'll be asked to share your location.")))
+           (kiln-swift:ui-alert-action alert "Not Now")
+           (kiln-swift:ui-alert-action alert "Continue")
+           (kiln-swift:on-event :alert alert
+                                (lambda (index h)
+                                  (declare (ignore h))
+                                  (when (eql index 1)
+                                    (kiln-location:location-ask (lambda (ok) (when ok (go-on)))))))
+           (kiln-swift:ui-alert-present alert))))))
+
+(defun sun-tick (g)
+  "Waiting for a fix: when it comes, the light from the sun, and the fixes stopped (one is enough)."
+  (when (eq (game-sun-label g) :waiting)
+    (multiple-value-bind (lat lon) (kiln-location:location)
+      (when lat
+        (kiln-location:location-stop)
+        (multiple-value-bind (el az) (kiln-location:sun-position lat lon)
+          ;; toward the sun: north -Z, east +X, up +Y; the light travels the other way.  Below the horizon, a
+          ;; low light from where it will rise or set, so the cubes still show
+          (let* ((e (* (max el 4.0) (/ pi 180))) (a (* az (/ pi 180)))
+                 (to-sun (list (* (cos e) (sin a)) (sin e) (- (* (cos e) (cos a))))))
+            (setf (game-light g) (mapcar #'- to-sun))
+            (setf (game-sun-label g) t)
+            (format t "~&hello3d: the sun from ~,2F ~,2F: ~,1F degrees up, ~,0F (~A)~%" lat lon el az (compass az))
+            (finish-output)
+            (kiln-swift:ui-set-text (game-pad-label g)
+                                    (if (> el 0)
+                                        (format nil "the sun: ~D degrees up, ~A" (round el) (compass az))
+                                        (format nil "the sun is down (~D degrees), ~A" (round el) (compass az))))))))))
+
 (defun make-menus (g)
   "A Mac's menus: Game in the menu bar -- spin, sound, following the head, faster, slower -- and a status item with
    the frame rate, whose menu has spin and sound.  The check marks follow the toggles wherever they are changed."
@@ -789,7 +917,12 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (kiln-mac:menu-item m "Slower" (lambda () (set-speed g (/ (game-speed g) 1.25))) :key "-")
     (kiln-mac:menu-separator m)
     (kiln-mac:menu-item m "Remind Me in 10 Seconds" (lambda () (remind g)))
-    (kiln-mac:menu-item m "Flip the Cubes" (lambda () (flip g)) :key "f"))
+    (kiln-mac:menu-item m "Flip the Cubes" (lambda () (flip g)) :key "f")
+    (kiln-mac:menu-separator m)
+    (kiln-mac:menu-item m "Show Map" (lambda () (open-map g)))
+    (kiln-mac:menu-item m "Light from the Sun" (lambda () (light-from-sun g)))
+    (kiln-mac:menu-separator m)
+    (kiln-mac:menu-item m "Print..." (lambda () (kiln-gpu:gpu-print (game-view g))) :key "p"))
   (let ((sm (kiln-mac:menu "Hello 3D" :in-bar nil)))
     (push (kiln-mac:menu-item sm "Spin" (lambda () (set-spin g (not (game-spin g))))) (game-spin-items g))
     (push (kiln-mac:menu-item sm "Sound" (lambda () (set-sound g (not (game-sound g))))) (game-sound-items g))
@@ -807,10 +940,18 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (kiln-mac:on-drop (lambda (path) (on-picture g path)))
   (kiln-mac:on-open (lambda (path) (on-picture g path))))
 
+(defvar *glow* nil "HELLO3D_GLOW: the middle cube's peak, times SDR white, whatever the screen says its headroom is.")
+
+(defun glow-peak (g)
+  "How bright the middle cube gets at its brightest: the screen's headroom, or HELLO3D_GLOW's."
+  (if (game-hdr g) (or *glow* (game-headroom g)) 1.0))
+
 (defun start (&key touch)
   "Everything made once: the view filling the window, the pipeline, the meshes, the textures, the controls."
   (let ((g (make-game :touch touch :scale (max 1 (%sys 1001 2 0 0)))))
-    (setf (game-view g) (kiln-gpu:gpu-view 0 0 0 0))
+    (setf (game-view g) (kiln-gpu:gpu-view 0 0 0 0)
+          (game-hdr g) (kiln-gpu:gpu-view-hdr (game-view g)))
+    (format t "~&hello3d: ~:[standard~;high~] dynamic range~%" (game-hdr g))
     (let ((shader (kiln-gpu:gpu-shader *shader*)))
       (setf (game-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "world_vertex" "world_fragment"))))
     (unless (game-pipeline g) (error "hello3d: the shader or its pipeline did not build (see the log)"))
@@ -854,6 +995,8 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
   (%sys 1003 0 0 0)
   (setf *head-demo* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_DEMO"))) (and v (plusp (length v)))))
   (setf *head-log* (let ((v (modus-int::%cli-getenv "HELLO3D_HEAD_LOG"))) (and v (plusp (length v)))))
+  (setf *glow* (let ((v (modus-int::%cli-getenv "HELLO3D_GLOW")))
+                 (and v (plusp (length v)) (ignore-errors (let ((*read-eval* nil)) (float (read-from-string v) 1.0))))))
   (let ((g (start :touch touch)) (last (get-internal-real-time)))
     (format t "~&hello3d: running~%")
     (loop
@@ -866,14 +1009,23 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
         (steer g dt)
         (when (game-spin g) (incf (game-angle g) (* dt (game-speed g))))
         (flip-tick g)
+        (sun-tick g)
         (handler-case (hear g)
           (serious-condition (c) (format t "~&hello3d: sound: ~A~%" c)))
         (handler-case (render g)
           (serious-condition (c) (format t "~&hello3d: ~A~%" c)))
+        (handler-case (render-map g)
+          (serious-condition (c) (format t "~&hello3d: map: ~A~%" c)))
         ;; the frame rate, twice a second
         (incf (game-frames g))
         (let ((since (/ (- now (game-fps-at g)) internal-time-units-per-second)))
           (when (>= since 0.5)
+            ;; the headroom changes as a TV goes into its HDR mode, or a Mac's window moves to another screen
+            (when (game-hdr g)
+              (let ((h (kiln-gpu:gpu-headroom)))
+                (unless (= h (game-headroom g))
+                  (format t "~&hello3d: headroom ~,2F~%" h) (finish-output)
+                  (setf (game-headroom g) h))))
             (kiln-swift:ui-set-text (game-fps-label g)
                                     (format nil "~D frames a second~:[~*~;  ·  watch~@[ ♥ ~D~]~]"
                                             (round (game-frames g) since) (watch-fresh-p g)

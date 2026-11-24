@@ -32,7 +32,7 @@
   (:export #:gpu-view #:gpu-shader #:gpu-pipeline #:gpu-buffer #:gpu-write
            #:gpu-pass-begin #:gpu-pass-end #:with-gpu-pass #:gpu-use #:gpu-bind #:gpu-draw #:floats
            #:gpu-view-size #:gpu-depth #:gpu-cull #:gpu-constants #:gpu-texture #:gpu-bind-texture
-           #:gpu-indices #:gpu-draw-indexed))
+           #:gpu-indices #:gpu-draw-indexed #:gpu-print #:gpu-view-hdr #:gpu-headroom))
 
 (in-package #:kiln-gpu)
 
@@ -51,6 +51,21 @@
 
 (defun gpu-view (x y w h)
   (%call "gpu_view_new" x y w h))
+
+;;; HIGH DYNAMIC RANGE: WebGPU's configure({format: 'rgba16float', toneMapping: {mode: 'extended'}}).  The view
+;;; draws half floats in extended sRGB: what a shader wrote before looks the same, and past 1.0 is brighter than
+;;; white, up to GPU-HEADROOM.  On a TV it also asks for an HDR10 mode (taken when Match Content > Dynamic Range
+;;; is on).  Pipelines follow their view's format by themselves.
+
+(defun gpu-view-hdr (view &optional (on t))
+  "VIEW in extended range (ON) or back to 8 bits; true if it is HDR now, NIL where the host has no HDR."
+  (handler-case (plusp (%call "gpu_view_hdr" view (if on 1 0)))
+    (error () nil)))
+
+(defun gpu-headroom ()
+  "How many times SDR white the screen can show now: 1.0 on an SDR screen, or a TV not yet in an HDR mode."
+  (handler-case (/ (%call "gpu_headroom") 1000.0)
+    (error () 1.0)))
 
 (defun gpu-shader (source)
   "A shader module compiled from SOURCE, or NIL (the log says why)."
@@ -146,3 +161,7 @@
   "Draw COUNT of the 16-bit INDICES (a GPU-INDICES buffer) from FIRST."
   (%call "gpu_draw_indexed" pass (ecase primitive (:triangles 0) (:triangle-strip 1) (:lines 2) (:points 3))
          indices count first 0))
+
+(defun gpu-print (view)
+  "VIEW's next frame, copied out of the GPU, to the system's print panel."
+  (%call "gpu_view_print" view))

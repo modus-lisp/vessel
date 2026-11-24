@@ -29,6 +29,21 @@
 ;;;;                                   it opens MENU when clicked, or calls FN
 ;;;;   (status-title item "120 fps")
 ;;;;
+;;;; PRINTING: (print-window "Desk")  the window's picture to the print panel (a GPU view: KILN-GPU:GPU-PRINT)
+;;;;
+;;;; TRACKPAD GESTURES come with the window's own events (type 15, pseudo-syscall 1004), for the app's loop:
+;;;;   (gesture-event e)               (values kind phase amount) for a type 15 event E: KIND :pinch (AMOUNT the
+;;;;                                   change, 0.1 a tenth bigger), :rotate (degrees, counter-clockwise), :smart-zoom,
+;;;;                                   :swipe (:left :right :up :down); PHASE :began :changed :ended
+;;;;
+;;;; MORE WINDOWS than the one the desk (or app) is in:
+;;;;   (new-window "Map" 360 360 &key palette)   a window (a floating palette), shown, centred: a UI handle -- KILN-SWIFT:UI-ADD puts views in it,
+;;;;                                   placed from its top left; a GPU view made to fill (GPU-VIEW 0 0 0 0) fills it
+;;;;   (window-show win)  (window-hide win)  (window-retitle win "Map: 3 cubes")
+;;;;   (on-window-close win fn)        FN, of no arguments, when its close button is clicked (it is hidden, and can
+;;;;                                   be shown again)
+;;;;   (on-window-resize win fn)       FN gets its new width and height, in points
+;;;;
 ;;;; THE APP'S OWN EVENTS AND THE DOCK:
 ;;;;   (on-open fn)                    FN gets each file's path or link opened with the app: Finder's Open With
 ;;;;                                   (kiln mac --opens=UTIS), `open', the app's URL scheme (--url-scheme=NAME)
@@ -47,7 +62,9 @@
            #:window-pointer-lock #:window-pointer-shape
            #:glass-panel #:glass-button #:menu #:menu-item #:menu-separator #:menu-check #:menu-enable
            #:status-item #:status-title
-           #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce))
+           #:on-open #:on-drop #:on-app-state #:on-quit #:dock-badge #:dock-bounce
+           #:new-window #:window-show #:window-hide #:window-retitle #:on-window-close #:on-window-resize
+           #:gesture-event #:print-window))
 
 (in-package #:kiln-mac)
 
@@ -185,3 +202,46 @@
 (defun dock-bounce (&optional critical)
   "The Dock icon bounces once -- until the app is active, if CRITICAL."
   (kiln-swift:swift-call "dock_bounce" (if critical 1 0)))
+
+;;; ---- more windows ---------------------------------------------------------------------------------------------------
+
+(defun new-window (title width height &key palette)
+  "A window titled TITLE, WIDTH x HEIGHT points, centred and shown: a UI handle that views are added to.  PALETTE: a
+   floating palette -- a small-titled panel over the app's windows, hidden while another app is in front, leaving
+   the keys with the main window."
+  (let ((b (%bytes title)))
+    (kiln-swift:swift-call "window_new" (kiln-swift::%addr b) (length b) width height (if palette 1 0))))
+
+(defun window-show (win) (kiln-swift:swift-call "window_show" win))
+(defun window-hide (win) (kiln-swift:swift-call "window_hide" win))
+
+(defun window-retitle (win title)
+  (let ((b (%bytes title)))
+    (kiln-swift:swift-call "window_retitle" win (kiln-swift::%addr b) (length b))))
+
+(defun on-window-close (win fn)
+  "FN, of no arguments, when WIN's close button is clicked; WIN is hidden, and WINDOW-SHOW brings it back."
+  (kiln-swift:on-event :winclose win (lambda (value h) (declare (ignore value h)) (funcall fn))))
+
+(defun on-window-resize (win fn)
+  "FN gets WIN's new content width and height, in points, as it is resized."
+  (kiln-swift:on-event :winresize win (lambda (wh h) (declare (ignore h)) (funcall fn (floor wh 65536) (mod wh 65536)))))
+
+;;; ---- trackpad gestures ----------------------------------------------------------------------------------------------
+
+(defun gesture-event (e)
+  "A trackpad gesture (a type 15 window event): (values kind phase amount), KIND :PINCH :ROTATE :SMART-ZOOM or :SWIPE,
+   PHASE :BEGAN :CHANGED or :ENDED, AMOUNT a pinch's change (0.1: a tenth bigger), a rotation's degrees
+   (counter-clockwise), a swipe's direction (:LEFT :RIGHT :UP :DOWN), NIL for a smart zoom."
+  (let* ((kind (ldb (byte 4 32) e)) (phase (ldb (byte 2 36) e))
+         (raw (ldb (byte 32 0) e)) (n (if (logbitp 31 raw) (- raw (ash 1 32)) raw)))
+    (values (case kind (0 :pinch) (1 :rotate) (2 :smart-zoom) (t :swipe))
+            (case phase (0 :began) (1 :changed) (t :ended))
+            (case kind
+              (0 (/ n 1000.0)) (1 (/ n 1000.0)) (2 nil)
+              (t (case n (1 :left) (2 :right) (3 :up) (t :down)))))))
+
+(defun print-window (&optional (title "Window"))
+  "The window's picture -- its framebuffer, as last shown -- to the system's print panel, titled TITLE."
+  (let ((b (%bytes title)))
+    (kiln-swift:swift-call "print_window" (kiln-swift::%addr b) (length b))))
