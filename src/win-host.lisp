@@ -33,6 +33,7 @@
 ;;;;   now playing       the System Media Transport Controls: the media overlay and the media keys
 ;;;;   the camera        Media Foundation: frames as BGRA, a preview, a JPEG (WIC), video (H.264, MPEG-4; no sound)
 ;;;;                     -- UNTESTED: written on a PC with no camera
+;;;;   files, folders    Windows' file dialog (IFileOpenDialog), on the windows' thread; a folder kept under a key
 ;;;;   not on a PC       head tracking, the phone's motion, the watch's link: each answers that it is not here
 ;;;;
 ;;;; THE ONE THREAD.  The window is made by, and its messages are pumped on, the thread that runs the app (Win32
@@ -3289,6 +3290,97 @@
     (c *create-directory* (wide1 dir) 0)
     dir))
 
+;;; ---- choosing files and folders (app_pick_file, files_choose_folder, ui_document_picker_show) ----------------------
+;;;
+;;; Windows' own file dialog (IFileOpenDialog: the Explorer-style one, folders with FOS_PICKFOLDERS).  It is modal,
+;;; so it runs on the windows' thread: each call on it is a UI-POST, the next made from the previous one's answer,
+;;; and the app's thread never waits.  The object is created there too, in that thread's single-threaded apartment
+;;; (the dialog's own requirement), and only ever called from there.  What was chosen arrives as the same event the
+;;; Mac sends: :picked or :folder, with the path in Windows' form but with forward slashes ("" when cancelled).
+;;; A folder chosen under a key is remembered (app-folder\folders.txt) for files_folder_path on later runs.
+;;; Slots (the SDK's shobjidl_core.h): IFileOpenDialog 3 Show, 9 SetOptions, 17 SetTitle, 20 GetResult;
+;;; IShellItem 5 GetDisplayName (SIGDN_FILESYSPATH).
+
+(defun vslot (obj slot) (peek64 (+ (peek64 obj) (* 8 slot))))
+
+(defun ui-chain (steps done)
+  "Each of STEPS, a function of the previous result returning (F ARGS EXTRA) or NIL to stop early, posted to the
+   windows' thread in turn; DONE gets the last result and that call's memory, or NIL."
+  (labels ((next (steps prev mem)
+             (when *debug* (format t "~&vessel-windows: ui-chain: ~D to go, last #x~X~%" (length steps) (or prev 0)))
+             (if (null steps)
+                 (funcall done prev mem)
+                 (let ((call (funcall (first steps) prev mem)))
+                   (if (null call)
+                       (funcall done nil mem)
+                       (destructuring-bind (f args &optional (extra 0)) call
+                         (ui-post f args (lambda (r m) (next (rest steps) r m)) extra)))))))
+    (next steps nil 0)))
+
+(defun choose (folder-p title kind h &optional key)
+  "Windows' file dialog for a file or (FOLDER-P) a folder; then (KIND H path), and the folder kept under KEY."
+  (let ((dialog 0) (item 0) (path ""))
+    (flet ((ok (r) (not (failed-p (or r 0)))))
+      (ui-chain
+       (list
+        ;; the windows' thread in a single-threaded apartment (RPC_E_CHANGED_MODE if it is already in one: fine)
+        (lambda (r mem) (declare (ignore r mem)) (list *co-initialize* (list 0 2)))
+        (lambda (r mem) (declare (ignore r mem))
+          (list *co-create*
+                (list (lambda (m) (guid-at m "DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")) 0 1
+                      (lambda (m) (guid-at (+ m 16) "D57C7288-D4AD-4768-BE02-9D969532D960"))
+                      (lambda (m) (poke64 (+ m 32) 0) (+ m 32)))
+                64))
+        (lambda (r mem)
+          (when (ok r)
+            (setf dialog (peek64 (+ mem 32)))
+            (list (vslot dialog 9) (list dialog (if folder-p #x60 #x1840)))))    ; SetOptions
+        (lambda (r mem) (declare (ignore r mem))
+          (list (vslot dialog 17) (list dialog (lambda (m) (wide-at m title))) (* 2 (+ 1 (length title)))))
+        (lambda (r mem) (declare (ignore r mem)) (list (vslot dialog 3) (list dialog *hwnd*)))   ; Show: modal
+        (lambda (r mem) (declare (ignore mem))
+          (when (ok r)                                                       ; cancelled: #x800704C7
+            (list (vslot dialog 20) (list dialog (lambda (m) (poke64 m 0) m)) 8)))   ; GetResult
+        (lambda (r mem)
+          (when (ok r)
+            (setf item (peek64 mem))
+            (list (vslot item 5) (list item #x80058000 (lambda (m) (poke64 m 0) m)) 8)))   ; GetDisplayName
+        (lambda (r mem)
+          (when (ok r)
+            (let ((p (peek64 mem)))
+              (unless (zerop p)
+                (setf path (substitute #\/ #\\ (or (modus-int::w32-wstr p) "")))
+                (c *co-task-mem-free* p))))
+          nil))
+       (lambda (r mem)
+         (declare (ignore r mem))
+         ;; let go of what was made, on the thread that made it
+         (unless (zerop item) (ui-post (vslot item 2) (list item) (lambda (r m) r m)))
+         (unless (zerop dialog) (ui-post (vslot dialog 2) (list dialog) (lambda (r m) r m)))
+         (when (and key (plusp (length path))) (remember-folder key path))
+         (ui-event (list kind h path))))))
+  h)
+
+(defun folders-file () (format nil "~A\\folders.txt" (app-folder)))
+
+(defun remembered-folders ()
+  "(key . path) for every folder chosen under a key."
+  (with-open-file (in (folders-file) :if-does-not-exist nil)
+    (when in
+      (loop for line = (read-line in nil) while line
+            for tab = (position #\Tab line)
+            when tab collect (cons (subseq line 0 tab) (subseq line (1+ tab)))))))
+
+(defun remember-folder (key path)
+  (let ((all (cons (cons key path) (remove key (remembered-folders) :key #'car :test #'string=))))
+    (with-open-file (out (folders-file) :direction :output :if-exists :supersede :if-does-not-exist :create)
+      (dolist (kv all) (format out "~A~C~A~%" (car kv) #\Tab (cdr kv))))))
+
+(defun folder-path (key)
+  "The folder chosen under KEY, if it is still there: its path, or \"\"."
+  (let ((path (cdr (assoc key (remembered-folders) :test #'string=))))
+    (if (and path (probe-file (concatenate 'string (string-right-trim "/" path) "/"))) path "")))
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -3439,6 +3531,13 @@
 (defswift "cam_stop" (cam) (cam-stop cam))
 (defswift "cam_close" (cam) (cam-close cam))
 (defswift "files_documents" (buf cap) (answer-text (app-folder) buf cap))
+
+;; choosing files and folders: Windows' file dialog
+(defswift "app_pick_file" () (choose nil "Open" :picked (new-handle (make-ctl :kind :picker))))
+(defswift "ui_document_picker_show" () (choose nil "Open" :picked (new-handle (make-ctl :kind :picker))))
+(defswift "files_choose_folder" (a n)
+  (choose t "Choose a Folder" :folder (new-handle (make-ctl :kind :picker)) (and (plusp n) (utf8-text a n))))
+(defswift "files_folder_path" (a n buf cap) (answer-text (folder-path (utf8-text a n)) buf cap))
 
 ;; the phone's motion and the watch's link: neither is here (a PC)
 (defswift "device_motion" (on) 0)
