@@ -41,7 +41,7 @@
 
 (defpackage #:vessel-windows
   (:use #:cl)
-  (:export #:open-window #:install-bridge #:*dpi* #:*hwnd*))
+  (:export #:open-window #:host-init #:install-bridge #:*dpi* #:*hwnd*))
 
 (in-package #:vessel-windows)
 
@@ -667,6 +667,11 @@
   (let ((r (rect-area)))
     (c *get-client-rect* *hwnd* r)
     (setf *w* (s32 (peek32 (+ r 8))) *h* (s32 (peek32 (+ r 12))))))
+
+(defun host-init ()
+  "The host's calls, without a window: for a script that uses the speaker, the microphone, the location and so on."
+  (call-init)
+  (procs-init))
 
 (defun open-window (title width height)
   "Open the app's window, WIDTH x HEIGHT points, titled TITLE.  The rest of this host acts on it."
@@ -2150,6 +2155,159 @@
         ((wasapi-p) (+ (floor (ring-filled) 2) (* 2 (peek64 (+ *wa* #x50)))))
         (t (* 2 (modus-int::w32-audio-queued *speaker*)))))
 
+;;; ---- the microphone (mic_*: vessel's microphone.lisp) ------------------------------------------------------------------
+;;;
+;;; As the speaker, in reverse: WASAPI captures the default input in shared mode, as mono 16-bit at the rate asked for
+;;; (AUTOCONVERTPCM), and a thread of native code waits on its event and copies each packet into a ring (512 KB:
+;;; 5 s at 48 kHz).  Lisp drains it (mic_read).  If Lisp falls behind and a packet does not fit, the packet is dropped
+;;; and counted (mic_dropped) -- the Mac drops the oldest instead; here each side writes only its own counter.
+;;; A packet the engine marks SILENT is copied from a page of zeros.  Windows' microphone privacy switch refusing the
+;;; app shows as E_ACCESSDENIED: mic_state 3.
+;;; The block: +#x00 WaitForSingleObject  +#x08 memcpy  +#x10 the event  +#x18 IAudioCaptureClient  +#x20 the ring
+;;; +#x28 its size - 1  +#x30 bytes ever written (dword, the thread's)  +#x38 bytes ever read (dword, Lisp's)
+;;; +#x40 frames dropped  +#x48 stop  +#x50 a data cell  +#x58 a frames cell  +#x60 a flags cell  +#x68 a packet-size
+;;; cell  +#x78 a page of zeros  +#x100 the code.
+;;; IAudioCaptureClient 3 GetBuffer, 4 ReleaseBuffer, 5 GetNextPacketSize.
+
+(defconstant +mic-ring-bytes+ (ash 1 19))
+(defvar *mic* 0 "The capture block.")
+(defvar *mic-client* 0)
+(defvar *mic-state* 0 "As mic_state answers: 0 off, 1 asking, 2 capturing, 3 not allowed, 4 failed.")
+
+(defun mic-code ()
+  (let ((jne '(#x0F #x85)) (je '(#x0F #x84)) (js '(#x0F #x88)) (jbe '(#x0F #x86)) (jmp '(#xE9)))
+    (assemble
+     `(#x53 #x56 #x57 #x48 #x83 #xEC #x30          ; push rbx/rsi/rdi; sub rsp,0x30
+       #x48 #x89 #xCB                              ; mov rbx,rcx
+       (:label :loop)
+       #x48 #x83 #x7B #x48 #x00 (:j ,jne :out)     ; stop?
+       #x48 #x8B #x4B #x10 #xBA #x64 #x00 #x00 #x00 #xFF #x13    ; WaitForSingleObject(event, 100)
+       (:label :packet)
+       #x48 #x8B #x4B #x18 #x48 #x8D #x53 #x68     ; rcx capture, rdx &packet
+       #x48 #x8B #x01 #xFF #x50 #x28               ; GetNextPacketSize
+       #x85 #xC0 (:j ,js :loop)
+       #x83 #x7B #x68 #x00 (:j ,je :loop)          ; nothing waiting
+       #x48 #xC7 #x44 #x24 #x20 #x00 #x00 #x00 #x00   ; 5th, 6th: NULL
+       #x48 #xC7 #x44 #x24 #x28 #x00 #x00 #x00 #x00
+       #x48 #x8B #x4B #x18 #x48 #x8D #x53 #x50 #x4C #x8D #x43 #x58 #x4C #x8D #x4B #x60   ; &data &frames &flags
+       #x48 #x8B #x01 #xFF #x50 #x18               ; GetBuffer
+       #x85 #xC0 (:j ,js :loop)
+       #xF7 #x43 #x60 #x02 #x00 #x00 #x00 (:j ,je :sound)   ; SILENT: read from the page of zeros
+       #x48 #x8B #x43 #x78 #x48 #x89 #x43 #x50
+       (:label :sound)
+       #x8B #x73 #x58 #xD1 #xE6                    ; esi = bytes (2 a frame)
+       #x8B #x43 #x30 #x2B #x43 #x38               ; eax = filled
+       #x8B #x7B #x28 #xFF #xC7 #x29 #xC7          ; edi = room
+       #x39 #xFE (:j ,jbe :fits)
+       #x8B #x43 #x58 #x48 #x01 #x43 #x40 (:j ,jmp :release)   ; no room: dropped
+       (:label :fits)
+       #x8B #x43 #x30 #x23 #x43 #x28               ; eax = write offset
+       #x8B #x7B #x28 #xFF #xC7 #x29 #xC7          ; edi = size - offset
+       #x39 #xF7 (:j ,jbe :first) #x89 #xF7        ; edi = min(that, bytes)
+       (:label :first)
+       #x48 #x8B #x4B #x20 #x48 #x01 #xC1 #x48 #x8B #x53 #x50 #x41 #x89 #xF8 #xFF #x53 #x08   ; memcpy(ring+off, data, edi)
+       #x41 #x89 #xF0 #x41 #x29 #xF8 (:j ,je :copied)
+       #x48 #x8B #x4B #x20 #x48 #x8B #x53 #x50 #x48 #x01 #xFA #xFF #x53 #x08                 ; the rest, to the ring's start
+       (:label :copied)
+       #x01 #x73 #x30                              ; written += bytes (dword)
+       (:label :release)
+       #x48 #x8B #x4B #x18 #x8B #x53 #x58 #x48 #x8B #x01 #xFF #x50 #x20   ; ReleaseBuffer(frames)
+       (:j ,jmp :packet)
+       (:label :out)
+       #x48 #x83 #xC4 #x30 #x5F #x5E #x5B #x31 #xC0 #xC3))))
+
+(defun mic-start (rate)
+  (when (member *mic-state* '(1 2)) (return-from mic-start 1))
+  (let ((rate (if (plusp rate) rate 48000)) (g1 (area 1)) (g2 (area 2)))
+    (flet ((fail (state why)
+             (format t "~&vessel-windows: microphone: ~A~%" why)
+             (setf *mic-state* state)
+             (return-from mic-start 0)))
+      (c *co-initialize* 0 0)
+      (modus-int::w32-put-guid g1 "BCDE0395-E52F-467C-8E3D-C4579291692E")
+      (modus-int::w32-put-guid g2 "A95664D2-9614-4F35-A746-DE8DB63617E6")
+      (when (failed-p (c *co-create* g1 0 23 g2 (out0))) (fail 4 "no device enumerator"))
+      (let ((enum (peek64 (cell 0))))
+        (when (failed-p (m enum 4 1 0 (out0))) (release enum) (fail 4 "no default input"))   ; eCapture, eConsole
+        (let ((dev (peek64 (cell 0))))
+          (release enum)
+          (modus-int::w32-put-guid g1 "1CB9AD4C-DBFA-4C32-B178-C2F568A703B2")
+          (let ((hr (m dev 3 g1 23 0 (out0))))
+            (release dev)
+            (when (failed-p hr)
+              (if (= (logand hr #xFFFFFFFF) #x80070005)
+                  (fail 3 "Windows does not let this app use it (Settings > Privacy & security > Microphone)")
+                  (fail 4 (format nil "no audio client (#x~8,'0X)" (logand hr #xFFFFFFFF))))))
+          (let ((client (peek64 (cell 0))) (wf (area 0)))
+            (zero wf 20)                                                     ; WAVEFORMATEX: PCM, mono, 16-bit
+            (poke16 wf 1) (poke16 (+ wf 2) 1) (poke32 (+ wf 4) rate) (poke32 (+ wf 8) (* rate 2))
+            (poke16 (+ wf 12) 2) (poke16 (+ wf 14) 16)
+            (let ((hr (m client 3 0 #x88040000 10000000 0 wf 0)))            ; shared, event, converted; a 1 s buffer
+              (when (failed-p hr)
+                (release client)
+                (if (= (logand hr #xFFFFFFFF) #x80070005)
+                    (fail 3 "Windows does not let this app use it (Settings > Privacy & security > Microphone)")
+                    (fail 4 (format nil "Initialize refused (#x~8,'0X)" (logand hr #xFFFFFFFF))))))
+            (let ((event (c *create-event* 0 0 0 0)))
+              (m client 13 event)                                            ; SetEventHandle
+              (modus-int::w32-put-guid g1 "C8ADBD64-E71E-48A0-A4DE-185C395CD317")
+              (when (failed-p (m client 14 g1 (out0))) (release client) (fail 4 "no capture client"))
+              (let ((capture (peek64 (cell 0)))
+                    (block (modus-int::w32-alloc #x1000 t))
+                    (ring (modus-int::w32-alloc +mic-ring-bytes+))
+                    (zeros (modus-int::w32-alloc #x40000)))
+                (poke64 block *wait-single*) (poke64 (+ block 8) *memcpy*) (poke64 (+ block #x10) event)
+                (poke64 (+ block #x18) capture) (poke64 (+ block #x20) ring)
+                (poke64 (+ block #x28) (- +mic-ring-bytes+ 1)) (poke64 (+ block #x78) zeros)
+                (loop for b in (mic-code) for i from 0 do (poke8 (+ block #x100 i) b))
+                (setf *mic* block *mic-client* client)
+                (let ((thread (c *create-thread* 0 0 (+ block #x100) block 0 0)))
+                  (c *set-thread-priority* thread 2))
+                (when (failed-p (m client 10)) (fail 4 "Start refused"))
+                (setf *mic-state* 2)
+                (format t "~&vessel-windows: microphone: capturing at ~D Hz~%" rate)
+                1))))))))
+
+(defun mic-filled () (if (zerop *mic*) 0 (logand (- (peek32 (+ *mic* #x30)) (peek32 (+ *mic* #x38))) #xFFFFFFFF)))
+
+(defun mic-sample (offset)
+  "The sample at byte OFFSET (taken modulo the ring), signed."
+  (let ((v (peek16 (+ (peek64 (+ *mic* #x20)) (logand offset (- +mic-ring-bytes+ 1))))))
+    (if (>= v #x8000) (- v #x10000) v)))
+
+(defun mic-read (buf cap)
+  "The oldest samples waiting, at most CAP, into BUF (a token for a (SIGNED-BYTE 16) vector, or an address of
+   modus fixnum words); how many."
+  (if (zerop *mic*)
+      0
+      (let* ((n (min cap (floor (mic-filled) 2))) (rd (peek32 (+ *mic* #x38))) (arr (token-array buf)))
+        (dotimes (i n)
+          (let ((v (mic-sample (+ rd (* 2 i)))))
+            (if arr
+                (when (< i (length arr)) (setf (aref arr i) v))
+                (poke64 (+ buf (* 8 i)) (* 2 v)))))
+        (poke32 (+ *mic* #x38) (logand (+ rd (* 2 n)) #xFFFFFFFF))           ; read, after the samples are taken
+        n)))
+
+(defun mic-level ()
+  "The level now: RMS of the last 1024 samples captured, in millionths of full scale."
+  (if (zerop *mic*)
+      0
+      ;; the last 1024 captured, whether or not Lisp has read them (a program that drains every frame still has a level)
+      (let ((wr (peek32 (+ *mic* #x30))) (sum 0) (n (min 1024 (floor (peek32 (+ *mic* #x30)) 2))))
+        (if (zerop n)
+            0
+            (progn
+              (dotimes (i n) (let ((v (mic-sample (- wr (* 2 (+ i 1)))))) (incf sum (* v v))))
+              (min 1000000 (round (* 1000000 (sqrt (/ sum n))) 32768)))))))
+
+(defun mic-stop ()
+  (unless (zerop *mic*)
+    (poke64 (+ *mic* #x48) 1)
+    (m *mic-client* 11))                                                     ; Stop
+  (setf *mic-state* 0)
+  0)
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -2274,6 +2432,15 @@
   (if (null *fix*)
       0
       (progn (put-floats a *fix*) 1)))
+
+;; the microphone
+(defswift "mic_start" (rate) (mic-start rate))
+(defswift "mic_state" () *mic-state*)
+(defswift "mic_read" (buf cap) (mic-read buf cap))
+(defswift "mic_waiting" () (floor (mic-filled) 2))
+(defswift "mic_dropped" () (if (zerop *mic*) 0 (peek64 (+ *mic* #x40))))
+(defswift "mic_level" () (mic-level))
+(defswift "mic_stop" () (mic-stop))
 
 ;; game controllers
 (defswift "pad_count" () (pad-count))
