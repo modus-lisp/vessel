@@ -261,6 +261,15 @@
   (*memcpy* "ntdll.dll" "memcpy")
   (*memset* "ntdll.dll" "memset")
   (*co-task-mem-free* "ole32.dll" "CoTaskMemFree")
+  (*dwm-set-attribute* "dwmapi.dll" "DwmSetWindowAttribute")
+  (*reg-get-value* "advapi32.dll" "RegGetValueW")
+  (*open-clipboard* "user32.dll" "OpenClipboard")
+  (*empty-clipboard* "user32.dll" "EmptyClipboard")
+  (*set-clipboard-data* "user32.dll" "SetClipboardData")
+  (*close-clipboard* "user32.dll" "CloseClipboard")
+  (*global-alloc* "kernel32.dll" "GlobalAlloc")
+  (*global-lock* "kernel32.dll" "GlobalLock")
+  (*global-unlock* "kernel32.dll" "GlobalUnlock")
   (*get-dc* "user32.dll" "GetDC")
   (*release-dc* "user32.dll" "ReleaseDC")
   (*create-directory* "kernel32.dll" "CreateDirectoryW")
@@ -469,7 +478,7 @@
        #x48 #x83 #xC4 #x28 #xC3))))          ; add rsp,0x28; ret
 
 (defparameter *recorded*
-  (append '(#x05 #x07 #x08 #x10 #x1C #x111 #x114 #x233)
+  (append '(#x05 #x07 #x08 #x10 #x1A #x1C #x111 #x114 #x233)
           (loop for m from #x100 to #x10F collect m)
           (loop for m from #x200 to #x20E collect m))
   "The messages the ring keeps: size, focus, close, the app's activation, a command (a menu, a button), a
@@ -729,6 +738,7 @@
       (setf *hwnd* (u *create-window* 0 (wide1 "VesselWindow") (wide2 title) +main-style+
                       #x80000000 #x80000000 ow oh 0 0 *hinst* 0))))
   (when (zerop *hwnd*) (error "vessel-windows: CreateWindowExW failed"))
+  (theme-frame *hwnd*)
   (poke64 (+ *page* #x10) *hwnd*)
   (when (plusp *get-dpi-for-window*) (setf *dpi* (logand (c *get-dpi-for-window* *hwnd*) #xFFFF)))
   (setf *font* (c *create-font* (- (px 14)) 0 0 0 400 0 0 0 1 0 0 5 0 (wide1 "Segoe UI")))
@@ -880,6 +890,10 @@
              (when *minimized* (setf *minimized* nil) (ui-event (list :appstate 0 "shown")))
              (setf *w* (lo16 lp) *h* (hi16 lp))
              (push-event (logior (ash 6 40) (ash *h* 20) *w*)))))
+      ((and main (= msg #x1A))                              ; WM_SETTINGCHANGE: light or dark, maybe
+       (theme-frame *hwnd*)
+       (maphash (lambda (h ctl) (declare (ignore h)) (when (eq (ctl-kind ctl) :window) (theme-frame (ctl-hwnd ctl))))
+                *ctls*))
       ((and main (= msg #x08))                              ; WM_KILLFOCUS
        (release-keys) (unlock-pointer))
       ((and main (= msg #x1C))                              ; WM_ACTIVATEAPP
@@ -1666,6 +1680,7 @@
                      (- (s32 (peek32 (+ r 8))) (s32 (peek32 r))) (- (s32 (peek32 (+ r 12))) (s32 (peek32 (+ r 4))))
                      (if (/= palette 0) *hwnd* 0) 0 *hinst* 0)))
         (when (zerop hwnd) (error "vessel-windows: no window ~A" class))
+        (theme-frame hwnd)
         (poke64 (+ page #x10) hwnd)
         (setf *pages* (append *pages* (list page)))
         (u *show-window* hwnd (if (/= palette 0) 4 5))              ; SW_SHOWNOACTIVATE for a palette
@@ -3418,6 +3433,48 @@
   (when *ble* (modus-int::w32-ble-stop *ble*) (setf *ble* nil))
   0)
 
+;;; ---- light or dark; the clipboard ----------------------------------------------------------------------------------
+;;;
+;;; A window's frame follows Windows' app theme (Settings > Personalization > Colors: "Choose your app mode"), read
+;;; from AppsUseLightTheme; DWMWA_USE_IMMERSIVE_DARK_MODE (20) makes the title bar dark.  It is set as each window is
+;;; made and again on WM_SETTINGCHANGE, so a change of theme reaches open windows.  The clipboard (app_copy) is
+;;; CF_UNICODETEXT in a moveable global block, which Windows owns once it is set.
+
+(defun dark-p ()
+  "Does Windows want apps dark?"
+  (poke32 (cell 8) 1) (poke32 (cell 9) 4)
+  (and (not (failed-p (c *reg-get-value* #x80000001                                   ; HKEY_CURRENT_USER
+                         (wide1 "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+                         (wide2 "AppsUseLightTheme") #x10 0 (cell 8) (cell 9))))     ; RRF_RT_REG_DWORD
+       (zerop (peek32 (cell 8)))))
+
+(defun theme-frame (hwnd)
+  (poke32 (cell 10) (if (dark-p) 1 0))
+  (c *dwm-set-attribute* hwnd 20 (cell 10) 4)
+  0)
+
+(defun clipboard-open ()
+  "Open the clipboard, owned by a window of ours (with no owner, EmptyClipboard leaves it ownerless and
+   SetClipboardData fails); another program -- a clipboard monitor, a remote desktop -- may hold it a moment, so a
+   few tries.  T if open."
+  (let ((owner (if (plusp *hwnd*) *hwnd* *call-hwnd*)))
+    (loop repeat 20
+          thereis (plusp (logand (c *open-clipboard* owner) #xFFFFFFFF))
+          do (c *sleep* 5))))
+
+(defun clipboard-set (text)
+  "TEXT on Windows' clipboard: 1, or 0 if it could not be opened."
+  (let* ((bytes (+ 2 (* 4 (length text))))
+         (g (c *global-alloc* 2 bytes)))                                       ; GMEM_MOVEABLE
+    (if (or (zerop g) (not (clipboard-open)))
+        0
+        (let ((p (c *global-lock* g)))
+          (modus-int::w32-put-wstr p text)
+          (c *global-unlock* g)
+          (c *empty-clipboard*)
+          (prog1 (if (zerop (c *set-clipboard-data* 13 g)) 0 1)                ; CF_UNICODETEXT
+            (c *close-clipboard*))))))
+
 ;;; ---- SWIFT-CALL, answered --------------------------------------------------------------------------------------------
 
 (defvar *swift* (make-hash-table :test 'equal))
@@ -3575,6 +3632,10 @@
 (defswift "files_choose_folder" (a n)
   (choose t "Choose a Folder" :folder (new-handle (make-ctl :kind :picker)) (and (plusp n) (utf8-text a n))))
 (defswift "files_folder_path" (a n buf cap) (answer-text (folder-path (utf8-text a n)) buf cap))
+
+;; the clipboard, and the theme (a phone's monochrome theme has no Windows equivalent: the frame follows Windows)
+(defswift "app_copy" (a n) (clipboard-set (utf8-text a n)))
+(defswift "app_theme" (theme) 0)
 
 ;; Bluetooth LE: modus's WinRT radio
 (defswift "ble_start" (sa sn ca cn) (ble-start (utf8-text sa sn) (utf8-text ca cn)))
