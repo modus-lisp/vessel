@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- vessel's identity on Windows: a SPARSE package (packaging with external location).  It carries no files of its
+     own; it names the workspace as its external location and vessel.exe (modus, with an embedded manifest naming
+     this package) as its application, so Windows treats a vessel app as an installed one: its own name and icon in
+     Start and in notifications, toasts, and the other APIs that want a package identity.
+     build-identity.ps1 fills in PUBLISHER and PARAMETERS and packs it. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 rescap">
+
+  <Identity Name="ModusLisp.Vessel" Publisher="PUBLISHER" Version="1.0.0.0" ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Vessel</DisplayName>
+    <PublisherDisplayName>modus-lisp</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="Vessel" Executable="vessel.exe"
+                 uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App"
+                 uap10:Parameters="PARAMETERS">
+      <uap:VisualElements DisplayName="Vessel" Description="vessel, on modus"
+                          BackgroundColor="transparent"
+                          Square150x150Logo="Assets\Square150x150Logo.png"
+                          Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+</Package>
