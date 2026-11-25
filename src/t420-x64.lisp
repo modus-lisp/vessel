@@ -66,3 +66,12 @@
 (defun t4-cmd-baseline ()
   (unless *t4-disk-own* (handler-case (t4d-take) (error (c) (t4-log "disk: ~A" c))))
   (funcall *t4x-baseline*))
+
+;;; GENERATIONAL GC: not on bare x64.  The desk's %KILN-GEN-GC-START makes a thread first, so a
+;;; hosted image carves its lock arena before tenuring (app.lisp), and bare x64 has no OS
+;;; threads; nor does its image carry the generational write barrier, which is built into the
+;;; hosted x86-64 and AArch64 images (modus docs/generational-gc.md).  The plain collector, then,
+;;; and said once.
+(defun %kiln-gen-gc-start ()
+  (t4-log "kiln: gc plain (no generational collector on bare x64)")
+  nil)
