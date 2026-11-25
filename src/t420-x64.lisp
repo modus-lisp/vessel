@@ -31,3 +31,38 @@
     (handler-case (%t4-cmd-poll)
       (error (c) (t4-log "cmd poll: ~A" c)))
     (modus-int::%sleep-ms 50)))
+
+;;; --- the desk on x64 ---------------------------------------------------------------------------
+;;; Loaded after the whole desk (kiln t420 --x64 puts this file last), so these replace the i386
+;;; platform calls they name.  What is not here works unchanged: the 8042, the desk's own USB
+;;; drivers, the network (the same e1000 driver), the CMOS clock, the GPU's registers (PC-MMIO-MAP
+;;; is the identity).  What is i386-only and stays off: the native blit routine and the
+;;; write-combining code (both need i386's code area: without it the blit is the Lisp loop, which
+;;; the x64 JIT makes native, and write-combining installs nothing), and the panel fitter switch
+;;; (VBE's EDID; UEFI's GOP mode is the panel's own already).
+
+(defun %t4-screen-up (&optional max-w max-h)
+  "Take the screen UEFI left: GOP's framebuffer, as the stub recorded it (boot-uefi-x64.lisp:
+   base at #x1B000, pixels a scanline at #x1B008, width and height at #x1B024 / #x1B028).
+   (W H), or NIL when the firmware had no GOP."
+  (declare (ignore max-w max-h))
+  (when (= (mem-ref #x1B020 :u32) 1)
+    (setf *t4-w* (mem-ref #x1B024 :u32) *t4-h* (mem-ref #x1B028 :u32)
+          *t4-base* (mem-ref #x1B000 :u64)          ; stored pre-tagged: the value is the address
+          *t4-pitch* (* 4 (mem-ref #x1B008 :u32)))
+    ;; the console off the screen (2: VGA text memory, which nobody sees under GOP)
+    (setf (mem-ref #x1B078 :u32) 2)
+    (t4-log "x64: GOP ~Dx~D at #x~X, pitch ~D, pixel format ~D"
+            *t4-w* *t4-h* *t4-base* *t4-pitch* (mem-ref #x1B00C :u32))
+    (list *t4-w* *t4-h*)))
+
+;;; No BIOS: the disk is the desk's once T4D-TAKE has run, and KILN-T420-MAIN reads the command
+;;; channel's baseline before it takes the disk.  So the baseline takes it, and taking it twice
+;;; is the first time's answer (a second take would reset a controller in use).
+(defvar *t4x-take* (symbol-function 't4d-take))
+(defun t4d-take ()
+  (if (and *t4-disk-own* *t4d*) *t4d* (funcall *t4x-take*)))
+(defvar *t4x-baseline* (symbol-function 't4-cmd-baseline))
+(defun t4-cmd-baseline ()
+  (unless *t4-disk-own* (handler-case (t4d-take) (error (c) (t4-log "disk: ~A" c))))
+  (funcall *t4x-baseline*))
