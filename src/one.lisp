@@ -29,7 +29,8 @@
   "The gateway is a SYSTEM now, not a file beside webrtc-data.  It used to be loaded
    by absolute path — and loading it was the same act as starting it, because the file
    ended in (hunchentoot:start ...) and (loop (sleep 5)).  Now START-GATEWAY does that
-   and loading merely defines.")
+   and loading merely defines.  (Its HTTP server is cl-transport/http-server now, not
+   hunchentoot, so the gateway needs no Quicklisp and no OpenSSL.)")
 
 (defvar *nostr-gateway-system* "glass-webrtc/nostr")
 (defvar *etc* (kiln-env "KILN_ETC" "/etc/kiln"))
@@ -146,7 +147,8 @@
            (finish-output *error-output*))))
      :name "kiln-gateway")))
 
-;;; Wait for the acceptor before starting the desktop, so the startup banner is
+;;; Wait for the gateway's HTTP server (webrtc-data::*ACCEPTOR*, its name from when it was a
+;;; hunchentoot acceptor) before starting the desktop, so the startup banner is
 ;;; in a definite order and a gateway that died is reported before the screen
 ;;; comes up rather than somewhere in the middle of it.
 (when *gateway-thread*
