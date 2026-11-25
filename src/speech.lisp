@@ -102,9 +102,9 @@
     (get-output-stream-string out)))
 
 (defun %temp-path (name)
-  "NAME in the app's temporary directory ($TMPDIR, which may or may not end in a slash)."
-  (let ((dir (or (modus-int::%cli-getenv "TMPDIR") "/tmp")))
-    (concatenate 'string (string-right-trim "/" dir) "/" name)))
+  "NAME in the app's temporary directory ($TMPDIR, or $TEMP on Windows; it may or may not end in a slash)."
+  (let ((dir (or (modus-int::%cli-getenv "TMPDIR") (modus-int::%cli-getenv "TEMP") "/tmp")))
+    (concatenate 'string (string-right-trim "/\\" dir) "/" name)))
 
 (defun round-trip (text done &key (path (%temp-path "kiln-round-trip.caf")) said)
   "Say TEXT into a file, transcribe the file, and call DONE with what was heard (\"\" if nothing, and :FAILED

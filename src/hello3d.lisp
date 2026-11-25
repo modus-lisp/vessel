@@ -88,6 +88,71 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
 }
 ")
 
+(defparameter *shader-hlsl* "
+// *SHADER*, for Direct3D 11 (win-host.lisp): the same two pipelines.  The vertices are read here from a raw buffer,
+// as Metal's shader reads them from a device pointer; the matrices are column-major, as Metal's; the per-object
+// constants are one block, Object's or Lines' fields as each pipeline names them (Lines: model is the transform,
+// tint the colour).
+ByteAddressBuffer vertices : register(t0);
+Texture2D picture : register(t8);
+SamplerState picture_sampler : register(s0);
+cbuffer Frame : register(b1) { float4x4 view_projection; float4 light; float4 eye; float4 fog; float4 fog_colour; };
+cbuffer Object : register(b2) { float4x4 model; float4 tint; float4 params; };
+cbuffer Draw : register(b13) { uint first_vertex; };   // Metal's vertex_id counts from the draw's start; this does
+
+struct Out { float4 position : SV_Position; float3 normal : NORMAL; float2 uv : TEXCOORD0; float3 world : TEXCOORD1; };
+
+Out world_vertex(uint vid : SV_VertexID) {
+    uint at = (vid + first_vertex) * 32;
+    float4 world = mul(model, float4(asfloat(vertices.Load3(at)), 1.0));
+    Out o;
+    o.position = mul(view_projection, world);
+    o.world = world.xyz;
+    o.normal = mul(model, float4(asfloat(vertices.Load3(at + 12)), 0.0)).xyz;
+    o.uv = asfloat(vertices.Load2(at + 24));
+    return o;
+}
+
+float4 world_fragment(Out i) : SV_Target {
+    float3 n = normalize(i.normal);
+    float sun = max(dot(n, -normalize(light.xyz)), 0.0);
+    float sky = 0.5 + 0.5 * n.y;
+    float3 base = picture.Sample(picture_sampler, i.uv).rgb * tint.rgb;
+    float3 colour = base * (0.18 + 0.22 * sky + 0.75 * sun);
+    float d = distance(i.world, eye.xyz);
+    float f = saturate((d - fog.x) / (fog.y - fog.x));
+    return float4(lerp(colour, fog_colour.rgb, f), 1.0);
+}
+
+struct LineOut { float4 position : SV_Position; float nearness : TEXCOORD0; };
+
+LineOut line_vertex(uint vid : SV_VertexID) {
+    uint id = vid + first_vertex;
+    uint seg = id / 6, corner = id % 6;
+    float4 a = mul(model, float4(asfloat(vertices.Load3(seg * 24)), 1.0));
+    float4 b = mul(model, float4(asfloat(vertices.Load3(seg * 24 + 12)), 1.0));
+    float2 half_view = params.yz;
+    float2 d = normalize(b.xy / b.w * half_view - a.xy / a.w * half_view);
+    float2 normal = float2(-d.y, d.x) * params.x;
+    bool at_b = corner == 2 || corner == 4 || corner == 5;
+    float side = (corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0;
+    float4 q = at_b ? b : a;
+    float centre = mul(model, float4(0, 0, 0, 1)).w;
+    LineOut o;
+    o.position = float4(q.xy + normal * side / half_view * q.w, q.z, q.w);
+    o.nearness = saturate(0.5 + (centre - q.w) * 0.8);
+    return o;
+}
+
+float4 line_fragment(LineOut i) : SV_Target {
+    return float4(tint.rgb * lerp(0.3, 1.0, i.nearness), tint.a);
+}
+")
+
+(defun shader-source ()
+  "The shaders in the language this platform's GPU takes."
+  (if (eq (kiln-gpu:gpu-language) :hlsl) *shader-hlsl* *shader*))
+
 ;;; ---- vectors and matrices: single-floats, the matrices column-major as Metal reads them ---------------------------
 
 (deftype mat () '(simple-array single-float (16)))
@@ -952,10 +1017,10 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant Lines &lines [[b
     (setf (game-view g) (kiln-gpu:gpu-view 0 0 0 0)
           (game-hdr g) (kiln-gpu:gpu-view-hdr (game-view g)))
     (format t "~&hello3d: ~:[standard~;high~] dynamic range~%" (game-hdr g))
-    (let ((shader (kiln-gpu:gpu-shader *shader*)))
+    (let ((shader (kiln-gpu:gpu-shader (shader-source))))
       (setf (game-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "world_vertex" "world_fragment"))))
     (unless (game-pipeline g) (error "hello3d: the shader or its pipeline did not build (see the log)"))
-    (let ((shader (kiln-gpu:gpu-shader *shader*)))
+    (let ((shader (kiln-gpu:gpu-shader (shader-source))))
       (setf (game-line-pipeline g) (and shader (kiln-gpu:gpu-pipeline shader "line_vertex" "line_fragment"))))
     (multiple-value-bind (egg steps) (egg-lines)
      (let ((nose (nose-lines)))

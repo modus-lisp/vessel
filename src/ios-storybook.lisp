@@ -882,12 +882,32 @@ fragment float4 spin_fragment(V in [[stage_in]]) { return in.colour; }
 "
   "The GPU story's shader, in Metal Shading Language: a triangle turned by the time, its colours blended.")
 
+(defparameter *spin-shader-hlsl* "
+// *SPIN-SHADER*, for Direct3D 11 (win-host.lisp): buffers are raw buffers at t<index>; b13 holds the draw's first
+// vertex, which Metal's vertex_id counts from and SV_VertexID does not
+ByteAddressBuffer v : register(t0);
+ByteAddressBuffer t : register(t1);
+cbuffer Draw : register(b13) { uint first_vertex; };
+struct V { float4 position : SV_Position; float4 colour : COLOR0; };
+V spin_vertex(uint vid : SV_VertexID) {
+  uint i = (vid + first_vertex) * 20;
+  float x = asfloat(v.Load(i)), y = asfloat(v.Load(i + 4)), time = asfloat(t.Load(0));
+  float c = cos(time), s = sin(time);
+  V o;
+  o.position = float4(x * c - y * s, x * s + y * c, 0, 1);
+  o.colour = float4(asfloat(v.Load3(i + 8)), 1);
+  return o;
+}
+float4 spin_fragment(V i) : SV_Target { return i.colour; }
+"
+  "*SPIN-SHADER* in HLSL, for a GPU-LANGUAGE of :HLSL (Windows).")
+
 (defun %story-gpu ()
   "A triangle the GPU draws and turns, every frame: a pipeline built once, a uniform written each frame, a render
    pass recorded and submitted (gpu.lisp).  The readout says when it has drawn ten frames."
   (let* ((view (kiln-gpu:gpu-view 24 200 350 350))
          (readout (kiln-swift:ui-label "gpu: starting" 24 570 350 30))
-         (shader (kiln-gpu:gpu-shader *spin-shader*))
+         (shader (kiln-gpu:gpu-shader (if (eq (kiln-gpu:gpu-language) :hlsl) *spin-shader-hlsl* *spin-shader*)))
          (pipeline (and shader (kiln-gpu:gpu-pipeline shader "spin_vertex" "spin_fragment")))
          (vertices (kiln-gpu:gpu-buffer (kiln-gpu:floats  0.0  0.8   1.0 0.3 0.3
                                                           -0.7 -0.5   0.3 1.0 0.3
