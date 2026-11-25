@@ -45,6 +45,14 @@
                                     (logand reg #xFC))))))
   (io-out-dword #xCFC val))
 
+;; MMIO: arch-i386-cl's signature (BYTES of device registers at physical PHYS, their address
+;; back).  Here RAM and the PCI hole below 4 GB are IDENTITY-mapped by the UEFI stub, and the
+;; firmware's MTRRs make the hole uncached, so the address is PHYS.  (The multiboot stub maps
+;; only the first 1 GB: a BAR above that is not reachable there.)
+(defun pc-mmio-map (phys bytes)
+  bytes
+  phys)
+
 ;; ============================================================
 ;; Timing / serial / entropy
 ;; ============================================================

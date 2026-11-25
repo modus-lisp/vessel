@@ -464,22 +464,30 @@
 (defvar *t4-disk-own* nil
   "(read . write): the desk's own driver for the boot disk (t420-usb-disk.lisp), once it has
    taken the disk's controller from the BIOS; NIL: INT 13h.")
+;;; A 64-BIT DESK HAS NO BIOS: the x64 image boots through UEFI and calls ExitBootServices, so
+;;; there is no INT 13h and the disk is the desk's own driver's or nobody's.  %T4-BIOS-P asks
+;;; whether this image has the pcboot shim at all (a symbol the x64 image does not define).
+(defun %t4-64-p () (> most-positive-fixnum #xFFFFFFFF))
+(defun %t4-bios-p ()
+  (and (not (%t4-64-p)) (fboundp 'modus-int::%pcbios-present-p) (funcall 'modus-int::%pcbios-present-p)))
+(defun %t4-disk-p () (or *t4-disk-own* (%t4-bios-p)))
 
 (defun %t4-disk-write (lba nsec)
   "Write NSEC (<= 64) sectors from #x30000 to LBA of the boot disk.  T when it worked."
   (when *t4-disk-own* (return-from %t4-disk-write (funcall (cdr *t4-disk-own*) lba nsec)))
+  (unless (%t4-bios-p) (return-from %t4-disk-write nil))
   (setf (mem-ref #xC000 :u8) 16 (mem-ref #xC001 :u8) 0
         (mem-ref #xC002 :u8) nsec (mem-ref #xC003 :u8) 0
         (mem-ref #xC004 :u32) 0                       ; buffer offset 0 ...
         (mem-ref #xC006 :u8) #x00 (mem-ref #xC007 :u8) #x30   ; ... segment 3000h
         (mem-ref #xC008 :u32) lba (mem-ref #xC00C :u32) 0)
-  (and (modus-int::%pcbios-int #x13 #x4300 0 0 (logand (mem-ref #x58C :u32) #xFF) #xC000 0 0)
-       (zerop (logand (modus-int::%pcbios-out 40) 1))))   ; carry clear
+  (and (funcall 'modus-int::%pcbios-int #x13 #x4300 0 0 (logand (mem-ref #x58C :u32) #xFF) #xC000 0 0)
+       (zerop (logand (funcall 'modus-int::%pcbios-out 40) 1))))   ; carry clear
 
 (defun t4-log-flush ()
   "Write what is new in the log (whole sectors from the first unwritten one), then the header."
   (%t4-ring-drain)
-  (when (and (> *t4-log-n* *t4-log-flushed*) (modus-int::%pcbios-present-p))
+  (when (and (> *t4-log-n* *t4-log-flushed*) (%t4-disk-p))
     (let* ((first (floor *t4-log-flushed* 512)) (last (ceiling *t4-log-n* 512)) (s first))
       (loop while (< s last)
             do (let ((n (min 64 (- last s))))
@@ -508,19 +516,20 @@
 (defun %t4-disk-read (lba nsec)
   "Read NSEC (<= 64) sectors at LBA of the boot disk to #x30000.  T when it worked."
   (when *t4-disk-own* (return-from %t4-disk-read (funcall (car *t4-disk-own*) lba nsec)))
+  (unless (%t4-bios-p) (return-from %t4-disk-read nil))
   (setf (mem-ref #xC000 :u8) 16 (mem-ref #xC001 :u8) 0
         (mem-ref #xC002 :u8) nsec (mem-ref #xC003 :u8) 0
         (mem-ref #xC004 :u32) 0
         (mem-ref #xC006 :u8) #x00 (mem-ref #xC007 :u8) #x30
         (mem-ref #xC008 :u32) lba (mem-ref #xC00C :u32) 0)
-  (and (modus-int::%pcbios-int #x13 #x4200 0 0 (logand (mem-ref #x58C :u32) #xFF) #xC000 0 0)
-       (zerop (logand (modus-int::%pcbios-out 40) 1))))
+  (and (funcall 'modus-int::%pcbios-int #x13 #x4200 0 0 (logand (mem-ref #x58C :u32) #xFF) #xC000 0 0)
+       (zerop (logand (funcall 'modus-int::%pcbios-out 40) 1))))
 
 (defun t4-cmd-baseline ()
   "Take the command channel's current sequence number as already done, at the desk's start: a
    command written after this is new.  (Taken at the first idle poll instead, a command sent
    while the desk was still starting was taken for the baseline and never run.)"
-  (when (and (modus-int::%pcbios-present-p) (%t4-disk-read *t4-cmd-lba* 1)
+  (when (and (%t4-disk-p) (%t4-disk-read *t4-cmd-lba* 1)
              (= (mem-ref #x30000 :u8) 84) (= (mem-ref #x30004 :u8) 68))
     (setq *t4-cmd-seq* (mem-ref #x30008 :u32)))
   (t4-log "kiln t420: commands after ~D" (or *t4-cmd-seq* 0))
@@ -528,7 +537,7 @@
 
 (defun %t4-cmd-poll ()
   "Run the command in the command sectors if it is new (at most once a second)."
-  (when (and (modus-int::%pcbios-present-p)
+  (when (and (%t4-disk-p)
              (> (- (get-internal-real-time) *t4-cmd-at*) internal-time-units-per-second))
     (setq *t4-cmd-at* (get-internal-real-time))
     (when (and (%t4-disk-read *t4-cmd-lba* 16)

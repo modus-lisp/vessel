@@ -28,10 +28,11 @@
      ,@body))
 
 (defun %t4d-mark (k)
-  "Startup progress, for a camera: band K (8 pixels) across the top of the screen, green."
-  (ignore-errors
+  "Startup progress, for a camera: band K (8 pixels) across the top of the screen, green.
+   (i386's framebuffer address: nothing on a 64-bit image, whose screen is elsewhere.)"
+  (unless (%t4-64-p) (ignore-errors
     (loop for i from (* k 8 1366) below (* (+ k 1) 8 1366)
-          do (modus-int::%mmio-write32 (+ #x0E000000 (* 4 i)) #x00C000))))
+          do (modus-int::%mmio-write32 (+ #x0E000000 (* 4 i)) #x00C000)))))
 
 (defun %t4d-qh (dir) (%t4u-va (if (eq dir :in) #x4000 #x4080)))
 (defun %t4d-td (k) (%t4u-va (+ #x4100 (* k 64))))
@@ -155,10 +156,14 @@
   "Take the boot disk's controller from the BIOS, walk its bus, open the first mass storage
    device.  From here INT 13h on that disk is gone: the desk's disk is this.  The plist, or NIL."
   ;; the boot disk's first sector, as the BIOS reads it: the disk found below must be the same
-  ;; one (on another PC the boot disk can be elsewhere, and this one somebody's stick)
-  (let ((mbr (and (%t4-disk-read 0 1)
-                  (let ((v (make-array 512 :element-type '(unsigned-byte 8))))
-                    (dotimes (i 512 v) (setf (aref v i) (mem-ref (+ #x30000 i) :u8)))))))
+  ;; one (on another PC the boot disk can be elsewhere, and this one somebody's stick).  With no
+  ;; BIOS (the x64 image boots through UEFI and exits its boot services) there is nobody to ask:
+  ;; :NO-BIOS, and the first disk on *T4D-CONTROLLER* with a partition table is taken.
+  (let ((mbr (if (%t4-bios-p)
+                 (and (%t4-disk-read 0 1)
+                      (let ((v (make-array 512 :element-type '(unsigned-byte 8))))
+                        (dotimes (i 512 v) (setf (aref v i) (mem-ref (+ #x30000 i) :u8)))))
+                 :no-bios)))
     (unless mbr (return-from t4d-take nil))
     (%t4d-mark 0)
   (let ((*t4u-area* +t4d-area+) (*t4-usb-devices* nil) (*t4u-next-addr* 1) (*t4-usb* nil))
@@ -207,7 +212,9 @@
       ;; the desk's disk is this from here, if its first sector is the BIOS's
       (%t4d-mark 4)
       (if (and (dotimes (k 10 nil) (when (t4d-read 0 1) (return t)) (%t4u-sleep 100))
-               (dotimes (i 512 t) (unless (= (mem-ref (+ #x30000 i) :u8) (aref mbr i)) (return nil))))
+               (if (eq mbr :no-bios)
+                   (and (= (mem-ref #x301FE :u8) #x55) (= (mem-ref #x301FF :u8) #xAA))
+                   (dotimes (i 512 t) (unless (= (mem-ref (+ #x30000 i) :u8) (aref mbr i)) (return nil)))))
           (progn (setq *t4-disk-own* (cons #'t4d-read #'t4d-write)) (%t4d-mark 5))
           (%t4u-say "disk: ~A is not the boot disk, or unreadable (~D ok, ~D failed)"
                     (getf (getf *t4d* :dev) :name) (getf *t4d* :ok) (getf *t4d* :errors))))

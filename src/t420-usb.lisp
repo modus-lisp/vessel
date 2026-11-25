@@ -50,7 +50,9 @@
   "The schedules' area of the controller being worked: the keyboard's and mouse's controller
    here, the boot disk's elsewhere (t420-usb-disk.lisp binds it, with *T4-USB* and the bus).")
 (defun %t4u-va (off) (+ *t4u-area* off))
-(defun %t4u-pa (va) (+ (- va #x0F000000) (mem-ref #x80AC :u32)))
+(defun %t4u-pa (va)
+  ;; i386: the net block's physical base; x64 (UEFI): RAM is identity-mapped, VA = PA
+  (if (> most-positive-fixnum #xFFFFFFFF) va (+ (- va #x0F000000) (mem-ref #x80AC :u32))))
 (defun %t4u-w (va v) (modus-int::%mmio-write32 va (logand v #xFFFFFFFF)))
 (defun %t4u-r (va) (modus-int::%mmio-read32 va))
 
