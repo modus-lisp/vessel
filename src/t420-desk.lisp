@@ -174,6 +174,6 @@
          (setq *kiln-wm-scale* 1)
          (let ((s (and (find-package "GLASS.WM") (find-symbol "*DRAG-ADAPTIVE*" "GLASS.WM"))))
            (when s (setf (symbol-value s) nil)))
-         (kiln-app-main :top 0 :media nil))
+         (kiln-app-main :top 0 :bottom 0 :media nil))
     (%t4-console-to-log nil)
     (%t4-screen-down)))

@@ -361,11 +361,12 @@
 
 (defun t4g-f32 (x)
   "IEEE single bits of X (any real): what a vertex or a state word holds.  Stored into a
-   single-float vector and its lane read back (on i386 a vector's data is at its word - 5): ~14 us
-   a float through INTEGER-DECODE-FLOAT was 20 ms of a demo frame."
+   single-float vector and its lane read back (a vector's data is at its word - 5 on i386, a
+   4-byte header; + 7 on x64, a 16-byte one -- at - 5 there every float read 0, and the demo drew
+   nothing): ~14 us a float through INTEGER-DECODE-FLOAT was 20 ms of a demo frame."
   (let ((v *t4g-f32-cell*))
     (setf (aref v 0) (coerce x 'single-float))
-    (mem-ref (- (modus-int::%val->word v) 5) :u32)))
+    (mem-ref (+ (modus-int::%val->word v) (if (%t4-64-p) 7 -5)) :u32)))
 
 ;;; ---- the EU: our own pixel shaders ----------------------------------------------------------------
 ;;; A gen 6 EU instruction is four dwords.  The two the shaders below use, with the fields that vary

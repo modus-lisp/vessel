@@ -894,14 +894,15 @@
 
 ;;; THE SCREEN'S LAYOUT, at start and whenever the phone turns: (Y0 X0 DW DH) -- where the desk's
 ;;; top-left device pixel is, and its size in desk pixels (K device pixels each).  PORTRAIT keeps
-;;; TOP points for the status bar and 20 for the home indicator, the desk centred across.
+;;; TOP points for the status bar and BOTTOM (20) for the home indicator, the desk centred across;
+;;; a laptop has neither (t420-desk.lisp: :top 0 :bottom 0).
 ;;; LANDSCAPE has no status bar, and the Dynamic Island and the home indicator are on the sides and
 ;;; the bottom: the desk goes inside the safe area (pseudo-syscall 1001, 3..6: its insets in pixels).
 (defvar *kiln-safe-area* nil
   "True where pseudo-syscall 1001 answers 3..6 with the safe area's insets (iOS: src/ios.lisp).
    Elsewhere it answers something else for them -- the Zero, 1 -- and the layout is portrait's.")
 
-(defun %kiln-layout (sw sh k top &optional full)
+(defun %kiln-layout (sw sh k top &optional full (bottom 20))
   (when full                                       ; over the whole screen: no margins at all
     (return-from %kiln-layout (list 0 0 (floor sw k) (floor sh k))))
   (flet ((inset (i) (and *kiln-safe-area*
@@ -910,7 +911,7 @@
       (if (and (> sw sh) st sl sb sr)
           (let* ((uw (- sw sl sr)) (dw (floor uw k)) (dh (floor (- sh st sb) k)))
             (list st (+ sl (floor (- uw (* dw k)) 2)) dw dh))
-          (let* ((y0 (* top k)) (dw (floor sw k)) (dh (floor (- sh y0 (* 20 k)) k)))
+          (let* ((y0 (* top k)) (dw (floor sw k)) (dh (floor (- sh y0 (* bottom k)) k)))
             (list y0 (floor (- sw (* dw k)) 2) dw dh))))))
 
 (defun %kiln-apply-desk-size (desk sw sh dw dh)
@@ -924,7 +925,7 @@
   (when *kiln-present-changes* (funcall *kiln-present-changes*))
   (%kiln-sys 1003 0 0 0))
 
-(defun kiln-app-main (&key autoplay (top 60) (media t))
+(defun kiln-app-main (&key autoplay (top 60) (bottom 20) (media t))
   "The app: a glass desk (glass/desk) on the phone's screen -- windows dragged by their title
    bars, a root menu on the background -- with the Actions window open (the media player
    without it).  AUTOPLAY, a file name in
@@ -952,7 +953,7 @@
                      (not (equal (ignore-errors (modus-int::%cli-getenv "KILN_HIDPI")) "0"))))
          (dens (if hidpi k 1))            ; desk pixels to a point
          (mag (if hidpi 1 k))             ; screen pixels to a desk pixel
-         (lay (%kiln-layout sw sh k top))
+         (lay (%kiln-layout sw sh k top nil bottom))
          (y0 (first lay)) (x0 (second lay)) (dw (third lay)) (dh (fourth lay))
          (big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
          ;; SOUND: a mixer whose clock is this loop (see %KILN-PUMP-AUDIO), and a
@@ -1177,7 +1178,7 @@
                 (let ((want (and (%wm-call "WM-WANTS-FULLSCREEN" desk) t)))
                   (unless (eq want full)
                     (setq full want)
-                    (let ((lay (%kiln-layout sw sh k top full)))
+                    (let ((lay (%kiln-layout sw sh k top full bottom)))
                       (setq y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
                             big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))
                       (%wm-call "WM-SET-FULLSCREEN" desk full)
@@ -1239,7 +1240,7 @@
                 ;; again and let glass.wm fit the windows to it (WM-RESIZE-SCREEN, as a VNC
                 ;; client's resize); it repaints the whole screen.
                 ((= type 6)
-                 (let ((lay (%kiln-layout x y k top)))
+                 (let ((lay (%kiln-layout x y k top nil bottom)))
                    (setq sw x sh y full nil
                          y0 (first lay) x0 (second lay) dw (third lay) dh (fourth lay)
                          big (if (= mag 1) nil (glass:make-framebuffer (* dw k) (* dh k))))

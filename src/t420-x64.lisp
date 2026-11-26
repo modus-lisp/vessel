@@ -199,3 +199,10 @@
         (let ((f (%t4x-install-code *t4x-wc-code*)))
           (when f (funcall f))))
       n)))
+
+;;; THE VIDEO ACTION'S CLIP ON THE x64 DISK.  i386's rig writes the clip at LBA 144000, past its
+;;; small image; on the x64 disk that is inside the ESP (LBAs 2048..247807, the EFI image and
+;;; \CORE.BIN), so Video decoded core bytes: "video: 0 pictures in 0.0 s".  Between the ESP and the
+;;; log (kiln's --log-lba, 640000) nothing is written, and the rig puts the clip at 600000:
+;;;   dd if=mandel.h264 of=IMAGE bs=512 seek=600000 conv=notrunc
+(setq *t4v-clip* (cons 600000 693507))
