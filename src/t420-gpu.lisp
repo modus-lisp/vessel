@@ -421,7 +421,8 @@
 (defvar *t4g-tri* (vector nil nil) "Triangle batches, (gpu . cpu): one per draw queued at a time.")
 
 (defun t4g-draw-triangles (rt depth verts n &key (cull 1) texture (batch 0))
-  "Draw N triangles (VERTS: a list of 8-float vertices, 3N of them) into surface RT, depth-tested
+  "Draw N triangles (VERTS: a list of 8-float vertices, 3N of them, or a single-float vector of
+   8 lanes a vertex) into surface RT, depth-tested
    against surface DEPTH (or none, NIL).  A vertex is a position and one attribute: a colour
    (Gouraud), or with TEXTURE (a surface) the coordinates (u v - -) it is sampled at, bilinearly
    (igt's sampling kernel).  CULL is SF's cull mode (1 none, 3 back).  BATCH picks the batch
@@ -454,10 +455,18 @@
       (w ds 0) (w (+ ds 4) 0)
       (w (+ ds 8) (if depth (logior (ash 1 31) (ash 2 27) (ash 1 26)) 0))   ; LESS, test + write
       (dotimes (i 6) (w (+ cc (* 4 i)) 0))
-      ;; vertices
+      ;; vertices: a list of 8-float lists, or PACKED -- a single-float vector of 8 lanes a vertex,
+      ;; whose lanes' bits go to the batch as they are (no T4G-F32, nothing allocated).  The
+      ;; vector's address is taken again for every lane: on i386 a :U32 read can make a bignum,
+      ;; and a collection then would move the vector.
       (let ((o vbase))
-        (dolist (v verts)
-          (dolist (f v) (w o (t4g-f32 f)) (incf o 4))))
+        (if (listp verts)
+            (dolist (v verts)
+              (dolist (f v) (w o (t4g-f32 f)) (incf o 4)))
+            (let ((off (if (%t4-64-p) 7 -5)))
+              (dotimes (k (* 24 n))
+                (w o (mem-ref (+ (modus-int::%val->word verts) off (* 4 k)) :u32))
+                (incf o 4)))))
       ;; commands
       (flet ((out (&rest ds) (dolist (d ds) (w p d) (incf p 4))))
         (out #x69040000)                                             ; PIPELINE_SELECT 3D
@@ -515,50 +524,145 @@
 (defvar *t4d-desk* nil "The desk's own screen as a texture: surface 0.")
 (defparameter *t4d-faces* '((0 2 6 4) (1 5 7 3) (0 4 5 1) (2 3 7 6) (0 1 3 2) (4 6 7 5)))
 
-(defun %t4d-corners (cx cy cz size ax ay az)
-  "A cube's 8 corners, centre (CX CY CZ), half-size SIZE, turned by AX AY AZ (radians) and
-   projected to the screen (focal 900, near 1, far 60): a vector of (x y z w).  Corner I is
-   (x y z) = the bits of I."
-  (let* ((sx (sin ax)) (cxa (cos ax)) (sy (sin ay)) (cya (cos ay)) (sz (sin az)) (cza (cos az))
-         (pts (make-array 8)))
-    (dotimes (i 8 pts)
-      (let* ((x (if (logbitp 0 i) size (- size))) (y (if (logbitp 1 i) size (- size)))
-             (z (if (logbitp 2 i) size (- size))))
-        ;; around x, then y, then z
-        (psetq y (- (* y cxa) (* z sx)) z (+ (* y sx) (* z cxa)))
-        (psetq x (+ (* x cya) (* z sy)) z (- (* z cya) (* x sy)))
-        (psetq x (- (* x cza) (* y sz)) y (+ (* x sz) (* y cza)))
-        (let ((wx (+ x cx)) (wy (+ y cy)) (wz (+ z cz)))
-          (setf (aref pts i)
-                (list (+ 683 (/ (* 900 wx) wz)) (- 384 (/ (* 900 wy) wz)) (/ (- wz 1) 59) 1.0)))))))
+;;; THE SCENE ALLOCATES (ALMOST) NOTHING A FRAME.  As lists -- an APPENDed 8-float list a vertex,
+;;; 180 a frame, then T4G-F32 on each of their 1440 floats -- a frame consed 387 KB (measured on
+;;; the T420 with GET-ALLOC-PTR: scene 193 KB, its draw 117 KB, the textured cube 46 + 32 KB), 18
+;;; MB/s at 47 frames/s, and bare x64 has no generational collector: a pause every few seconds.
+;;; Two things were the cost: the lists, and boxed float arithmetic -- 96 bytes a * or /, 144 with
+;;; a fixnum, and SIN / COS 1.8 / 2.1 KB a call (measured).  So:
+;;; - vertices go into single-float vectors made once, and T4G-DRAW-TRIANGLES copies their lanes'
+;;;   bits to the batch;
+;;; - every float the scene computes lives in the lanes of *T4D-W*, in functions that DECLARE it
+;;;   (SIMPLE-ARRAY SINGLE-FLOAT (*)): the compiler's FP-tree then keeps the arithmetic unboxed
+;;;   (measured: 0 bytes for a declared lane expression, 336 for the same one undeclared);
+;;; - sine and cosine are %T4D-SINCOS: the quadrant by one FLOOR, then degree-7 / degree-8
+;;;   polynomials on [-pi/4, pi/4], single precision, in lanes.
+;;; What is left boxed is each cube's inputs, coerced into lanes.
+(defvar *t4d-pts* (make-array 32 :element-type 'single-float :initial-element 0.0)
+  "The corners %T4D-CORNERS made last: 8 x (x y z w).")
+(defvar *t4d-verts* (make-array (* 4 36 8) :element-type 'single-float :initial-element 0.0)
+  "The four orbiting cubes' vertices, 8 lanes each.")
+(defvar *t4d-box* (make-array (* 36 8) :element-type 'single-float :initial-element 0.0)
+  "The textured cube's vertices, 8 lanes each.")
+(defvar *t4d-w* (make-array 64 :element-type 'single-float :initial-element 0.0)
+  "The scene's working lanes: 0..2 a cube's angles (x y z), 3..5 its centre, 6 its half-size,
+   10..15 the angles' sin and cos (sx cx sy cy sz cz), 20..29 a corner on its way, 30..36 the
+   scene's own values, 59..63 %T4D-SINCOS's.")
+(defvar *t4d-signs*
+  (let ((v (make-array 24 :element-type 'single-float :initial-element 0.0)))
+    (dotimes (i 8 v)
+      (dotimes (k 3) (setf (aref v (+ (* 3 i) k)) (if (logbitp k i) 1.0 -1.0)))))
+  "Corner I's (x y z) signs: the bits of I.")
 
-(defun %t4d-cube (tris cx cy cz size ax ay az)
-  "TRIS with a cube's 12 triangles pushed on, each corner coloured by its bits: the RGB cube."
-  (let ((pts (%t4d-corners cx cy cz size ax ay az)))
-    (flet ((v (i) (append (aref pts i)
-                          (list (if (logbitp 0 i) 1.0 0.15) (if (logbitp 1 i) 1.0 0.15)
-                                (if (logbitp 2 i) 1.0 0.15) 1.0))))
-      (dolist (f *t4d-faces* tris)
+(defun %t4d-sincos (w in out)
+  "Lane OUT of W := sin of lane IN, lane OUT+1 := its cos."
+  (declare (type (simple-array single-float (*)) w))
+  (let ((q (floor (+ (* (aref w in) 0.63661977) 0.5))))
+    (setf (aref w 62) (coerce q 'single-float))
+    (setf (aref w 63) (- (aref w in) (* (aref w 62) 1.5707964)))          ; r, |r| <= pi/4
+    (setf (aref w 61) (* (aref w 63) (aref w 63)))
+    (setf (aref w 59) (* (aref w 63) (+ 1.0 (* (aref w 61) (+ -0.16666667 (* (aref w 61)
+                                                (+ 0.008333334 (* (aref w 61) -1.984127e-4))))))))
+    (setf (aref w 60) (+ 1.0 (* (aref w 61) (+ -0.5 (* (aref w 61) (+ 0.041666668 (* (aref w 61)
+                                                (+ -0.0013888889 (* (aref w 61) 2.4801588e-5)))))))))
+    (case (mod q 4)
+      (0 (setf (aref w out) (aref w 59) (aref w (+ out 1)) (aref w 60)))
+      (1 (setf (aref w out) (aref w 60) (aref w (+ out 1)) (- 0.0 (aref w 59))))
+      (2 (setf (aref w out) (- 0.0 (aref w 59)) (aref w (+ out 1)) (- 0.0 (aref w 60))))
+      (t (setf (aref w out) (- 0.0 (aref w 60)) (aref w (+ out 1)) (aref w 59))))
+    nil))
+
+(defun %t4d-corners-w (w pts)
+  "A cube's 8 corners into PTS as (x y z w): centre lanes 3..5 of W, half-size 6, turned by the
+   angles in lanes 0..2 (radians; x, then y, then z) and projected to the screen (focal 900,
+   near 1, far 60).  Corner I is (x y z) = the bits of I."
+  (declare (type (simple-array single-float (*)) w pts))
+  (%t4d-sincos w 0 10) (%t4d-sincos w 1 12) (%t4d-sincos w 2 14)
+  (let ((sg *t4d-signs*))
+    (declare (type (simple-array single-float (*)) sg))
+    (dotimes (i 8 pts)
+      (let ((b (* 3 i)) (j (* 4 i)))
+        (setf (aref w 20) (* (aref w 6) (aref sg b))
+              (aref w 21) (* (aref w 6) (aref sg (+ b 1)))
+              (aref w 22) (* (aref w 6) (aref sg (+ b 2))))
+        ;; around x: y z
+        (setf (aref w 23) (- (* (aref w 21) (aref w 11)) (* (aref w 22) (aref w 10)))
+              (aref w 24) (+ (* (aref w 21) (aref w 10)) (* (aref w 22) (aref w 11))))
+        ;; around y: x z
+        (setf (aref w 25) (+ (* (aref w 20) (aref w 13)) (* (aref w 24) (aref w 12)))
+              (aref w 26) (- (* (aref w 24) (aref w 13)) (* (aref w 20) (aref w 12))))
+        ;; around z, and moved to the centre: wx wy wz
+        (setf (aref w 27) (+ (- (* (aref w 25) (aref w 15)) (* (aref w 23) (aref w 14))) (aref w 3))
+              (aref w 28) (+ (+ (* (aref w 25) (aref w 14)) (* (aref w 23) (aref w 15))) (aref w 4))
+              (aref w 29) (+ (aref w 26) (aref w 5)))
+        (setf (aref pts j) (+ 683.0 (/ (* 900.0 (aref w 27)) (aref w 29)))
+              (aref pts (+ j 1)) (- 384.0 (/ (* 900.0 (aref w 28)) (aref w 29)))
+              (aref pts (+ j 2)) (/ (- (aref w 29) 1.0) 59.0)
+              (aref pts (+ j 3)) 1.0)))))
+
+(defun %t4d-corners (cx cy cz size ax ay az)
+  "A cube's 8 corners, centre (CX CY CZ), half-size SIZE, turned by AX AY AZ, into *T4D-PTS*."
+  (let ((w *t4d-w*))
+    (setf (aref w 0) (coerce ax 'single-float) (aref w 1) (coerce ay 'single-float)
+          (aref w 2) (coerce az 'single-float) (aref w 3) (coerce cx 'single-float)
+          (aref w 4) (coerce cy 'single-float) (aref w 5) (coerce cz 'single-float)
+          (aref w 6) (coerce size 'single-float))
+    (%t4d-corners-w w *t4d-pts*)))
+
+(defun %t4d-put (verts k i a b c d)
+  "Vertex K of VERTS: corner I of *T4D-PTS*, then the attribute (A B C D)."
+  (declare (type (simple-array single-float (*)) verts))
+  (let ((o (* 8 k)) (j (* 4 i)) (pts *t4d-pts*))
+    (declare (type (simple-array single-float (*)) pts))
+    (setf (aref verts o) (aref pts j) (aref verts (+ o 1)) (aref pts (+ j 1))
+          (aref verts (+ o 2)) (aref pts (+ j 2)) (aref verts (+ o 3)) (aref pts (+ j 3))
+          (aref verts (+ o 4)) a (aref verts (+ o 5)) b (aref verts (+ o 6)) c (aref verts (+ o 7)) d)))
+
+(defun %t4d-cube (verts k0)
+  "A cube (its angles, centre and size in *T4D-W*'s lanes 0..6) as 12 triangles into VERTS from
+   vertex K0, each corner coloured by its bits: the RGB cube.  The next free vertex."
+  (%t4d-corners-w *t4d-w* *t4d-pts*)
+  (let ((k k0))
+    (flet ((v (i) (%t4d-put verts k i (if (logbitp 0 i) 1.0 0.15) (if (logbitp 1 i) 1.0 0.15)
+                            (if (logbitp 2 i) 1.0 0.15) 1.0)
+                  (incf k)))
+      (dolist (f *t4d-faces* k)
         (destructuring-bind (a b c d) f
-          (push (v a) tris) (push (v b) tris) (push (v c) tris)
-          (push (v a) tris) (push (v c) tris) (push (v d) tris))))))
+          (v a) (v b) (v c) (v a) (v c) (v d))))))
 
 (defun %t4d-cube-textured (cx cy cz size ax ay az)
-  "A cube's 12 triangles, each face carrying texture coordinates over the whole texture."
-  (let ((pts (%t4d-corners cx cy cz size ax ay az)) (tris nil))
-    (flet ((v (i u vv) (append (aref pts i) (list u vv 0.0 0.0))))
-      (dolist (f *t4d-faces* tris)
+  "A cube's 12 triangles into *T4D-BOX*, each face carrying texture coordinates over the whole
+   texture.  The vector."
+  (%t4d-corners cx cy cz size ax ay az)
+  (let ((k 0) (verts *t4d-box*))
+    (flet ((v (i u vv) (%t4d-put verts k i u vv 0.0 0.0) (incf k)))
+      (dolist (f *t4d-faces* verts)
         (destructuring-bind (a b c d) f
-          (push (v a 0.0 1.0) tris) (push (v b 1.0 1.0) tris) (push (v c 1.0 0.0) tris)
-          (push (v a 0.0 1.0) tris) (push (v c 1.0 0.0) tris) (push (v d 0.0 0.0) tris))))))
+          (v a 0.0 1.0) (v b 1.0 1.0) (v c 1.0 0.0) (v a 0.0 1.0) (v c 1.0 0.0) (v d 0.0 0.0))))))
+
+(defun %t4d-scene-w (w k)
+  "Cube K of the four orbiting ones at the time in lane 33 of W, into W's lanes 0..6."
+  (declare (type (simple-array single-float (*)) w))
+  (setf (aref w 30) (+ (* (aref w 33) 0.8) (aref w 34)))
+  (%t4d-sincos w 30 31)
+  (setf (aref w 3) (* 3.4 (aref w 32)) (aref w 4) (* 1.2 (aref w 31))
+        (aref w 5) (+ 9.0 (* 3.4 (aref w 31))) (aref w 6) 0.7
+        (aref w 0) (* (aref w 33) (+ 1.3 (aref w 35))) (aref w 1) (* (aref w 33) 0.9)
+        (aref w 2) (* (aref w 33) (- 0.5 (aref w 36))))
+  k)
 
 (defun %t4d-scene (s)
-  "The Gouraud vertices of the scene at S seconds (the four orbiting cubes)."
-  (let ((tris nil))
-    (dotimes (k 4 tris)
-      (let ((a (+ (* s 0.8) (* k (/ pi 2)))))
-        (setq tris (%t4d-cube tris (* 3.4 (cos a)) (* 1.2 (sin a)) (+ 9 (* 3.4 (sin a))) 0.7
-                              (* s (+ 1.3 (* 0.2 k))) (* s 0.9) (* s (- 0.5 (* 0.1 k)))))))))
+  "The Gouraud vertices of the scene at S seconds (the four orbiting cubes), in *T4D-VERTS*:
+   (values the vector, its triangles)."
+  (let ((w *t4d-w*) (k 0))
+    (setf (aref w 33) (coerce s 'single-float))
+    (dotimes (c 4)
+      (setf (aref w 34) (coerce (* c (/ pi 2)) 'single-float)
+            (aref w 35) (coerce (* c 0.2) 'single-float)
+            (aref w 36) (coerce (* c 0.1) 'single-float))
+      (%t4d-scene-w w c)
+      (setq k (%t4d-cube *t4d-verts* k)))
+    (values *t4d-verts* (floor k 3))))
 
 (defun %t4d-flip (s)
   "Scan out surface S from the next vertical blank; wait for it (at most 50 ms)."
@@ -596,9 +700,9 @@
                (t4g-blt-clear back bg)
                (t4g-wait *t4g-blt* (t4g-blt-clear depth one) 100)
                ;; the orbiting cubes, Gouraud; the middle one wears the desk (surface 0) as a texture
-               (let ((verts (%t4d-scene s))
-                     (box (%t4d-cube-textured 0 0 9 1.5 (* s 0.7) (* s 1.1) (* s 0.3))))
-                 (t4g-draw-triangles back depth verts (floor (length verts) 3))
+               (multiple-value-bind (verts n) (%t4d-scene s)
+                 (t4g-draw-triangles back depth verts n))
+               (let ((box (%t4d-cube-textured 0 0 9 1.5 (* s 0.7) (* s 1.1) (* s 0.3))))
                  (t4g-wait *t4g-rcs* (t4g-draw-triangles back depth box 12 :texture *t4d-desk* :batch 1) 100))
                (%t4d-flip back)
                (setq back (if (eq back a) b a))
