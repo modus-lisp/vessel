@@ -510,7 +510,7 @@
 ;;; says when it has).  The CPU only turns and projects 40 corners a frame.  The desk's screen,
 ;;; surface 0, is not touched: leaving flips back to it.
 
-(defvar *t4d* nil "The demo's surfaces: (front back depth).")
+(defvar *t4g-demo* nil "The demo's surfaces: (front back depth).")
 (defvar *t4d-desk* nil "The desk's own screen as a texture: surface 0.")
 (defparameter *t4d-faces* '((0 2 6 4) (1 5 7 3) (0 4 5 1) (2 3 7 6) (0 1 3 2) (4 6 7 5)))
 
@@ -579,10 +579,10 @@
   "Run the demo until a key or a click (or for SECONDS).  (frames seconds), and the screen is the
    desk's again."
   (unless *t4g-rcs* (t4g-render-start))
-  (unless *t4d*
-    (setq *t4d* (list (t4g-surface-new 1366 768) (t4g-surface-new 1366 768) (t4g-surface-new 1366 768))))
+  (unless *t4g-demo*
+    (setq *t4g-demo* (list (t4g-surface-new 1366 768) (t4g-surface-new 1366 768) (t4g-surface-new 1366 768))))
   (setq *t4d-desk* (make-t4g-surface :gpu 0 :cpu nil :w *t4-w* :h *t4-h* :pitch *t4-pitch*))
-  (destructuring-bind (a b depth) *t4d*
+  (destructuring-bind (a b depth) *t4g-demo*
     (let* ((t0 (get-internal-real-time)) (hz internal-time-units-per-second)
            (frames 0) (back a) (bg #x0B1020) (one (t4g-f32 1.0)))
       (%t4d-input-p)

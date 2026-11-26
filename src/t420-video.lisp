@@ -928,9 +928,9 @@
   "Play BYTES -- an H.264 Annex B stream, MPEG-2 video, or VC-1 -- full screen at FPS, REPEAT times or until a key or a click.
    (pictures seconds late-frames)."
   (unless *t4g-rcs* (t4g-render-start))
-  (unless *t4d*
-    (setq *t4d* (list (t4g-surface-new 1366 768) (t4g-surface-new 1366 768) (t4g-surface-new 1366 768))))
-  (let* ((a (first *t4d*)) (b (second *t4d*)) (back a) (shown 0) (late 0)
+  (unless *t4g-demo*
+    (setq *t4g-demo* (list (t4g-surface-new 1366 768) (t4g-surface-new 1366 768) (t4g-surface-new 1366 768))))
+  (let* ((a (first *t4g-demo*)) (b (second *t4g-demo*)) (back a) (shown 0) (late 0)
          (hz internal-time-units-per-second) (t0 (get-internal-real-time)))
     (%t4d-input-p)
     (when *t4g-cursor* (t4-gpu-set #x70080 0) (t4-gpu-set #x70084 *t4g-cursor*))

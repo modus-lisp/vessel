@@ -38,8 +38,8 @@
 ;;; drivers, the network (the same e1000 driver), the CMOS clock, the GPU's registers (PC-MMIO-MAP
 ;;; is the identity).  What is i386-only and stays off: the native blit routine and the
 ;;; write-combining code (both need i386's code area: without it the blit is the Lisp loop, which
-;;; the x64 JIT makes native, and write-combining installs nothing), and the panel fitter switch
-;;; (VBE's EDID; UEFI's GOP mode is the panel's own already).
+;;; the x64 JIT makes native, and write-combining installs nothing).  The native copy and
+;;; write-combining have x64 versions below, and so does the panel fitter switch.
 
 (defun %t4-screen-up (&optional max-w max-h)
   "Take the screen UEFI left: GOP's framebuffer, as the stub recorded it (boot-uefi-x64.lisp:
@@ -55,6 +55,42 @@
     (t4-log "x64: GOP ~Dx~D at #x~X, pitch ~D, pixel format ~D"
             *t4-w* *t4-h* *t4-base* *t4-pitch* (mem-ref #x1B00C :u32))
     (list *t4-w* *t4-h*)))
+
+;;; THE PANEL'S OWN RESOLUTION, UNDER UEFI.  GOP on the T420 offers nothing past 1024x768 (the
+;;; stub takes its largest mode; measured on the machine), the panel is 1366x768, and the panel
+;;; fitter stretches the 4:3 picture -- the BIOS's picture exactly (t420.lisp's %T4-NATIVE-PANEL,
+;;; whose register sequence this is).  There is no VBE EDID here, so the panel's size is pipe A's
+;;; ACTIVE TIMINGS, which with the fitter scaling are the panel's own.  Read over the disk channel
+;;; on the T420 with GOP at 1024x768: device #x0126, BAR0 #xF0000000, HTOTAL active 1366, VTOTAL
+;;; active 768, PIPEASRC 1024x768, PF_CTL #x80800000 (on), PF_WIN_SZ 1366x768, DSPASURF 0.  The
+;;; framebuffer stays at GOP's base (DSPASURF 0 is the aperture's start).
+(defun %t4-native-panel ()
+  "Switch an Intel GPU's pipe A from a fitted GOP mode to the panel's size.  (W H) when it did."
+  (ignore-errors
+   (let* ((pcr (lambda (r) (modus-int::pci-config-read 0 2 0 r)))
+          (id (funcall pcr 0)))
+     (when (and (= (logand id #xFFFF) #x8086) (zerop (funcall pcr #x14)))
+       (let* ((bar (logand (funcall pcr #x10) (lognot 15)))
+              (rd (lambda (o) (mem-ref (+ bar o) :u32)))
+              (wr (lambda (o v) (setf (mem-ref (+ bar o) :u32) v)))
+              (ew (1+ (logand (funcall rd #x60000) #xFFF)))
+              (eh (1+ (logand (funcall rd #x6000C) #xFFF))))
+         (when (and (logbitp 31 (funcall rd #x68080))            ; the fitter is scaling
+                    (>= ew *t4-w*) (>= eh *t4-h*) (not (and (= ew *t4-w*) (= eh *t4-h*)))
+                    (<= ew 4096) (<= eh 4096))
+           (let ((pitch (* 64 (ceiling (* ew 4) 64))))
+             (funcall wr #x68080 0)                                    ; PF_CTL
+             (funcall wr #x68070 0)                                    ; PF_WIN_POS
+             (funcall wr #x68074 0)                                    ; PF_WIN_SZ: arms the change
+             (funcall wr #x6001C (logior (ash (1- ew) 16) (1- eh)))    ; PIPEASRC
+             (funcall wr #x70188 pitch)                                ; DSPASTRIDE
+             (funcall wr #x70180 (logior (funcall rd #x70180) #x4000)) ; DSPACNTR: trickle feed off
+             (funcall wr #x7019C (funcall rd #x7019C))                 ; DSPASURF: latch
+             (setf *t4-w* ew *t4-h* eh *t4-pitch* pitch
+                   (mem-ref #x1B024 :u32) ew (mem-ref #x1B028 :u32) eh
+                   (mem-ref #x1B008 :u32) (floor pitch 4))
+             (t4-log "x64: panel ~Dx~D, fitter off, pitch ~D" ew eh pitch)
+             (list ew eh))))))))
 
 ;;; No BIOS: the disk is the desk's once T4D-TAKE has run, and KILN-T420-MAIN reads the command
 ;;; channel's baseline before it takes the disk.  So the baseline takes it, and taking it twice
