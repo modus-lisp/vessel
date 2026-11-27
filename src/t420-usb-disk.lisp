@@ -150,6 +150,19 @@
       (if ok (incf (getf *t4d* :ok)) (incf (getf *t4d* :errors)))
       ok)))
 
+;;; ---- the keyboard and mouse beside the disk ----------------------------------------------------
+
+(defun t4d-hid-poll ()
+  "What the keyboard and mouse on the boot disk's bus reported (T4D-TAKE bound them: the rig's
+   Zero is a disk, a keyboard and a mouse), as desk events -- the same path as t420-usb.lisp's
+   own controller, with this bus's schedules and its own held keys and counters."
+  (let ((d *t4d*))
+    (when (and d (getf d :hid) (or (aref (getf d :hid) 0) (aref (getf d :hid) 1)))
+      (with-t4d-bus
+        (let ((*t4u-hid* (getf d :hid)) (*t4u-keys-down* (getf d :keys))
+              (*t4u-reports* (getf d :hid-reports)) (*t4u-errors* (getf d :hid-errors)))
+          (%t4u-poll-hid))))))
+
 ;;; ---- taking it ---------------------------------------------------------------------------------
 
 (defun t4d-take ()
@@ -194,13 +207,20 @@
             (when m
               (destructuring-bind (iface in out mps cfg) m
                 (%t4u-ctl dev #x00 9 cfg 0 0)                            ; SET_CONFIGURATION
-                (%t4d-qh-init :in dev in mps)
-                (%t4d-qh-init :out dev out mps)
-                (%t4d-ring)
-                (setq *t4d* (list :ctl *t4-usb* :devices *t4-usb-devices* :dev dev :iface iface
-                                  :in in :out out :mps mps :tag 0 :ok 0 :errors 0))
-                (%t4u-say "disk: ~A (address ~D, bulk ~D/~D, ~D bytes)" (or (getf dev :name) "?")
-                          (getf dev :addr) in out mps)
+                ;; a keyboard and a mouse on this bus too -- the rig's Zero has both beside the
+                ;; disk, in the same configuration.  Before the bulk QHs: binding makes control
+                ;; transfers, and each one leaves the async ring with only its head
+                (let ((hid (let ((*t4u-hid* nil)) (ignore-errors (%t4u-hid-bind)) *t4u-hid*)))
+                  (%t4d-qh-init :in dev in mps)
+                  (%t4d-qh-init :out dev out mps)
+                  (%t4d-ring)
+                  (setq *t4d* (list :ctl *t4-usb* :devices *t4-usb-devices* :dev dev :iface iface
+                                    :in in :out out :mps mps :tag 0 :ok 0 :errors 0
+                                    :hid (or hid (vector nil nil)) :keys (make-array 8 :initial-element 0)
+                                    :hid-reports (vector 0 0) :hid-errors (vector 0 0)))
+                  (%t4u-say "disk: ~A (address ~D, bulk ~D/~D, ~D bytes); on its bus a keyboard ~:[no~;yes~], a mouse ~:[no~;yes~]"
+                            (or (getf dev :name) "?") (getf dev :addr) in out mps
+                            (and hid (aref hid 0)) (and hid (aref hid 1))))
                 (return)))))))
     (when *t4d*
       (%t4d-mark 3)

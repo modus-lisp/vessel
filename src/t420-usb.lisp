@@ -352,6 +352,13 @@
     (when (logbitp 6 (%t4u-r (+ qh 24))) (%t4u-w (+ qh 24) 0))
     (%t4u-w (+ qh 16) (%t4u-pa td))))
 
+;; Setting a configuration again resets every endpoint's data toggle on the device.  On the boot
+;; disk's controller (t420-usb-disk.lisp) the rig's Zero is ONE device: the disk the desk is
+;; driving, and a keyboard and a mouse beside it -- so only when it is not in that one already.
+(defun %t4u-configure (dev cfg)
+  (unless (and (= (%t4u-ctl dev #x80 8 0 0 1) 1) (= (%t4u-byte (%t4u-data-buf) 0) cfg))
+    (%t4u-ctl dev #x00 9 cfg 0 0)))                      ; SET_CONFIGURATION
+
 (defun %t4u-hid-bind ()
   "Bind the first boot keyboard and boot mouse; build the periodic schedule for them."
   (setf *t4u-hid* (vector nil nil))
@@ -361,7 +368,7 @@
         (destructuring-bind (proto iface ep mps cfg) i
           (let ((k (- proto 1)))
             (unless (aref *t4u-hid* k)
-              (%t4u-ctl dev #x00 9 cfg 0 0)                      ; SET_CONFIGURATION
+              (%t4u-configure dev cfg)
               (%t4u-ctl dev #x21 #x0B 0 iface 0)                 ; SET_PROTOCOL: boot
               (%t4u-ctl dev #x21 #x0A 0 iface 0)                 ; SET_IDLE: report on change
               (setf (aref *t4u-hid* k) (list dev ep mps iface))
@@ -479,23 +486,28 @@
       (when k (want (%t4u-int-qh 0) (if m (logior (%t4u-pa (%t4u-int-qh 1)) 2) 1))))))
 
 (defun t4-usb-poll ()
-  "Collect what the bound keyboard and mouse reported since the last call, as desk events."
-  (when *t4-usb*
-    (%t4u-check-links)
-    (dotimes (k 2)
-      (let ((h (aref *t4u-hid* k)))
-        (when h
-          (let ((tok (%t4u-r (+ (%t4u-int-td k) 8))))
-            (unless (logbitp 7 tok)                                   ; not active: done
-              (if (logbitp 6 tok) (incf (aref *t4u-errors* k)) (incf (aref *t4u-reports* k)))
-              (unless (logbitp 6 tok)                                 ; not halted
-                (let ((n (- (min 64 (third h)) (logand (ash tok -16) #x7FFF))))
-                  (when (plusp n)
-                    (if (= k 0)
-                        (%t4u-kbd-report (%t4u-int-buf 0))
-                        (when (>= n 3) (%t4u-mouse-report (%t4u-int-buf 1) n))))))
-              (%t4u-arm k))))))
-    (%t4u-repeat-tick)))
+  "Collect what the bound keyboards and mice reported since the last call, as desk events: this
+   controller's, and the boot disk's (t420-usb-disk.lisp T4D-HID-POLL: the rig's Zero)."
+  (when *t4-usb* (%t4u-poll-hid))
+  (when (fboundp 't4d-hid-poll) (funcall 't4d-hid-poll))
+  (%t4u-repeat-tick))
+
+(defun %t4u-poll-hid ()
+  "One controller's keyboard and mouse (*T4-USB*, *T4U-AREA*, *T4U-HID* bound to it)."
+  (%t4u-check-links)
+  (dotimes (k 2)
+    (let ((h (aref *t4u-hid* k)))
+      (when h
+        (let ((tok (%t4u-r (+ (%t4u-int-td k) 8))))
+          (unless (logbitp 7 tok)                                   ; not active: done
+            (if (logbitp 6 tok) (incf (aref *t4u-errors* k)) (incf (aref *t4u-reports* k)))
+            (unless (logbitp 6 tok)                                 ; not halted
+              (let ((n (- (min 64 (third h)) (logand (ash tok -16) #x7FFF))))
+                (when (plusp n)
+                  (if (= k 0)
+                      (%t4u-kbd-report (%t4u-int-buf 0))
+                      (when (>= n 3) (%t4u-mouse-report (%t4u-int-buf 1) n))))))
+            (%t4u-arm k)))))))
 
 ;;; ---- bring-up -----------------------------------------------------------------------------------
 
